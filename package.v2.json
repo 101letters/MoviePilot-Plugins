@@ -1,13 +1,14 @@
 {
   "OplistTransfer": {
     "name": "OpenList 文件转运",
-    "description": "监听整理完成事件，将任务排队后交给 OpenList 内部 copy 执行，并发送通知。",
+    "description": "监听整理完成事件，将文件传输任务排队后交给 OpenList 内部 copy 执行。",
     "labels": "OpenList,文件转运,通知,自动化",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "icon": "refresh2.png",
     "author": "101letters",
     "level": 1,
     "history": {
+      "v1.2.0": "配置页改为 taosync 风格，仅展示用户真正需要配置的引擎、源目录、目标目录、作业与缓存/节流参数；底层 API 路径改为内部固定。",
       "v1.1.0": "重构为 MP 事件触发 + OpenList 内部 copy 队列模型，加入去重、目标查重、节流与任务状态轮询。",
       "v1.0.1": "参考 taosync 调整 OpenList/AList 调用方式：Authorization 直接传 token，copy/mkdir 使用固定 payload。",
       "v1.0.0": "首个版本：监听整理完成后自动 copy 到 OpenList，并发送通知。"

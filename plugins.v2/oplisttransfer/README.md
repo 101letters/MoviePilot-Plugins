@@ -1,54 +1,46 @@
 # OpenList 文件转运插件
 
-整理完成后自动触发 `TransferComplete` 内部事件，插件将任务入队并节流下发给 OpenList 内部 copy 任务系统执行传输。
+监听 MoviePilot 的整理完成事件，将文件传输任务排队后交给 OpenList 内部 copy 执行。
 
-## 核心模型
+## 设计原则
 
-- MoviePilot 只负责触发事件
-- OpenList 负责真正的文件复制
-- 插件负责：入队、去重、节流、查重、下发任务、轮询状态、通知
+- MP 只负责触发
+- OpenList 负责真正 copy
+- 仅新增：目标目录已存在同名文件则跳过
+- 用队列做节流，避免短时间大量调用 OpenList API
 
-## 当前默认规则
+## 推荐配置风格
 
-- MP 相对根路径：`/media`
-- OpenList 源前缀：`/影视库`
-- OpenList 目标前缀：`/目标目录/影视库`
+参考 taosync 的作业概念：
 
-例如：
+- 引擎：OpenList 地址
+- 源目录：`/影视库/`
+- 目标目录：`/123云盘/影视/`
+- 作业名称：`影视库`
+- 同步方法：仅新增
+- 目标目录扫描缓存：使用
+- 目标目录操作间隔：1 秒
+- 源目录扫描缓存：不使用
+- 源目录操作间隔：0 秒
+- 排除项：按行填写
 
-- MP 整理后文件：`/media/华语电影/xxx/abc.mkv`
+## 路径规则
+
+从 MP 整理路径中截取 `/media` 后面的相对路径：
+
+- MP 文件：`/media/华语电影/xxx/abc.mkv`
 - 相对目录：`华语电影/xxx`
 - OpenList 源目录：`/影视库/华语电影/xxx`
-- OpenList 目标目录：`/目标目录/影视库/华语电影/xxx`
+- OpenList 目标目录：`/123云盘/影视/华语电影/xxx`
 - 文件名：`abc.mkv`
 
-## 去重与节流
+## 固定内部 API
 
-- 事件去重：相同 `src_dir + dst_dir + name` 在时效内不会重复入队
-- 目标查重：下发前会调用 `/api/fs/list` 检查目标目录是否已存在同名文件
-- 节流：队列串行处理，可设置入队延迟与下发间隔
+插件内部固定使用：
 
-默认值：
+- `/api/fs/list`
+- `/api/fs/mkdir`
+- `/api/fs/copy`
+- `/api/admin/task/copy/info`
 
-- 入队延迟：5 秒
-- 下发间隔：3 秒
-- 去重时效：1800 秒
-
-## OpenList 调用方式（参考 taosync）
-
-- `Authorization: <token>`
-- `POST /api/fs/mkdir` body: `{ "path": "/目标目录" }`
-- `POST /api/fs/list` body: `{ "path": "/目标目录", "refresh": true }`
-- `POST /api/fs/copy` body:
-
-```json
-{
-  "src_dir": "/源目录",
-  "dst_dir": "/目标目录",
-  "overwrite": true,
-  "names": ["文件名.mkv"]
-}
-```
-
-- `POST /api/admin/task/copy/info?tid=...` 轮询任务状态
-- 返回 JSON 中 `code == 200` 才算成功
+这些不对外展示，不需要手动修改。

@@ -18,37 +18,44 @@ except ImportError:
 
 class OplistTransfer(_PluginBase):
     plugin_name = "OpenList 文件转运"
-    plugin_desc = "监听整理完成事件，将任务排队后交给 OpenList 内部 copy 执行，并发送通知。"
+    plugin_desc = "监听整理完成事件，将文件传输任务排队后交给 OpenList 内部 copy 执行。"
     plugin_icon = "refresh2.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "101letters"
     author_url = "https://github.com/101letters"
     plugin_config_prefix = "oplisttransfer_"
     plugin_order = 66
     auth_level = 1
 
-    _enabled = False
+    _enabled = True
     _notify = True
     _oplist_url = ""
     _token = ""
+    _engine_name = ""
+    _src_path = "/影视库/"
+    _dst_path = "/123云盘/影视/"
+    _job_name = "影视库"
+    _method = 0
+    _use_cache_t = 1
+    _scan_interval_t = 1
+    _use_cache_s = 0
+    _scan_interval_s = 0
+    _exclude = "下载文件/\n123网盘/\nXiuren/\n私人影视/"
+    _delay_seconds = 5
+    _dispatch_interval = 3
+    _interval_minutes = 360
+    _enabled_types = ["movie", "tv"]
+    _dedupe_ttl_seconds = 1800
+    _max_queue_size = 1000
+    _timeout = 60
+    _poll_interval = 3
+    _poll_max_times = 120
+
     _copy_api_path = "/api/fs/copy"
     _mkdir_api_path = "/api/fs/mkdir"
     _list_api_path = "/api/fs/list"
     _task_info_api_path = "/api/admin/task/copy/info"
     _mp_relative_root = "/media"
-    _openlist_src_prefix = "/影视库"
-    _openlist_dst_prefix = "/目标目录/影视库"
-    _overwrite = True
-    _create_dest_dir = True
-    _delay_seconds = 5
-    _dispatch_interval = 3
-    _timeout = 60
-    _poll_task_status = True
-    _poll_interval = 3
-    _poll_max_times = 120
-    _enabled_types = ["movie", "tv"]
-    _dedupe_ttl_seconds = 1800
-    _max_queue_size = 1000
 
     _queue_lock = threading.Lock()
     _worker_lock = threading.Lock()
@@ -64,29 +71,30 @@ class OplistTransfer(_PluginBase):
             return
 
         config = config or {}
-        self._enabled = bool(config.get("enabled"))
+        self._enabled = bool(config.get("enabled", True))
         self._notify = bool(config.get("notify", True))
         self._oplist_url = (config.get("oplist_url") or "").rstrip("/")
         self._token = (config.get("token") or "").strip()
-        self._copy_api_path = config.get("copy_api_path") or "/api/fs/copy"
-        self._mkdir_api_path = config.get("mkdir_api_path") or "/api/fs/mkdir"
-        self._list_api_path = config.get("list_api_path") or "/api/fs/list"
-        self._task_info_api_path = config.get("task_info_api_path") or "/api/admin/task/copy/info"
-        self._mp_relative_root = config.get("mp_relative_root") or "/media"
-        self._openlist_src_prefix = config.get("openlist_src_prefix") or "/影视库"
-        self._openlist_dst_prefix = config.get("openlist_dst_prefix") or "/目标目录/影视库"
-        self._overwrite = bool(config.get("overwrite", True))
-        self._create_dest_dir = bool(config.get("create_dest_dir", True))
+        self._engine_name = config.get("engine_name") or ""
+        self._src_path = config.get("src_path") or "/影视库/"
+        self._dst_path = config.get("dst_path") or "/123云盘/影视/"
+        self._job_name = config.get("job_name") or "影视库"
+        self._method = int(config.get("method", 0))
+        self._use_cache_t = int(config.get("use_cache_t", 1))
+        self._scan_interval_t = int(config.get("scan_interval_t", 1))
+        self._use_cache_s = int(config.get("use_cache_s", 0))
+        self._scan_interval_s = int(config.get("scan_interval_s", 0))
+        self._exclude = config.get("exclude") or "下载文件/\n123网盘/\nXiuren/\n私人影视/"
         self._delay_seconds = int(config.get("delay_seconds") or 5)
         self._dispatch_interval = int(config.get("dispatch_interval") or 3)
-        self._timeout = int(config.get("timeout") or 60)
-        self._poll_task_status = bool(config.get("poll_task_status", True))
-        self._poll_interval = int(config.get("poll_interval") or 3)
-        self._poll_max_times = int(config.get("poll_max_times") or 120)
+        self._interval_minutes = int(config.get("interval_minutes") or 360)
         enabled_types = config.get("enabled_types") or ["movie", "tv"]
         self._enabled_types = [str(x).lower() for x in enabled_types if x]
         self._dedupe_ttl_seconds = int(config.get("dedupe_ttl_seconds") or 1800)
         self._max_queue_size = int(config.get("max_queue_size") or 1000)
+        self._timeout = int(config.get("timeout") or 60)
+        self._poll_interval = int(config.get("poll_interval") or 3)
+        self._poll_max_times = int(config.get("poll_max_times") or 120)
 
         self._stop_event.clear()
         if self._enabled:
@@ -112,99 +120,94 @@ class OplistTransfer(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "enabled", "label": "是否启用"}}]},
                             {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "notify", "label": "开启通知"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "create_dest_dir", "label": "自动创建目标目录"}}]}
-                        ]
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [{"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": "本插件监听 MoviePilot 的 TransferComplete 内部事件。MP 只负责触发，真正 copy 在 OpenList 内部完成。插件会将任务入队、节流下发、查重，并按 taosync 的方式轮询 copy 任务状态。"}}]}]
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [{"component": "VTextField", "props": {"model": "oplist_url", "label": "OpenList 地址", "placeholder": "https://fox.example.com"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "timeout", "label": "请求超时(秒)", "type": "number"}}]}
-                        ]
-                    },
-                    {"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VTextField", "props": {"model": "token", "label": "OpenList Token", "type": "password"}}]}]},
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "copy_api_path", "label": "copy API", "placeholder": "/api/fs/copy"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "mkdir_api_path", "label": "mkdir API", "placeholder": "/api/fs/mkdir"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "list_api_path", "label": "list API", "placeholder": "/api/fs/list"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "task_info_api_path", "label": "task info API", "placeholder": "/api/admin/task/copy/info"}}]}
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "job_name", "label": "作业名称", "placeholder": "影视库"}}]}
                         ]
                     },
                     {
                         "component": "VRow",
                         "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "mp_relative_root", "label": "MP 相对根路径", "placeholder": "/media"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "openlist_src_prefix", "label": "OpenList 源前缀", "placeholder": "/影视库"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "openlist_dst_prefix", "label": "OpenList 目标前缀", "placeholder": "/目标目录/影视库"}}]}
+                            {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [{"component": "VTextField", "props": {"model": "oplist_url", "label": "引擎", "placeholder": "http://192.168.31.6:5244"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "engine_name", "label": "引擎备注", "placeholder": "可选"}}]}
+                        ]
+                    },
+                    {"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VTextField", "props": {"model": "token", "label": "Token", "type": "password"}}]}]},
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "src_path", "label": "源目录", "placeholder": "/影视库/"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "dst_path", "label": "目标目录", "placeholder": "/123云盘/影视/"}}]}
                         ]
                     },
                     {
                         "component": "VRow",
                         "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "delay_seconds", "label": "入队延迟(秒)", "type": "number"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "dispatch_interval", "label": "下发间隔(秒)", "type": "number"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "dedupe_ttl_seconds", "label": "去重时效(秒)", "type": "number"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "max_queue_size", "label": "最大队列长度", "type": "number"}}]}
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSelect", "props": {"model": "method", "label": "同步方法", "items": [{"title": "仅新增", "value": 0}]}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSelect", "props": {"model": "use_cache_t", "label": "目标目录扫描缓存", "items": [{"title": "不使用", "value": 0}, {"title": "使用", "value": 1}]}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "scan_interval_t", "label": "目标目录操作间隔(秒)", "type": "number"}}]}
                         ]
                     },
                     {
                         "component": "VRow",
                         "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "overwrite", "label": "覆盖已存在文件"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "poll_task_status", "label": "轮询任务状态"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "poll_interval", "label": "轮询间隔(秒)", "type": "number"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "poll_max_times", "label": "最大轮询次数", "type": "number"}}]}
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSelect", "props": {"model": "use_cache_s", "label": "源目录扫描缓存", "items": [{"title": "不使用", "value": 0}, {"title": "使用", "value": 1}]}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "scan_interval_s", "label": "源目录操作间隔(秒)", "type": "number"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "delay_seconds", "label": "入队延迟(秒)", "type": "number"}}]}
                         ]
                     },
-                    {"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSelect", "props": {"model": "enabled_types", "label": "处理媒体类型", "multiple": True, "chips": True, "items": [{"title": "电影", "value": "movie"}, {"title": "剧集", "value": "tv"}]}}]}]},
-                    {"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "text": "默认模型：从 MP 路径中取 /media 后面的相对路径，例如 /media/华语电影/xxx/abc.mkv -> 相对目录 华语电影/xxx；再拼接为源目录 /影视库/华语电影/xxx 和目标目录 /目标目录/影视库/华语电影/xxx；如果目标已存在同名文件则跳过。"}}]}]
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "dispatch_interval", "label": "下发间隔(秒)", "type": "number"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "interval_minutes", "label": "同步间隔(分钟)", "type": "number", "disabled": True}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSelect", "props": {"model": "enabled_types", "label": "处理媒体类型", "multiple": True, "chips": True, "items": [{"title": "电影", "value": "movie"}, {"title": "剧集", "value": "tv"}]}}]}
+                        ]
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [{"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": "调用方式固定为事件触发，不显示也不开放底层 OpenList API 路径配置。同步方法固定为仅新增：目标目录存在同名文件则跳过，不重复上传。"}}]}]
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [{"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": "路径规则：从 MP 整理路径中截取 /media 后面的相对路径，如 /media/华语电影/xxx/abc.mkv -> 华语电影/xxx；源目录 = 源目录前缀 + 相对目录；目标目录 = 目标目录前缀 + 相对目录；文件名保持不变。"}}]}]
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [{"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VTextarea", "props": {"model": "exclude", "label": "排除项规则", "rows": 6, "placeholder": "下载文件/\n123网盘/\nXiuren/\n私人影视/"}}]}]
                     }
                 ]
             }
         ], {
-            "enabled": False,
+            "enabled": True,
             "notify": True,
             "oplist_url": "",
             "token": "",
-            "copy_api_path": "/api/fs/copy",
-            "mkdir_api_path": "/api/fs/mkdir",
-            "list_api_path": "/api/fs/list",
-            "task_info_api_path": "/api/admin/task/copy/info",
-            "mp_relative_root": "/media",
-            "openlist_src_prefix": "/影视库",
-            "openlist_dst_prefix": "/目标目录/影视库",
-            "overwrite": True,
-            "create_dest_dir": True,
+            "engine_name": "",
+            "src_path": "/影视库/",
+            "dst_path": "/123云盘/影视/",
+            "job_name": "影视库",
+            "method": 0,
+            "use_cache_t": 1,
+            "scan_interval_t": 1,
+            "use_cache_s": 0,
+            "scan_interval_s": 0,
+            "exclude": "下载文件/\n123网盘/\nXiuren/\n私人影视/",
             "delay_seconds": 5,
             "dispatch_interval": 3,
-            "timeout": 60,
-            "poll_task_status": True,
-            "poll_interval": 3,
-            "poll_max_times": 120,
+            "interval_minutes": 360,
             "enabled_types": ["movie", "tv"],
-            "dedupe_ttl_seconds": 1800,
-            "max_queue_size": 1000,
         }
 
     def get_page(self) -> List[dict]:
         last = self.get_data("last_result") or {}
-        lines = []
+        queue_size = len(self._queue)
+        lines = [f"当前队列长度: {queue_size}"]
         for key in ["title", "source_path", "src_dir", "dst_dir", "name", "result", "message", "task_id", "time"]:
             value = last.get(key)
             if value not in [None, ""]:
                 lines.append(f"{key}: {value}")
-        queue_size = len(self._queue)
-        queue_info = f"当前队列长度: {queue_size}"
-        text = queue_info + ("\n" + "\n".join(lines) if lines else "\n暂无执行记录")
-        return [{"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": text}}]
+        return [{"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": "\n".join(lines)}}]
 
     def stop_service(self):
         self._stop_event.set()
@@ -219,13 +222,11 @@ class OplistTransfer(_PluginBase):
         event_info: dict = event.event_data
         transferinfo = event_info.get("transferinfo")
         mediainfo = event_info.get("mediainfo")
-
         if not transferinfo:
             return
 
         source_path = getattr(transferinfo, "target_path", None) or event_info.get("dest")
         if not source_path:
-            logger.warning("OpenList 文件转运：未获取到整理后路径，跳过")
             return
 
         media_type = str(getattr(mediainfo, "type", "") or "").lower()
@@ -237,8 +238,12 @@ class OplistTransfer(_PluginBase):
             logger.warning(f"OpenList 文件转运：无法从路径提取相对目录，跳过 {source_path}")
             return
 
-        src_dir = self.__join_path(self._openlist_src_prefix, relative_dir)
-        dst_dir = self.__join_path(self._openlist_dst_prefix, relative_dir)
+        if self.__is_excluded(relative_dir, name):
+            logger.info(f"OpenList 文件转运：命中排除规则，跳过 {source_path}")
+            return
+
+        src_dir = self.__join_path(self._src_path, relative_dir)
+        dst_dir = self.__join_path(self._dst_path, relative_dir)
         dedupe_key = f"{src_dir}|{dst_dir}|{name}"
         title = getattr(mediainfo, "title_year", None) or getattr(mediainfo, "title", None) or name
 
@@ -246,11 +251,9 @@ class OplistTransfer(_PluginBase):
         with self._queue_lock:
             self.__cleanup_recent_locked(now)
             if dedupe_key in self._queue_keys:
-                logger.info(f"OpenList 文件转运：任务已在队列中，跳过重复入队 {dedupe_key}")
                 return
             recent_at = self._recent_tasks.get(dedupe_key)
             if recent_at and now - recent_at < self._dedupe_ttl_seconds:
-                logger.info(f"OpenList 文件转运：任务在去重时效内，跳过 {dedupe_key}")
                 return
             if len(self._queue) >= self._max_queue_size:
                 logger.warning("OpenList 文件转运：队列已满，丢弃新任务")
@@ -271,7 +274,6 @@ class OplistTransfer(_PluginBase):
             self._queue_keys.add(dedupe_key)
             self._recent_tasks[dedupe_key] = now
 
-        logger.info(f"OpenList 文件转运：任务已入队 {dedupe_key}")
         self.__start_worker()
 
     def __start_worker(self):
@@ -287,21 +289,17 @@ class OplistTransfer(_PluginBase):
             item = None
             now = time.time()
             with self._queue_lock:
-                if self._queue:
-                    first = self._queue[0]
-                    if first.get("not_before", 0) <= now:
-                        item = self._queue.pop(0)
-                        self._queue_keys.discard(item.get("dedupe_key"))
+                if self._queue and self._queue[0].get("not_before", 0) <= now:
+                    item = self._queue.pop(0)
+                    self._queue_keys.discard(item.get("dedupe_key"))
             if not item:
                 time.sleep(1)
                 continue
-
             try:
                 self.__handle_item(item)
             except Exception as e:
                 logger.error(f"OpenList 文件转运：处理队列任务异常 {e}\n{traceback.format_exc()}")
                 self.__record_and_notify(item=item, result="failed", message=str(e), task_id=None)
-
             if self._dispatch_interval > 0:
                 time.sleep(self._dispatch_interval)
 
@@ -311,20 +309,15 @@ class OplistTransfer(_PluginBase):
             raise Exception("未配置 OpenList token")
 
         if self.__target_exists(token, item["dst_dir"], item["name"]):
-            logger.info(f"OpenList 文件转运：目标已存在，跳过 {item['name']}")
             self.__record_and_notify(item=item, result="skipped", message="目标目录已存在同名文件，跳过", task_id=None)
             return
 
-        if self._create_dest_dir:
-            self.__mkdir(token, item["dst_dir"])
-
+        self.__mkdir(token, item["dst_dir"])
         task_id = self.__copy_file(token=token, src_dir=item["src_dir"], dst_dir=item["dst_dir"], name=item["name"])
         if not task_id:
             raise Exception("OpenList 未返回 copy task id")
 
-        if self._poll_task_status:
-            self.__wait_task_done(token, task_id)
-
+        self.__wait_task_done(token, task_id)
         self.__record_and_notify(item=item, result="success", message="copy 任务完成", task_id=task_id)
 
     def __extract_relative_dir_and_name(self, source_path: str) -> Tuple[Optional[str], Optional[str]]:
@@ -336,6 +329,16 @@ class OplistTransfer(_PluginBase):
             return None, None
         relative_dir = parent[len(root):].strip("/")
         return relative_dir, name
+
+    def __is_excluded(self, relative_dir: str, name: str) -> bool:
+        candidates = [relative_dir, f"{relative_dir}/{name}".strip("/")]
+        rules = [line.strip() for line in (self._exclude or "").splitlines() if line.strip()]
+        for rule in rules:
+            rule = rule.strip("/")
+            for candidate in candidates:
+                if candidate.startswith(rule):
+                    return True
+        return False
 
     def __headers(self, token: str) -> Dict[str, str]:
         return {"Authorization": token, "Content-Type": "application/json"}
@@ -367,7 +370,7 @@ class OplistTransfer(_PluginBase):
         data = self.__post_json(token, self._copy_api_path, payload={
             "src_dir": src_dir,
             "dst_dir": dst_dir,
-            "overwrite": self._overwrite,
+            "overwrite": True,
             "names": [name],
         })
         tasks = data.get("tasks") if isinstance(data, dict) else None
@@ -381,7 +384,7 @@ class OplistTransfer(_PluginBase):
         try:
             data = self.__post_json(token, self._list_api_path, payload={
                 "path": dst_dir,
-                "refresh": True,
+                "refresh": self._use_cache_t != 1,
             })
             content = data.get("content") if isinstance(data, dict) else None
             if not content:
@@ -401,12 +404,10 @@ class OplistTransfer(_PluginBase):
                 raise Exception("任务状态返回异常")
             state = info.get("state")
             error = info.get("error")
-            status = info.get("status")
             if state == 2:
                 return
             if error:
                 raise Exception(f"copy 任务失败：{error}")
-            logger.info(f"OpenList copy 任务进行中 tid={task_id} state={state} status={status}")
             time.sleep(self._poll_interval)
         raise Exception("等待 OpenList copy 任务完成超时")
 
@@ -434,6 +435,7 @@ class OplistTransfer(_PluginBase):
         mapping = {"success": "成功", "failed": "失败", "skipped": "跳过"}
         notify_title = f"【OpenList 文件转运{mapping.get(result, result)}】"
         notify_text = (
+            f"作业：{self._job_name}\n"
             f"媒体：{item.get('title')}\n"
             f"源目录：{item.get('src_dir')}\n"
             f"目标目录：{item.get('dst_dir')}\n"
