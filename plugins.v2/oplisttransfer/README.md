@@ -10,10 +10,30 @@
 - 支持自动创建目标目录
 - 支持通知
 - 支持可视化配置
+- **OpenList/AList 调用方式参考 taosync**
 
 ## 说明
 
 `TransferComplete` 是 MoviePilot 宿主内部事件，不属于公开 REST API，所以你在 API 文档里看不到它，这属于正常现象。
+
+## OpenList 调用方式
+
+当前实现参考 `dr34m-cn/taosync` 的 AList/OpenList 调用方式：
+
+- 请求头：`Authorization: <token>`
+- `mkdir`：`POST /api/fs/mkdir`，body：`{"path":"/目标目录"}`
+- `copy`：`POST /api/fs/copy`，body：
+
+```json
+{
+  "src_dir": "/源目录",
+  "dst_dir": "/目标目录",
+  "overwrite": true,
+  "names": ["文件名.mkv"]
+}
+```
+
+- 响应判定：HTTP 200 且 JSON `code == 200` 视为成功
 
 ## 推荐配置
 
@@ -33,26 +53,3 @@
 
 - 电影目标根目录：`/movies`
 - 剧集目标根目录：`/tv`
-
-### API 路径
-
-默认：
-
-- copy: `/api/fs/copy`
-- mkdir: `/api/fs/mkdir`
-
-如果你的 OpenList 版本接口不同，直接改配置即可。
-
-## copy 请求兼容
-
-插件会尝试几种常见 payload 格式调用 copy API，以兼容不同 OpenList / AList 风格接口。
-
-## 通知内容
-
-- 媒体名
-- 源文件
-- 源目录
-- 目标目录
-- 动作（copy）
-- 执行结果
-- 错误详情 / 返回信息
