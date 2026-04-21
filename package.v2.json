@@ -1,0 +1,14 @@
+{
+  "OplistTransfer": {
+    "name": "OpenList 文件转运",
+    "description": "监听整理完成事件，自动调用 OpenList API 执行文件复制并发送通知。",
+    "labels": "OpenList,文件转运,通知,自动化",
+    "version": "1.0.0",
+    "icon": "refresh2.png",
+    "author": "101letters",
+    "level": 1,
+    "history": {
+      "v1.0.0": "首个版本：监听整理完成后自动 copy 到 OpenList，并发送通知。"
+    }
+  }
+}
