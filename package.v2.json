@@ -1,2 +1,14 @@
 {
+  "OpenListCopy": {
+    "name": "OpenList复制",
+    "description": "监听整理完成事件，通过 OpenList 内部 copy API 将媒体文件夹复制到 123 云盘。",
+    "labels": "OpenList,复制,网盘,自动化",
+    "version": "0.1.0",
+    "icon": "copy.png",
+    "author": "101letters",
+    "level": 1,
+    "history": {
+      "v0.1.0": "首个版本：监听 TransferComplete 事件，通过 OpenList /api/fs/copy 复制整个媒体文件夹，支持 9 类路径映射、目标已存在跳过、异步队列、任务去重和失败重试。"
+    }
+  }
 }
