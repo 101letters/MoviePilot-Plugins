@@ -1,530 +1,369 @@
-"""MoviePilot V2 插件：OpenListSync — OpenList/AList 自动化定时同步。
-
-Provides three sync modes:
-- 0 仅新增
-- 1 全同步（镜像）
-- 2 移动
-"""
+"""MoviePilot V2 plugin: OpenListSync 主入口。"""
+import os
 import json
-import traceback
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+import threading
+from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from app.core.plugin import _PluginBase
+except Exception:  # pragma: no cover
+    from app.plugins import _PluginBase
 from app.log import logger
-from app.plugins import _PluginBase
-from app.schemas import NotificationType
-from app.schemas.types import EventType
+try:
+    from app.schemas.plugin import PluginConfig
+except Exception:  # pragma: no cover
+    PluginConfig = None
 
-from .client import OpenListClient, OpenListError
-from .engine import execute_job
-from .job_manager import JobManager
+from .client import OpenListClient
 from .task_manager import TaskManager
+from .job_manager import JobManager
 from .scheduler import Scheduler
 
 
 class OpenListSync(_PluginBase):
-    # ------------------------------------------------------------------
-    # plugin metadata
-    # ------------------------------------------------------------------
-    plugin_name = "OpenList同步"
-    plugin_desc = "定时自动同步 OpenList/AList 目录（仅新增/全同步/移动三种模式）"
-    plugin_icon = "sync.png"
+    plugin_name = "OpenListSync"
+    plugin_desc = "基于 OpenList API 的文件夹同步插件，支持多种同步模式和定时调度。"
     plugin_version = "0.1.0"
     plugin_author = "101letters"
-    author_url = "https://github.com/101letters"
+    plugin_icon = "sync.png"
     plugin_config_prefix = "openlistsync_"
     plugin_order = 31
     auth_level = 1
 
-    # ------------------------------------------------------------------
-    # config defaults
-    # ------------------------------------------------------------------
-    _enabled = False
-    _openlist_url = ""
-    _openlist_token = ""
-    _notify = True
-    _global_interval_seconds = 60
-    _jobs_json = "[]"
-    _max_task_history = 100
+    def __init__(self):
+        super().__init__()
+        self._client = None
+        self._task_manager = None
+        self._job_manager = None
+        self._scheduler = None
+        self._base_url = ""
+        self._token = ""
+        self._data_dir = ""
+        self._notify_enabled = True
+        self.config = {}
+        self._lock = threading.RLock()
 
-    # ------------------------------------------------------------------
-    # runtime state
-    # ------------------------------------------------------------------
-    _client: Optional[OpenListClient] = None
-    _job_manager: Optional[JobManager] = None
-    _task_manager: Optional[TaskManager] = None
-    _scheduler: Optional[Scheduler] = None
-    _routes_registered = False
+    def init_plugin(self, config: Optional[dict] = None):
+        """兼容 MoviePilot V2 插件初始化入口。"""
+        return self.init_service(config)
 
-    # ------------------------------------------------------------------
-    # config form
-    # ------------------------------------------------------------------
+    def init_service(self, config: Optional[dict] = None):
+        """MP 插件初始化入口。"""
+        with self._lock:
+            self.stop_service()
+            self.config = dict(config or {})
 
-    @staticmethod
-    def get_form() -> List[dict]:
+            enabled = bool(self.config.get("enabled", False))
+            openlist_url = str(self.config.get("openlist_url", "")).strip().rstrip("/")
+            openlist_token = str(self.config.get("openlist_token", "")).strip()
+            notify_enabled = bool(self.config.get("notify", True))
+            try:
+                global_interval_seconds = int(self.config.get("global_interval_seconds", 60))
+            except Exception:
+                global_interval_seconds = 60
+            try:
+                max_task_history = int(self.config.get("max_task_history", 100))
+            except Exception:
+                max_task_history = 100
+            data_dir = str(self.config.get("data_dir", "") or "").strip()
+
+            if not openlist_url:
+                openlist_url = str(self.config.get("base_url", "")).strip().rstrip("/")
+            if not openlist_token:
+                openlist_token = str(self.config.get("token", "")).strip()
+            if global_interval_seconds == 60 and self.config.get("global_interval"):
+                try:
+                    global_interval_seconds = int(self.config.get("global_interval"))
+                except Exception:
+                    pass
+
+            self._notify_enabled = notify_enabled
+            self._base_url = openlist_url
+            self._token = openlist_token
+
+            if not data_dir:
+                try:
+                    data_dir = os.path.join(self.get_data_path(), "openlistsync")
+                except Exception:
+                    data_dir = os.path.join(os.getcwd(), "openlistsync")
+            os.makedirs(data_dir, exist_ok=True)
+            self._data_dir = data_dir
+
+            tasks_file = os.path.join(data_dir, "tasks.json")
+            self._task_manager = TaskManager(tasks_file=tasks_file, max_history=max_task_history)
+            self._job_manager = JobManager(plugin=self)
+
+            if openlist_url and openlist_token:
+                self._client = OpenListClient(base_url=openlist_url, token=openlist_token)
+                self._scheduler = Scheduler(
+                    client=self._client,
+                    task_manager=self._task_manager,
+                    job_manager=self._job_manager,
+                    logger=logger,
+                )
+                self._scheduler._scan_interval = max(5, global_interval_seconds)
+
+                original_run_job = self._scheduler._run_job
+
+                def notify_wrapper(job, task_id, trigger):
+                    try:
+                        original_run_job(job, task_id, trigger)
+                    finally:
+                        if self._notify_enabled and self._task_manager:
+                            task = self._task_manager.get_task(task_id)
+                            if task:
+                                if task.get("status") == "success":
+                                    self._notify_sync_result(
+                                        job,
+                                        task_id,
+                                        result={"summary": task.get("summary", {})},
+                                    )
+                                elif task.get("status") == "failed":
+                                    self._notify_sync_result(
+                                        job,
+                                        task_id,
+                                        error=task.get("error") or "未知错误",
+                                    )
+
+                self._scheduler._run_job = notify_wrapper
+
+                if enabled:
+                    self._scheduler.start()
+            else:
+                logger.warning("OpenListSync: openlist_url 或 openlist_token 为空，调度器未启动")
+
+            logger.info(f"OpenListSync 插件初始化完成，数据目录: {data_dir}")
+
+    def stop_service(self):
+        """插件停止入口。"""
+        if self._scheduler:
+            self._scheduler.stop()
+        self._scheduler = None
+        self._client = None
+        self._task_manager = None
+        self._job_manager = None
+        logger.info("OpenListSync 插件已停止")
+
+    def get_state(self) -> bool:
+        return self._client is not None
+
+    def get_form(self) -> List[dict]:
         return [
             {
-                "component": "VForm",
-                "content": [
-                    {
-                        "component": "VRow",
-                        "cols": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 4},
-                             "content": [{"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4},
-                             "content": [{"component": "VSwitch", "props": {"model": "notify", "label": "发送通知"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4},
-                             "content": [{"component": "VTextField", "props": {"model": "global_interval_seconds", "label": "全局扫描间隔(秒)", "type": "number", "min": 5}}]},
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "cols": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 8},
-                             "content": [{"component": "VTextField", "props": {"model": "openlist_url", "label": "OpenList 地址", "placeholder": "http://192.168.1.100:5244"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4},
-                             "content": [{"component": "VTextField", "props": {"model": "max_task_history", "label": "任务记录上限", "type": "number", "min": 10}}]},
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "cols": [
-                            {"component": "VCol", "props": {"cols": 12},
-                             "content": [{"component": "VTextField", "props": {"model": "openlist_token", "label": "OpenList Token", "type": "password"}}]},
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "cols": [
-                            {"component": "VCol", "props": {"cols": 12},
-                             "content": [{"component": "VTextarea", "props": {"model": "jobs_json", "label": "作业配置 (JSON)", "rows": 10, "placeholder": "[]"}}]},
-                        ],
-                    },
-                ],
-            }
-        ]
-
-    def get_page(self) -> List[dict]:
-        """Extra management page rendered in the plugin detail panel."""
-        return [
+                "component": "switch",
+                "name": "enabled",
+                "id": "enabled",
+                "label": "启用插件",
+                "default": False,
+            },
             {
-                "component": "VRow",
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12},
-                        "content": [
-                            {
-                                "component": "VAlert",
-                                "props": {
-                                    "type": "info",
-                                    "variant": "tonal",
-                                    "text": "API 路径前缀: /api/v1/plugin/OpenListSync/"
-                                },
-                            }
-                        ],
-                    }
-                ],
-            }
+                "component": "input",
+                "name": "openlist_url",
+                "id": "openlist_url",
+                "label": "OpenList 服务地址",
+                "placeholder": "http://192.168.1.100:9090",
+                "required": True,
+            },
+            {
+                "component": "input",
+                "name": "openlist_token",
+                "id": "openlist_token",
+                "label": "API Token",
+                "placeholder": "请输入 OpenList API Token",
+                "input_type": "password",
+                "required": True,
+            },
+            {
+                "component": "switch",
+                "name": "notify",
+                "id": "notify",
+                "label": "启用通知",
+                "default": True,
+            },
+            {
+                "component": "input-number",
+                "name": "global_interval_seconds",
+                "id": "global_interval_seconds",
+                "label": "全局扫描间隔（秒）",
+                "placeholder": "60",
+                "required": True,
+                "default": 60,
+            },
+            {
+                "component": "input-number",
+                "name": "max_task_history",
+                "id": "max_task_history",
+                "label": "最大任务记录数",
+                "placeholder": "100",
+                "required": True,
+                "default": 100,
+            },
+            {
+                "component": "input",
+                "name": "data_dir",
+                "id": "data_dir",
+                "label": "数据目录（留空使用默认）",
+                "required": False,
+            },
+            {
+                "component": "textarea",
+                "name": "jobs_json",
+                "id": "jobs_json",
+                "label": "作业配置（JSON）",
+                "required": False,
+                "rows": 10,
+            },
         ]
 
-    # ------------------------------------------------------------------
-    # lifecycle
-    # ------------------------------------------------------------------
+    def get_page(self) -> Optional[dict]:
+        return None
 
-    def init_plugin(self, config: dict = None) -> None:
-        if config:
-            self._enabled = self._to_bool(config.get("enabled", False))
-            self._openlist_url = (config.get("openlist_url") or "").strip()
-            self._openlist_token = (config.get("openlist_token") or "").strip()
-            self._notify = self._to_bool(config.get("notify", True))
-            try:
-                self._global_interval_seconds = int(config.get("global_interval_seconds", 60) or 60)
-            except (ValueError, TypeError):
-                self._global_interval_seconds = 60
-            self._jobs_json = config.get("jobs_json") or "[]"
-            try:
-                self._max_task_history = int(config.get("max_task_history", 100) or 100)
-            except (ValueError, TypeError):
-                self._max_task_history = 100
+    def get_api(self) -> List[dict]:
+        return [
+            {"path": "/jobs", "endpoint": self.api_list_jobs, "methods": ["GET"]},
+            {"path": "/jobs/{job_id}", "endpoint": self.api_get_job, "methods": ["GET"]},
+            {"path": "/jobs", "endpoint": self.api_create_job, "methods": ["POST"]},
+            {"path": "/jobs/{job_id}", "endpoint": self.api_update_job, "methods": ["PUT"]},
+            {"path": "/jobs/{job_id}", "endpoint": self.api_delete_job, "methods": ["DELETE"]},
+            {"path": "/jobs/{job_id}/run", "endpoint": self.api_run_job, "methods": ["POST"]},
+            {"path": "/tasks", "endpoint": self.api_list_tasks, "methods": ["GET"]},
+            {"path": "/tasks/{task_id}", "endpoint": self.api_get_task, "methods": ["GET"]},
+            {"path": "/test_connection", "endpoint": self.api_test_connection, "methods": ["POST"]},
+            {"path": "/status", "endpoint": self.api_status, "methods": ["GET"]},
+        ]
 
-        # Register API routes (once)
-        if not self._routes_registered:
-            self._register_routes()
-            self._routes_registered = True
+    def api_list_jobs(self) -> dict:
+        if not self._job_manager:
+            return {"success": False, "message": "插件未初始化"}
+        jobs = self._job_manager.list_jobs()
+        return {"success": True, "data": jobs}
 
-        # Stop old scheduler if running
-        if self._scheduler:
-            self._scheduler.stop()
-            self._scheduler = None
+    def api_get_job(self, job_id: str) -> dict:
+        if not self._job_manager:
+            return {"success": False, "message": "插件未初始化"}
+        job = self._job_manager.get_job(job_id)
+        if not job:
+            return {"success": False, "message": "作业不存在"}
+        return {"success": True, "data": job}
 
-        # Init managers
-        self._job_manager = JobManager(save_callback=self._on_jobs_changed)
-        self._job_manager.load(self._jobs_json)
-        self._job_manager.compute_next_runs()
-
-        self._task_manager = TaskManager(max_history=self._max_task_history)
-
-        # Init client
-        if self._openlist_url and self._openlist_token:
-            self._client = OpenListClient(
-                base_url=self._openlist_url,
-                token=self._openlist_token,
-                timeout=60,
-            )
-        else:
-            self._client = None
-
-        # Start scheduler if enabled
-        if self._enabled:
-            self._start_scheduler()
-
-        logger.info(
-            f"OpenListSync 初始化完成: enabled={self._enabled}, "
-            f"url={self._openlist_url}, jobs={len(self._job_manager.list_jobs())}"
-        )
-
-    def stop_service(self) -> None:
-        """Called by MP when plugin is disabled or service stops."""
-        if self._scheduler:
-            self._scheduler.stop()
-            self._scheduler = None
-        logger.info("OpenListSync 服务已停止")
-
-    # ------------------------------------------------------------------
-    # internal helpers
-    # ------------------------------------------------------------------
-
-    def _start_scheduler(self) -> None:
-        """Create and start a new scheduler instance."""
-        if self._scheduler:
-            self._scheduler.stop()
-        self._scheduler = Scheduler(
-            interval_seconds=self._global_interval_seconds,
-            job_manager=self._job_manager,
-            task_manager=self._task_manager,
-            execute_fn=self._execute_with_client,
-            notify_fn=self._on_task_done,
-            client_factory=self._make_client,
-        )
-        self._scheduler.start()
-
-    def _make_client(self) -> OpenListClient:
-        """Factory to create an OpenListClient from current config."""
-        if not self._openlist_url:
-            raise OpenListError("OpenList 地址未配置")
-        if not self._openlist_token:
-            raise OpenListError("OpenList Token 未配置")
-        return OpenListClient(
-            base_url=self._openlist_url,
-            token=self._openlist_token,
-            timeout=60,
-        )
-
-    def _execute_with_client(self, job: dict, client: OpenListClient) -> dict:
-        """Wrapper so the scheduler doesn't depend on plugin internals."""
-        return execute_job(job, client)
-
-    def _on_jobs_changed(self, jobs: List[dict]) -> None:
-        """Callback from JobManager: persist jobs_json and update config."""
-        new_json = json.dumps(jobs, ensure_ascii=False, indent=2)
-        self._jobs_json = new_json
+    def api_create_job(self) -> dict:
+        if not self._job_manager:
+            return {"success": False, "message": "插件未初始化"}
+        payload = self._get_api_payload()
         try:
-            self.update_config({"jobs_json": new_json})
+            job = self._job_manager.create_job(payload)
+            return {"success": True, "data": job}
+        except ValueError as e:
+            return {"success": False, "message": str(e)}
         except Exception as e:
-            logger.error(f"保存作业配置失败: {e}")
+            logger.error(f"OpenListSync 创建作业失败: {e}", exc_info=True)
+            return {"success": False, "message": str(e)}
 
-    def _on_task_done(self, job: dict, result: Optional[dict], error: Optional[str]) -> None:
-        """Send MP notification after a task completes."""
-        if not self._notify:
-            return
+    def api_update_job(self, job_id: str) -> dict:
+        if not self._job_manager:
+            return {"success": False, "message": "插件未初始化"}
+        payload = self._get_api_payload()
+        try:
+            job = self._job_manager.update_job(job_id, payload)
+            if not job:
+                return {"success": False, "message": "作业不存在"}
+            return {"success": True, "data": job}
+        except ValueError as e:
+            return {"success": False, "message": str(e)}
+        except Exception as e:
+            logger.error(f"OpenListSync 更新作业失败: {e}", exc_info=True)
+            return {"success": False, "message": str(e)}
 
-        job_name = job.get("name", job.get("id", ""))
-        mode_names = {0: "仅新增", 1: "全同步", 2: "移动"}
-        mode = job.get("sync_mode", 0)
-        mode_name = mode_names.get(mode, str(mode))
+    def api_delete_job(self, job_id: str) -> dict:
+        if not self._job_manager:
+            return {"success": False, "message": "插件未初始化"}
+        ok = self._job_manager.delete_job(job_id)
+        if not ok:
+            return {"success": False, "message": "作业不存在"}
+        return {"success": True}
 
+    def api_run_job(self, job_id: str) -> dict:
+        if not self._scheduler:
+            return {"success": False, "message": "调度器未初始化"}
+        try:
+            task_id = self._scheduler.submit_job(job_id, trigger="manual")
+            if task_id:
+                return {"success": True, "data": {"task_id": task_id}}
+            return {"success": False, "message": "作业无法执行（可能已有任务运行中）"}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def api_list_tasks(self, limit: int = 20, job_id: str = None, status: str = None) -> dict:
+        if not self._task_manager:
+            return {"success": False, "message": "插件未初始化"}
+        tasks = self._task_manager.list_tasks(limit=limit, job_id=job_id, status=status)
+        return {"success": True, "data": tasks}
+
+    def api_get_task(self, task_id: str) -> dict:
+        if not self._task_manager:
+            return {"success": False, "message": "插件未初始化"}
+        task = self._task_manager.get_task(task_id)
+        if not task:
+            return {"success": False, "message": "任务不存在"}
+        return {"success": True, "data": task}
+
+    def api_test_connection(self) -> dict:
+        try:
+            payload = self._get_api_payload() or {}
+            base_url = str(payload.get("openlist_url") or self._base_url or "").strip().rstrip("/")
+            token = str(payload.get("openlist_token") or self._token or "").strip()
+            if not base_url or not token:
+                return {"success": False, "message": "OpenList 地址或 Token 未配置"}
+            client = OpenListClient(base_url=base_url, token=token)
+            ok, message = client.test_connection()
+            return {"success": bool(ok), "message": message}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def api_status(self) -> dict:
+        if not self._scheduler:
+            return {"success": False, "message": "调度器未初始化"}
+        status = self._scheduler.get_status()
+        return {"success": True, "data": status}
+
+    def _notify_sync_result(self, job: dict, task_id: str, result: dict = None, error: str = None):
+        """发送同步结果通知。"""
+        job_name = job.get("name", "未知作业") if isinstance(job, dict) else "未知作业"
         if error:
-            title = f"OpenListSync 同步失败: {job_name}"
-            text = f"模式: {mode_name}\n错误: {error}"
-        elif result:
-            summary_parts = []
-            for key, label in [("copied", "复制"), ("deleted", "删除"), ("moved", "移动"),
-                               ("skipped", "跳过"), ("conflicts", "冲突"), ("failed", "失败")]:
-                count = len(result.get(key, []))
-                if count:
-                    summary_parts.append(f"{label}: {count}")
-            title = f"OpenListSync 同步完成: {job_name}"
-            text = f"模式: {mode_name}\n" + "\n".join(summary_parts)
+            msg = f"【同步失败】{job_name}\n错误：{error}"
         else:
-            title = f"OpenListSync: {job_name}"
-            text = "无结果"
+            summary = (result or {}).get("summary", {})
+            copied = summary.get("copied", 0)
+            failed = summary.get("failed", 0)
+            deleted = summary.get("deleted", 0)
+            conflicts = summary.get("conflicts", 0)
+            msg = f"【同步完成】{job_name}\n新增/复制：{copied}，删除：{deleted}，冲突：{conflicts}，失败：{failed}"
+        self._send_text(msg)
 
-        # Send notification — note: we cannot call notification inside a thread
-        # directly.  We schedule it via MP's event system if possible.
+    def _send_text(self, msg: str):
+        """兼容不同 MoviePilot 通知方法。"""
         try:
-            self._send_notification(title, text)
+            if hasattr(self, "send_text"):
+                return self.send_text(msg)
+            if hasattr(self, "post_message"):
+                return self.post_message(title="OpenListSync", text=msg)
+            if hasattr(self, "send_notification"):
+                return self.send_notification(title="OpenListSync", text=msg)
         except Exception as e:
-            logger.error(f"发送通知失败: {e}")
+            logger.warning(f"OpenListSync 发送通知失败: {e}")
+        logger.info(f"OpenListSync 通知: {msg}")
 
-    def _send_notification(self, title: str, text: str) -> None:
-        """Send a system notification through MP."""
-        try:
-            self.systemmessage.put(
-                title=title,
-                text=text,
-            )
-        except Exception:
-            # Fallback: use post_message
-            self.post_message(
-                title=title,
-                text=text,
-            )
-
-    # ------------------------------------------------------------------
-    # API routes
-    # ------------------------------------------------------------------
-
-    @property
-    def api_prefix(self) -> str:
-        return "/api/v1/plugin/OpenListSync"
-
-    def _register_routes(self):
-        """Register all API routes.  Called by MP framework."""
-
-        @self.get_api(f"{self.api_prefix}/status")
-        async def status(request):
-            """GET: plugin status."""
-            return self._ok({
-                "enabled": self._enabled,
-                "openlist_url": self._openlist_url,
-                "notify": self._notify,
-                "global_interval_seconds": self._global_interval_seconds,
-                "max_task_history": self._max_task_history,
-                "job_count": len(self._job_manager.list_jobs()) if self._job_manager else 0,
-                "scheduler_running": self._scheduler is not None and self._scheduler._thread is not None and self._scheduler._thread.is_alive() if self._scheduler else False,
-                "client_ready": self._client is not None,
-            })
-
-        @self.get_api(f"{self.api_prefix}/jobs")
-        async def list_jobs(request):
-            """GET: list all jobs."""
-            if not self._job_manager:
-                return self._err("插件未初始化")
-            return self._ok(self._job_manager.list_jobs())
-
-        @self.get_api(f"{self.api_prefix}/jobs/(?P<job_id>[^/]+)")
-        async def get_job(request):
-            """GET: get one job by id."""
-            job_id = request.path_params.get("job_id", "")
-            if not self._job_manager:
-                return self._err("插件未初始化")
-            job = self._job_manager.get_job(job_id)
-            if job is None:
-                return self._err(f"作业不存在: {job_id}")
-            return self._ok(job)
-
-        @self.post_api(f"{self.api_prefix}/jobs")
-        async def create_job(request):
-            """POST: create a new job."""
-            if not self._job_manager:
-                return self._err("插件未初始化")
-            try:
-                body = await request.json()
-            except Exception:
-                return self._err("请求体不是有效的 JSON")
-            job = self._job_manager.add_job(body)
-            # Restart scheduler to pick up changes
-            if self._enabled:
-                self._start_scheduler()
-            return self._ok(job)
-
-        @self.put_api(f"{self.api_prefix}/jobs/(?P<job_id>[^/]+)")
-        async def update_job(request):
-            """PUT: update an existing job."""
-            job_id = request.path_params.get("job_id", "")
-            if not self._job_manager:
-                return self._err("插件未初始化")
-            try:
-                body = await request.json()
-            except Exception:
-                return self._err("请求体不是有效的 JSON")
-            job = self._job_manager.update_job(job_id, body)
-            if job is None:
-                return self._err(f"作业不存在: {job_id}")
-            if self._enabled:
-                self._start_scheduler()
-            return self._ok(job)
-
-        @self.delete_api(f"{self.api_prefix}/jobs/(?P<job_id>[^/]+)")
-        async def delete_job(request):
-            """DELETE: remove a job."""
-            job_id = request.path_params.get("job_id", "")
-            if not self._job_manager:
-                return self._err("插件未初始化")
-            ok = self._job_manager.delete_job(job_id)
-            if not ok:
-                return self._err(f"作业不存在: {job_id}")
-            if self._enabled:
-                self._start_scheduler()
-            return self._ok({"deleted": job_id})
-
-        @self.post_api(f"{self.api_prefix}/jobs/(?P<job_id>[^/]+)/run")
-        async def run_job(request):
-            """POST: manually trigger a job."""
-            job_id = request.path_params.get("job_id", "")
-            if not self._job_manager:
-                return self._err("插件未初始化")
-            job = self._job_manager.get_job(job_id)
-            if job is None:
-                return self._err(f"作业不存在: {job_id}")
-
-            # Concurrency guard
-            if self._task_manager and self._task_manager.has_running_task(job_id):
-                running = self._task_manager.get_running_task(job_id)
-                return self._err(f"作业正在运行中: {running.get('id', '') if running else job_id}")
-
-            # Create task
-            task = None
-            if self._task_manager:
-                task = self._task_manager.create_task(job, trigger="manual")
-                self._task_manager.mark_running(task["id"])
-
-            # Build client
-            try:
-                client = self._make_client()
-            except OpenListError as e:
-                if task and self._task_manager:
-                    self._task_manager.mark_failed(task["id"], str(e), task.get("started_at", ""))
-                return self._err(str(e))
-
-            # Execute
-            result = None
-            error = None
-            try:
-                result = execute_job(job, client)
-            except Exception as e:
-                error = str(e)
-                logger.error(f"手动执行失败: {e}")
-                logger.debug(traceback.format_exc())
-
-            # Update task
-            if task and self._task_manager:
-                if error:
-                    self._task_manager.mark_failed(task["id"], error, task.get("started_at", ""))
-                else:
-                    summary = {
-                        "copied": len(result.get("copied", [])),
-                        "deleted": len(result.get("deleted", [])),
-                        "moved": len(result.get("moved", [])),
-                        "skipped": len(result.get("skipped", [])),
-                        "conflicts": len(result.get("conflicts", [])),
-                        "failed": len(result.get("failed", [])),
-                    }
-                    detail = {
-                        "copied": result.get("copied", []),
-                        "deleted": result.get("deleted", []),
-                        "moved": result.get("moved", []),
-                        "skipped": result.get("skipped", []),
-                        "conflicts": result.get("conflicts", []),
-                        "failed": result.get("failed", []),
-                    }
-                    self._task_manager.mark_success(task["id"], summary, detail, task.get("started_at", ""))
-
-            # Update job runtime
-            if self._job_manager:
-                self._job_manager.mark_run_complete(job_id)
-
-            # Notify
-            self._on_task_done(job, result, error)
-
-            if error:
-                return self._err(error)
-            return self._ok({
-                "task_id": task["id"] if task else None,
-                "job_id": job_id,
-                "result": {
-                    "copied": len(result.get("copied", [])),
-                    "deleted": len(result.get("deleted", [])),
-                    "moved": len(result.get("moved", [])),
-                    "skipped": len(result.get("skipped", [])),
-                    "conflicts": len(result.get("conflicts", [])),
-                    "failed": len(result.get("failed", [])),
-                },
-            })
-
-        @self.get_api(f"{self.api_prefix}/tasks")
-        async def list_tasks(request):
-            """GET: list task records."""
-            if not self._task_manager:
-                return self._err("任务管理器未初始化")
-            limit = int(request.query_params.get("limit", 20))
-            job_id = request.query_params.get("job_id", "")
-            status = request.query_params.get("status", "")
-            tasks = self._task_manager.list_tasks(
-                limit=limit, job_id=job_id or None, status=status or None
-            )
-            return self._ok(tasks)
-
-        @self.get_api(f"{self.api_prefix}/tasks/(?P<task_id>[^/]+)")
-        async def get_task(request):
-            """GET: one task detail."""
-            task_id = request.path_params.get("task_id", "")
-            if not self._task_manager:
-                return self._err("任务管理器未初始化")
-            task = self._task_manager.get_task(task_id)
-            if task is None:
-                return self._err(f"任务不存在: {task_id}")
-            return self._ok(task)
-
-        @self.post_api(f"{self.api_prefix}/test_connection")
-        async def test_connection(request):
-            """POST: test OpenList connectivity."""
-            url = self._openlist_url
-            token = self._openlist_token
-
-            # Allow overriding from request body
-            try:
-                body = await request.json()
-            except Exception:
-                body = {}
-            if body.get("url"):
-                url = body["url"]
-            if body.get("token"):
-                token = body["token"]
-
-            if not url:
-                return self._err("OpenList 地址未配置")
-            if not token:
-                return self._err("OpenList Token 未配置")
-
-            try:
-                client = OpenListClient(base_url=url, token=token, timeout=10)
-                info = client.get("/")
-                return self._ok({"connected": True, "info": info})
-            except OpenListError as e:
-                return self._err(f"连接失败: {e}")
-
-    # ------------------------------------------------------------------
-    # response helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _ok(data: Any) -> dict:
-        return {"success": True, "data": data}
-
-    @staticmethod
-    def _err(message: str) -> dict:
-        return {"success": False, "message": message}
-
-    # ------------------------------------------------------------------
-    # utilities
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _to_bool(value) -> bool:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            return value.lower() in ("true", "1", "yes", "on")
-        return bool(value)
+    def _get_api_payload(self) -> dict:
+        """获取 API 请求体，兼容不同 MP V2 方法名。"""
+        for name in ("get_api_data", "api_data", "parse_body"):
+            func = getattr(self, name, None)
+            if callable(func):
+                try:
+                    data = func()
+                    if isinstance(data, dict):
+                        return data
+                except TypeError:
+                    continue
+                except Exception:
+                    break
+        return {}

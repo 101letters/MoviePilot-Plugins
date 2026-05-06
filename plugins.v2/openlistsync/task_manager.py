@@ -1,186 +1,176 @@
-"""Task persistence — JSON file storage with atomic writes."""
+"""任务记录管理：JSON 持久化、原子写入、线程安全、历史裁剪。"""
+import copy
 import json
 import os
 import threading
+import time
 import uuid
-from datetime import datetime
-from pathlib import Path
-from typing import List, Optional
-
-from app.log import logger
-
-
-DATA_DIR = Path(__file__).resolve().parent / "data"
-TASKS_FILE = DATA_DIR / "tasks.json"
+from typing import Optional
 
 
 class TaskManager:
-    """Read/write task records to ``data/tasks.json`` with atomic writes."""
-
-    def __init__(self, max_history: int = 100):
-        self._max_history = max_history
-        self._lock = threading.Lock()
-
-    # ------------------------------------------------------------------
-    # helpers
-    # ------------------------------------------------------------------
-
-    def _load_all(self) -> List[dict]:
-        """Load all tasks from file.  Returns list (empty if file missing)."""
-        if not TASKS_FILE.exists():
-            return []
+    def __init__(self, tasks_file: str, max_history: int = 100):
+        self.tasks_file = tasks_file
         try:
-            text = TASKS_FILE.read_text(encoding="utf-8")
-            data = json.loads(text)
-            return data if isinstance(data, list) else []
-        except Exception as e:
-            logger.warning(f"加载任务文件失败: {e}")
-            return []
+            self.max_history = max(1, int(max_history or 100))
+        except Exception:
+            self.max_history = 100
+        self.lock = threading.RLock()
+        self.data = {"tasks": []}
+        self._load()
 
-    def _save_all(self, tasks: List[dict]) -> None:
-        """Atomically write tasks to file.  Truncates beyond *max_history*."""
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        if self._max_history > 0 and len(tasks) > self._max_history:
-            tasks = tasks[-self._max_history:]
-        tmp = TASKS_FILE.with_suffix(".tmp")
+    def _load(self):
+        if not os.path.exists(self.tasks_file):
+            self.data = {"tasks": []}
+            return
         try:
-            tmp.write_text(
-                json.dumps(tasks, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            os.replace(str(tmp), str(TASKS_FILE))
-        except Exception as e:
-            logger.error(f"保存任务文件失败: {e}")
+            with open(self.tasks_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            self.data = {"tasks": []}
+            return
+        if not isinstance(data, dict):
+            self.data = {"tasks": []}
+            return
+        if not isinstance(data.get("tasks"), list):
+            data["tasks"] = []
+        self.data = data
 
-    @staticmethod
-    def _now() -> str:
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    def _save(self):
+        os.makedirs(os.path.dirname(self.tasks_file), exist_ok=True)
+        tmp = self.tasks_file + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.tasks_file)
 
-    @staticmethod
-    def _task_id() -> str:
-        return f"task_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    def _trim_history(self):
+        tasks = self.data.get("tasks", [])
+        if len(tasks) > self.max_history:
+            self.data["tasks"] = tasks[-self.max_history:]
 
-    # ------------------------------------------------------------------
-    # lifecycle
-    # ------------------------------------------------------------------
+    def _generate_id(self):
+        ts = time.strftime("%Y%m%d%H%M%S")
+        rand = uuid.uuid4().hex[:6]
+        return f"task_{ts}_{rand}"
 
-    def create_task(self, job: dict, trigger: str = "schedule") -> dict:
-        """Create a new pending task record."""
-        task = {
-            "id": self._task_id(),
-            "job_id": job.get("id", ""),
-            "job_name": job.get("name", ""),
-            "trigger": trigger,
-            "status": "pending",
-            "sync_mode": job.get("sync_mode", 0),
-            "src_dir": job.get("src_dir", ""),
-            "dst_dir": job.get("dst_dir", ""),
-            "started_at": self._now(),
-            "finished_at": None,
-            "duration_seconds": 0,
-            "summary": {"copied": 0, "deleted": 0, "moved": 0, "skipped": 0, "conflicts": 0, "failed": 0},
-            "detail": {"copied": [], "deleted": [], "moved": [], "skipped": [], "conflicts": [], "failed": []},
-            "error": None,
-        }
-        with self._lock:
-            tasks = self._load_all()
-            tasks.append(task)
-            self._save_all(tasks)
-        return task
+    def _now_str(self):
+        return time.strftime("%Y-%m-%d %H:%M:%S")
 
-    def _update(self, task_id: str, updates: dict) -> Optional[dict]:
-        """Update a task record and persist."""
-        with self._lock:
-            tasks = self._load_all()
-            for task in tasks:
-                if task.get("id") == task_id:
-                    task.update(updates)
-                    self._save_all(tasks)
-                    return task
-        return None
+    def create_task(self, job: dict, trigger: str) -> dict:
+        with self.lock:
+            now = self._now_str()
+            task = {
+                "id": self._generate_id(),
+                "job_id": job["id"],
+                "job_name": job.get("name", ""),
+                "trigger": trigger,
+                "status": "pending",
+                "sync_mode": int(job.get("sync_mode", 0)),
+                "src_dir": job.get("src_dir", ""),
+                "dst_dir": job.get("dst_dir", ""),
+                "started_at": None,
+                "finished_at": None,
+                "duration_seconds": None,
+                "summary": {},
+                "detail": {},
+                "error": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+            self.data["tasks"].append(task)
+            self._trim_history()
+            self._save()
+            return task
 
-    def mark_running(self, task_id: str) -> Optional[dict]:
-        return self._update(task_id, {"status": "running"})
+    def mark_running(self, task_id: str):
+        with self.lock:
+            task = self._find_task(task_id)
+            if task:
+                now = self._now_str()
+                task["status"] = "running"
+                task["started_at"] = now
+                task["updated_at"] = now
+                self._save()
 
-    def mark_success(self, task_id: str, summary: dict, detail: dict,
-                     started_at: str = "") -> Optional[dict]:
-        started_dt = None
-        if started_at:
+    def mark_success(self, task_id: str, result: dict):
+        with self.lock:
+            task = self._find_task(task_id)
+            if task:
+                finished_at = self._now_str()
+                task["status"] = "success"
+                task["finished_at"] = finished_at
+                task["summary"] = result.get("summary", {})
+                task["detail"] = {
+                    "copied": result.get("copied", []),
+                    "deleted": result.get("deleted", []),
+                    "moved": result.get("moved", []),
+                    "skipped": result.get("skipped", []),
+                    "conflicts": result.get("conflicts", []),
+                    "failed": result.get("failed", []),
+                }
+                started = task.get("started_at")
+                if started:
+                    import datetime
+                    try:
+                        s = datetime.datetime.strptime(started, "%Y-%m-%d %H:%M:%S")
+                        f = datetime.datetime.strptime(finished_at, "%Y-%m-%d %H:%M:%S")
+                        task["duration_seconds"] = int((f - s).total_seconds())
+                    except Exception:
+                        task["duration_seconds"] = 0
+                task["updated_at"] = finished_at
+                self._save()
+
+    def mark_failed(self, task_id: str, error: str):
+        with self.lock:
+            task = self._find_task(task_id)
+            if task:
+                finished_at = self._now_str()
+                task["status"] = "failed"
+                task["finished_at"] = finished_at
+                task["error"] = error
+                started = task.get("started_at")
+                if started:
+                    import datetime
+                    try:
+                        s = datetime.datetime.strptime(started, "%Y-%m-%d %H:%M:%S")
+                        f = datetime.datetime.strptime(finished_at, "%Y-%m-%d %H:%M:%S")
+                        task["duration_seconds"] = int((f - s).total_seconds())
+                    except Exception:
+                        task["duration_seconds"] = 0
+                task["updated_at"] = finished_at
+                self._save()
+
+    def list_tasks(self, limit: int = 20, job_id: str = None, status: str = None) -> list:
+        with self.lock:
             try:
-                started_dt = datetime.strptime(started_at, "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                pass
-        duration = 0
-        if started_dt:
-            duration = int((datetime.now() - started_dt).total_seconds())
-
-        return self._update(task_id, {
-            "status": "success",
-            "finished_at": self._now(),
-            "duration_seconds": duration,
-            "summary": summary,
-            "detail": detail,
-        })
-
-    def mark_failed(self, task_id: str, error: str, started_at: str = "") -> Optional[dict]:
-        started_dt = None
-        if started_at:
-            try:
-                started_dt = datetime.strptime(started_at, "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                pass
-        duration = 0
-        if started_dt:
-            duration = int((datetime.now() - started_dt).total_seconds())
-
-        return self._update(task_id, {
-            "status": "failed",
-            "finished_at": self._now(),
-            "duration_seconds": duration,
-            "error": error,
-        })
-
-    # ------------------------------------------------------------------
-    # query
-    # ------------------------------------------------------------------
+                limit = int(limit)
+            except Exception:
+                limit = 20
+            limit = max(1, min(limit, 200))
+            tasks = self.data.get("tasks", [])
+            if job_id:
+                tasks = [t for t in tasks if t.get("job_id") == job_id]
+            if status:
+                tasks = [t for t in tasks if t.get("status") == status]
+            tasks = sorted(tasks, key=lambda t: t.get("updated_at", ""), reverse=True)
+            return copy.deepcopy(tasks[:limit])
 
     def get_task(self, task_id: str) -> Optional[dict]:
-        with self._lock:
-            tasks = self._load_all()
-            for t in tasks:
+        with self.lock:
+            for t in self.data.get("tasks", []):
                 if t.get("id") == task_id:
-                    return t
-        return None
-
-    def list_tasks(self, limit: int = 20, job_id: str = None,
-                   status: str = None) -> List[dict]:
-        """List recent tasks, optionally filtered."""
-        with self._lock:
-            tasks = self._load_all()
-
-        if job_id:
-            tasks = [t for t in tasks if t.get("job_id") == job_id]
-        if status:
-            tasks = [t for t in tasks if t.get("status") == status]
-
-        # Return most recent last (so reversed first for slicing)
-        tasks = tasks[-limit:] if limit > 0 else tasks
-        return list(reversed(tasks))
+                    return copy.deepcopy(t)
+            return None
 
     def has_running_task(self, job_id: str) -> bool:
-        """Check if *job_id* has an active running task."""
-        with self._lock:
-            tasks = self._load_all()
-        for t in tasks:
-            if t.get("job_id") == job_id and t.get("status") in ("pending", "running"):
-                return True
-        return False
+        with self.lock:
+            return any(
+                t.get("job_id") == job_id and t.get("status") in ("pending", "running")
+                for t in self.data.get("tasks", [])
+            )
 
-    def get_running_task(self, job_id: str) -> Optional[dict]:
-        """Return the running/pending task for *job_id*, if any."""
-        with self._lock:
-            tasks = self._load_all()
-        for t in tasks:
-            if t.get("job_id") == job_id and t.get("status") in ("pending", "running"):
+    def _find_task(self, task_id: str) -> Optional[dict]:
+        for t in self.data.get("tasks", []):
+            if t["id"] == task_id:
                 return t
         return None

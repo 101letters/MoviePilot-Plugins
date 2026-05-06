@@ -1,192 +1,186 @@
-"""Background scheduler — timer-based job scanning."""
+"""后台调度器：定期扫描作业并串行执行同步任务。"""
 import threading
-import traceback
-from datetime import datetime
-from typing import Optional, Callable
+import time
+import datetime
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
-from app.log import logger
+try:
+    from .engine import SyncEngine
+    from .task_manager import TaskManager
+    from .job_manager import JobManager
+    from .client import OpenListClient
+except ImportError:
+    from engine import SyncEngine
+    from task_manager import TaskManager
+    from job_manager import JobManager
+    from client import OpenListClient
 
 
 class Scheduler:
-    """Background thread that periodically scans enabled jobs and executes them."""
+    def __init__(self, client: OpenListClient, task_manager: TaskManager, job_manager: JobManager, logger=None):
+        self.client = client
+        self.task_manager = task_manager
+        self.job_manager = job_manager
+        self.logger = logger or logging.getLogger(__name__)
+        self._engine = SyncEngine(client)
+        self._running = False
+        self._stopped = threading.Event()
+        self._scan_interval = 60
+        self._executor = None
+        self._scan_thread = None
+        self._current_future = None
+        self._current_task_id = None
+        self._running_jobs = set()
+        self._lock = threading.RLock()
 
-    def __init__(
-        self,
-        interval_seconds: int = 60,
-        job_manager=None,        # JobManager instance
-        task_manager=None,       # TaskManager instance
-        execute_fn: Optional[Callable] = None,   # (job, client) -> result
-        notify_fn: Optional[Callable] = None,     # (job, result, error) -> None
-        client_factory: Optional[Callable] = None,  # () -> OpenListClient
-    ):
-        self._interval = max(interval_seconds, 5)
-        self._job_manager = job_manager
-        self._task_manager = task_manager
-        self._execute_fn = execute_fn
-        self._notify_fn = notify_fn
-        self._client_factory = client_factory
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    # ------------------------------------------------------------------
-    # lifecycle
-    # ------------------------------------------------------------------
-
-    def start(self) -> None:
-        """Start the background scheduler thread."""
-        if self._thread and self._thread.is_alive():
-            logger.info("Scheduler 已在运行，跳过启动")
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._run_loop,
-            name="OpenListSyncScheduler",
-            daemon=True,
-        )
-        self._thread.start()
-        logger.info(f"Scheduler 已启动，扫描间隔 {self._interval}s")
-
-    def stop(self, timeout: float = 10.0) -> None:
-        """Signal stop and wait for the thread to exit."""
-        self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=timeout)
-        logger.info("Scheduler 已停止")
-
-    def update_interval(self, seconds: int) -> None:
-        self._interval = max(seconds, 5)
-
-    # ------------------------------------------------------------------
-    # run loop
-    # ------------------------------------------------------------------
-
-    def _run_loop(self) -> None:
-        """Main loop: sleep, then scan jobs."""
-        while not self._stop_event.is_set():
-            self._stop_event.wait(timeout=self._interval)
-            if self._stop_event.is_set():
-                break
-            self._scan_and_run()
-
-    def _scan_and_run(self) -> None:
-        """Scan all enabled jobs; execute those due."""
-        if self._job_manager is None:
-            return
-
-        try:
-            jobs = self._job_manager.get_enabled_jobs()
-        except Exception as e:
-            logger.error(f"Scheduler 获取作业列表失败: {e}")
-            return
-
-        now = datetime.now()
-
-        for job in jobs:
-            if self._stop_event.is_set():
-                break
-
-            job_id = job.get("id", "")
-            next_run_str = job.get("next_run_at")
-
-            # Parse next_run_at
-            if next_run_str:
-                try:
-                    next_run = datetime.fromisoformat(next_run_str)
-                except (ValueError, TypeError):
-                    next_run = None
-            else:
-                next_run = None
-
-            # If no next_run_at, compute it now
-            if next_run is None:
-                self._job_manager.mark_run_complete(job_id)
-                continue
-
-            if now < next_run:
-                continue  # not due yet
-
-            # Check concurrency
-            if self._task_manager and self._task_manager.has_running_task(job_id):
-                logger.info(f"Scheduler 跳过 job={job.get('name', job_id)}（正在运行）")
-                continue
-
-            # Execute
-            self._execute_one(job)
-
-    def _execute_one(self, job: dict) -> None:
-        """Create a task record, execute, update records, notify."""
-        job_id = job.get("id", "")
-        job_name = job.get("name", job_id)
-
-        # Create task
-        task = None
-        if self._task_manager:
-            task = self._task_manager.create_task(job, trigger="schedule")
-            self._task_manager.mark_running(task["id"])
-
-        # Build client
-        client = None
-        if self._client_factory:
-            try:
-                client = self._client_factory()
-            except Exception as e:
-                logger.error(f"Scheduler 创建 OpenListClient 失败: {e}")
-                if task and self._task_manager:
-                    self._task_manager.mark_failed(task["id"], str(e), task.get("started_at", ""))
-                self._notify(job, None, f"创建客户端失败: {e}")
+    def start(self):
+        """启动后台扫描线程。"""
+        with self._lock:
+            if self._running:
                 return
+            if self._executor is None or getattr(self._executor, "_shutdown", False):
+                self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="openlist_sync")
+            self._running = True
+            self._stopped.clear()
+            self._scan_thread = threading.Thread(target=self._scan_loop, daemon=True, name="openlist_scan")
+            self._scan_thread.start()
+        self.logger.info("OpenListSync 调度器已启动")
 
-        if client is None:
-            err = "Scheduler: client_factory 不可用"
-            logger.error(err)
-            if task and self._task_manager:
-                self._task_manager.mark_failed(task["id"], err, task.get("started_at", ""))
-            return
+    def stop(self):
+        """停止调度器。"""
+        with self._lock:
+            if not self._running:
+                return
+            self._running = False
+            self._stopped.set()
+            scan_thread = self._scan_thread
+            self._scan_thread = None
+            executor = self._executor
+            self._executor = None
 
-        # Execute
-        result = None
-        error = None
-        try:
-            result = self._execute_fn(job, client)
-        except Exception as e:
-            error = str(e)
-            logger.error(f"Scheduler 执行 job={job_name} 失败: {e}")
-            logger.debug(traceback.format_exc())
+        if scan_thread and scan_thread.is_alive():
+            scan_thread.join(timeout=30)
 
-        # Mark task
-        if task and self._task_manager:
-            if error:
-                self._task_manager.mark_failed(task["id"], error, task.get("started_at", ""))
-            else:
-                summary = {
-                    "copied": len(result.get("copied", [])),
-                    "deleted": len(result.get("deleted", [])),
-                    "moved": len(result.get("moved", [])),
-                    "skipped": len(result.get("skipped", [])),
-                    "conflicts": len(result.get("conflicts", [])),
-                    "failed": len(result.get("failed", [])),
-                }
-                detail = {
-                    "copied": result.get("copied", []),
-                    "deleted": result.get("deleted", []),
-                    "moved": result.get("moved", []),
-                    "skipped": result.get("skipped", []),
-                    "conflicts": result.get("conflicts", []),
-                    "failed": result.get("failed", []),
-                }
-                self._task_manager.mark_success(task["id"], summary, detail, task.get("started_at", ""))
-
-        # Update job runtime
-        if self._job_manager:
-            self._job_manager.mark_run_complete(job_id)
-
-        # Notify
-        self._notify(job, result, error)
-
-    def _notify(self, job: dict, result: Optional[dict], error: Optional[str]) -> None:
-        """Call user-provided notify callback."""
-        if self._notify_fn:
+        if executor:
             try:
-                self._notify_fn(job, result, error)
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=False)
+
+        self.logger.info("OpenListSync 调度器已停止")
+
+    def _scan_loop(self):
+        """后台扫描循环。"""
+        while not self._stopped.is_set():
+            try:
+                now = time.time()
+                jobs = self.job_manager.list_jobs()
+                for job in jobs:
+                    if self._stopped.is_set():
+                        break
+                    if not job.get("enabled", False):
+                        continue
+                    if self._is_job_due(job, now):
+                        self._submit_job(job)
             except Exception as e:
-                logger.error(f"通知回调失败: {e}")
+                self.logger.error(f"扫描循环出错: {e}")
+            self._stopped.wait(self._scan_interval)
+
+    def _is_job_due(self, job: dict, now: float) -> bool:
+        """判断作业是否到执行时间。"""
+        next_run_at = job.get("next_run_at")
+        if not next_run_at:
+            return True
+        try:
+            dt = datetime.datetime.strptime(next_run_at, "%Y-%m-%d %H:%M:%S")
+            return dt.timestamp() <= now + 5
+        except Exception:
+            return True
+
+    def submit_job(self, job_id: str, trigger: str = "manual") -> Optional[str]:
+        """手动提交一个作业，返回 task_id 或 None。"""
+        with self._lock:
+            job = self.job_manager.get_job(job_id)
+            if not job:
+                self.logger.warning(f"作业 {job_id} 不存在")
+                return None
+            return self._submit_job(job, trigger=trigger)
+
+    def _submit_job(self, job: dict, trigger: str = "schedule") -> Optional[str]:
+        """内部提交执行。"""
+        with self._lock:
+            if not self._running or self._stopped.is_set():
+                return None
+            if not self._executor:
+                return None
+            if self.is_busy():
+                self.logger.info("已有同步任务执行中，跳过本次提交")
+                return None
+
+            job_id = job["id"]
+
+            if job_id in self._running_jobs:
+                self.logger.info(f"作业 {job.get('name', job_id)} 已提交或执行中，跳过")
+                return None
+
+            if self.task_manager.has_running_task(job_id):
+                self.logger.info(f"作业 {job.get('name', job_id)} 已有运行中的任务，跳过")
+                return None
+
+            task = self.task_manager.create_task(job, trigger)
+            task_id = task["id"]
+
+            self._running_jobs.add(job_id)
+
+            try:
+                future = self._executor.submit(self._run_job, job, task_id, trigger)
+            except Exception:
+                self._running_jobs.discard(job_id)
+                self.task_manager.mark_failed(task_id, "提交任务到执行器失败")
+                raise
+
+            self._current_future = future
+            self._current_task_id = task_id
+            self.job_manager.mark_job_run(job_id, task_id)
+
+            return task_id
+
+    def _run_job(self, job: dict, task_id: str, trigger: str):
+        """实际执行同步逻辑，在 executor 线程中运行。"""
+        job_id = job.get("id", "")
+        self.task_manager.mark_running(task_id)
+
+        try:
+            result = self._engine.execute(job)
+
+            self.task_manager.mark_success(task_id, result)
+            self.logger.info(
+                f"作业 {job.get('name', job_id)} 同步完成: "
+                f"copied={result.get('summary', {}).get('copied', 0)}, "
+                f"failed={result.get('summary', {}).get('failed', 0)}, "
+                f"deleted={result.get('summary', {}).get('deleted', 0)}, "
+                f"conflicts={result.get('summary', {}).get('conflicts', 0)}"
+            )
+        except Exception as e:
+            self.task_manager.mark_failed(task_id, str(e))
+            self.logger.error(f"作业 {job.get('name', job_id)} 同步失败: {e}", exc_info=True)
+        finally:
+            with self._lock:
+                self._running_jobs.discard(job_id)
+                if self._current_task_id == task_id:
+                    self._current_task_id = None
+                    self._current_future = None
+
+    def is_busy(self) -> bool:
+        """检查是否有任务正在执行。"""
+        return self._current_future is not None and not self._current_future.done()
+
+    def get_status(self) -> dict:
+        """获取调度器状态。"""
+        return {
+            "running": self._running,
+            "busy": self.is_busy(),
+            "current_task_id": self._current_task_id if self.is_busy() else None,
+        }
