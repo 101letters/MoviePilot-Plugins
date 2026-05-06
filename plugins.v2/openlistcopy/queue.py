@@ -153,9 +153,15 @@ class CopyQueue:
             self._set_status(task, TaskStatus.SUCCESS)
             logger.info(f"OpenListCopy 复制成功: {task.name}")
         except AuthError as e:
-            self._set_status(task, TaskStatus.FAILED, f"认证失败: {e}")
+            error = f"认证失败: {e}"
+            self._set_status(task, TaskStatus.FAILED, error)
+            if self._notify_callback:
+                self._notify_callback(f"OpenListCopy 复制失败: {task.name}\n{error}")
         except NonRetryableError as e:
-            self._set_status(task, TaskStatus.FAILED, f"不可重试: {e}")
+            error = f"不可重试: {e}"
+            self._set_status(task, TaskStatus.FAILED, error)
+            if self._notify_callback:
+                self._notify_callback(f"OpenListCopy 复制失败: {task.name}\n{error}")
         except RetryableError as e:
             self._retry_later(task, str(e))
         except Exception as e:

@@ -25,8 +25,8 @@ MoviePilot V2 插件：监听整理完成事件，通过 OpenList/AList 内部 `
   {"category":"国产剧","mp_dir":"/media/国产剧","src_dir":"/影视库/国产剧","dst_dir":"/123云盘/影视/国产剧"},
   {"category":"欧美剧","mp_dir":"/media/欧美剧","src_dir":"/影视库/欧美剧","dst_dir":"/123云盘/影视/欧美剧"},
   {"category":"日韩剧","mp_dir":"/media/日韩剧","src_dir":"/影视库/日韩剧","dst_dir":"/123云盘/影视/日韩剧"},
-  {"category":"动漫","mp_dir":"/media/动漫","src_dir":"/影视库/动漫","dst_dir":"/123云盘/影视/动漫"},
-  {"category":"综艺","mp_dir":"/media/综艺","src_dir":"/影视库/综艺","dst_dir":"/123云盘/影视/综艺"}
+  {"category":"国漫","mp_dir":"/media/国漫","src_dir":"/影视库/国漫","dst_dir":"/123云盘/影视/国漫"},
+  {"category":"日番","mp_dir":"/media/日番","src_dir":"/影视库/日番","dst_dir":"/123云盘/影视/日番"}
 ]
 ```
 

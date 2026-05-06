@@ -24,8 +24,8 @@ DEFAULT_MAPPINGS = [
     {"category": "国产剧", "mp_dir": "/media/国产剧", "src_dir": "/影视库/国产剧", "dst_dir": "/123云盘/影视/国产剧"},
     {"category": "欧美剧", "mp_dir": "/media/欧美剧", "src_dir": "/影视库/欧美剧", "dst_dir": "/123云盘/影视/欧美剧"},
     {"category": "日韩剧", "mp_dir": "/media/日韩剧", "src_dir": "/影视库/日韩剧", "dst_dir": "/123云盘/影视/日韩剧"},
-    {"category": "动漫", "mp_dir": "/media/动漫", "src_dir": "/影视库/动漫", "dst_dir": "/123云盘/影视/动漫"},
-    {"category": "综艺", "mp_dir": "/media/综艺", "src_dir": "/影视库/综艺", "dst_dir": "/123云盘/影视/综艺"},
+    {"category": "国漫", "mp_dir": "/media/国漫", "src_dir": "/影视库/国漫", "dst_dir": "/123云盘/影视/国漫"},
+    {"category": "日番", "mp_dir": "/media/日番", "src_dir": "/影视库/日番", "dst_dir": "/123云盘/影视/日番"},
 ]
 
 
@@ -57,16 +57,16 @@ class OpenListCopy(_PluginBase):
 
     def init_plugin(self, config: dict = None):
         if config:
-            self._enabled = bool(config.get("enabled", False))
+            self._enabled = self._to_bool(config.get("enabled", False))
             self._openlist_url = config.get("openlist_url") or config.get("oplist_url") or ""
             self._username = config.get("username") or ""
             self._password = config.get("password") or ""
             self._token = config.get("token") or ""
-            self._timeout = int(config.get("timeout") or 60)
-            self._skip_existing = bool(config.get("skip_existing", True))
-            self._max_retries = int(config.get("max_retries") or 3)
-            self._retry_interval = int(config.get("retry_interval") or 300)
-            self._notify = bool(config.get("notify", True))
+            self._timeout = self._to_int(config.get("timeout"), 60)
+            self._skip_existing = self._to_bool(config.get("skip_existing", True))
+            self._max_retries = self._to_int(config.get("max_retries"), 3)
+            self._retry_interval = self._to_int(config.get("retry_interval"), 300)
+            self._notify = self._to_bool(config.get("notify", True))
             self._mappings_text = config.get("mappings") or self._mappings_text
 
         self._mappings = self._load_mappings(self._mappings_text)
@@ -118,9 +118,15 @@ class OpenListCopy(_PluginBase):
                     return str(target.get(key))
         if isinstance(target, (str, Path)):
             return str(target)
+        if target is not None:
+            for key in ("path", "file_path", "target_path", "target", "name"):
+                value = getattr(target, key, None)
+                if value:
+                    return str(value)
         for key in ("target_dir", "target_path", "file_path", "path", "dest", "destination"):
-            if transfer.get(key):
-                return str(transfer.get(key))
+            value = transfer.get(key) if isinstance(transfer, dict) else getattr(transfer, key, None)
+            if value:
+                return str(value)
         return ""
 
     def _build_task(self, mp_path: str) -> Optional[CopyTask]:
@@ -164,6 +170,26 @@ class OpenListCopy(_PluginBase):
     def _norm_remote(path: str) -> str:
         value = str(PurePosixPath(str(path).replace("\\", "/"))).rstrip("/")
         return value if value.startswith("/") else f"/{value}"
+
+
+    @staticmethod
+    def _to_bool(value, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "y", "on", "启用", "是")
+        return bool(value)
+
+    @staticmethod
+    def _to_int(value, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
 
     def _load_mappings(self, text) -> List[dict]:
         try:
