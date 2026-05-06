@@ -10,5 +10,17 @@
     "history": {
       "v0.1.0": "首个版本：监听 TransferComplete 事件，通过 OpenList /api/fs/copy 复制整个媒体文件夹，支持 9 类路径映射、目标已存在跳过、异步队列、任务去重和失败重试。"
     }
+  },
+  "OpenListSync": {
+    "name": "OpenList同步",
+    "description": "OpenList/AList 自动同步插件，支持仅新增、全同步、移动三种模式，定时扫描、作业管理、任务记录与通知。",
+    "labels": "OpenList,同步,网盘,定时,自动化",
+    "version": "0.1.0",
+    "icon": "sync.png",
+    "author": "101letters",
+    "level": 1,
+    "history": {
+      "v0.1.0": "首个版本：单引擎配置、多作业管理（JSON）、三种同步模式（仅新增/全同步/移动）、fnmatch 排除规则、定时扫描调度、手动执行 API、任务记录与 MP 通知。"
+    }
   }
 }
