@@ -1,14 +1,2 @@
 {
-  "OpenListUploader": {
-    "name": "OpenList 上传",
-    "description": "监听整理完成事件，通过 OpenList 上传 API 将媒体文件上传到网盘。",
-    "labels": "OpenList,上传,网盘,自动化",
-    "version": "0.1.0",
-    "icon": "cloud-upload.png",
-    "author": "101letters",
-    "level": 1,
-    "history": {
-      "v0.1.0": "首个版本：监听 TransferComplete 事件，通过 OpenList /api/fs/put 流式上传文件到网盘，支持路径映射、文件过滤、失败重试。"
-    }
-  }
 }
