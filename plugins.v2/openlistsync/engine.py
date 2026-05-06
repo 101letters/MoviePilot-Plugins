@@ -1,4 +1,5 @@
 """同步执行引擎：三种同步模式的核心逻辑。"""
+import os
 import fnmatch
 from typing import Optional
 
@@ -34,6 +35,33 @@ def split_rel_path(rel_path: str):
 class SyncEngine:
     def __init__(self, client):
         self.client = client
+
+    @staticmethod
+    def rel_path_from_src(src_dir: str, abs_path: str) -> str:
+        """计算事件路径相对于 src_dir 的相对路径"""
+        src = src_dir.strip("/")
+        ap = abs_path.strip("/")
+        if ap == src:
+            return ""
+        prefix = src + "/"
+        if ap.startswith(prefix):
+            return ap[len(prefix):]
+        raise ValueError(f"event_path '{abs_path}' 不在 src_dir '{src_dir}' 下")
+
+    @staticmethod
+    def normalize_path(path: str) -> str:
+        path = str(path or "").strip()
+        if not path:
+            return ""
+        if not path.startswith("/"):
+            path = "/" + path
+        if len(path) > 1:
+            path = path.rstrip("/")
+        return path
+
+    @staticmethod
+    def join_rel_path(parent: str, name: str) -> str:
+        return join_rel_path(parent, name)
 
     def should_exclude(self, rel_path: str, name: str, rules: list) -> bool:
         """用 fnmatch 匹配排除规则"""
@@ -220,39 +248,26 @@ class SyncEngine:
             src_file = src_files[rel_path]
             dst_file = dst_files.get(rel_path)
             if dst_file is None:
-                # 阶段1：copy
                 try:
                     self.copy_one(src_dir, dst_dir, rel_path)
                     copied.append(rel_path)
                 except Exception as e:
                     failed.append({"path": rel_path, "operation": "copy", "error": str(e)})
                     continue
-
-                # 阶段2：verify
                 try:
                     verified = self.get_one(dst_dir, rel_path)
                 except Exception as e:
                     failed.append({"path": rel_path, "operation": "verify", "error": str(e)})
                     continue
-
                 if not verified or int(verified.get("size") or 0) != src_file["size"]:
-                    failed.append({
-                        "path": rel_path,
-                        "operation": "verify",
-                        "error": "copy verification failed",
-                    })
+                    failed.append({"path": rel_path, "operation": "verify", "error": "copy verification failed"})
                     continue
-
-                # 阶段3：remove source
                 try:
                     self.remove_one(src_dir, rel_path)
                     moved.append(rel_path)
                 except Exception as e:
                     failed.append({"path": rel_path, "operation": "remove_source", "error": str(e)})
-
                 continue
-
-            # 目标已存在
             if dst_file["size"] == src_file["size"]:
                 try:
                     self.remove_one(src_dir, rel_path)
@@ -275,3 +290,159 @@ class SyncEngine:
             "conflicts": conflicts,
             "failed": failed,
         }
+
+    def sync_event(self, job: dict, event_path: str, file_list_new: list = None) -> dict:
+        """事件驱动的单路径同步"""
+        src_dir = job["src_dir"]
+        mode = int(job["sync_mode"])
+        exclude_rules = job.get("exclude_rules") or []
+        file_list_new = file_list_new or []
+
+        rel_base = self.rel_path_from_src(src_dir, event_path)
+
+        if file_list_new:
+            rel_paths = [
+                self.join_rel_path(rel_base, fn)
+                for fn in file_list_new if fn
+            ]
+        elif rel_base:
+            rel_paths = [rel_base]
+        else:
+            raise ValueError("事件路径为作业根目录且无 file_list_new，跳过以避免全量同步")
+
+        rel_paths = [
+            p for p in rel_paths
+            if not self.should_exclude(p, os.path.basename(p), exclude_rules)
+        ]
+
+        if not rel_paths:
+            return {
+                "mode": mode,
+                "event_path": event_path,
+                "copied": [], "deleted": [], "moved": [], "skipped": [], "conflicts": [], "failed": [],
+                "summary": {"scanned_src": 0, "scanned_dst": 0, "copied": 0, "deleted": 0, "moved": 0, "skipped": 0, "conflicts": 0, "failed": 0}
+            }
+
+        if mode == 0:
+            result = self._sync_event_incremental(job, rel_paths)
+        elif mode == 1:
+            result = self._sync_event_mirror(job, rel_base, rel_paths, bool(file_list_new))
+        elif mode == 2:
+            result = self._sync_event_move(job, rel_paths)
+        else:
+            raise ValueError(f"不支持的同步模式: {mode}")
+
+        result["mode"] = mode
+        result["event_path"] = event_path
+        for k in ("copied", "deleted", "moved", "skipped", "conflicts", "failed"):
+            items = result.get(k, [])
+            result.setdefault("summary", {})[k] = len(items) if isinstance(items, list) else (1 if items else 0)
+        summary = result.setdefault("summary", {})
+        summary.setdefault("scanned_src", summary.get("copied", 0) + summary.get("skipped", 0) + summary.get("conflicts", 0) + summary.get("failed", 0))
+        summary.setdefault("scanned_dst", summary.get("deleted", 0))
+        return result
+
+    def _expand_rel_paths_to_files(self, job: dict, rel_paths: list) -> list:
+        """将 rel_paths 中的目录展开为文件列表"""
+        result = []
+        for rel_path in rel_paths:
+            info = self.client.get(join_path(job["src_dir"], rel_path))
+            if info and info.get("is_dir"):
+                files = self.walk_files(join_path(job["src_dir"], rel_path), job.get("exclude_rules") or [])
+                for local_rel in files:
+                    result.append(join_rel_path(rel_path, local_rel))
+            else:
+                result.append(rel_path)
+        return result
+
+    def _sync_event_incremental(self, job: dict, rel_paths: list) -> dict:
+        copied, skipped, conflicts, failed = [], [], [], []
+        expanded = self._expand_rel_paths_to_files(job, rel_paths)
+
+        for rel_path in expanded:
+            try:
+                src_file = self.client.get(join_path(job["src_dir"], rel_path))
+                if not src_file:
+                    failed.append({"path": rel_path, "error": "源文件不存在"})
+                    continue
+
+                dst_file = self.client.get(join_path(job["dst_dir"], rel_path))
+                if not dst_file:
+                    self.copy_one(job["src_dir"], job["dst_dir"], rel_path)
+                    copied.append(rel_path)
+                elif int(src_file.get("size") or 0) == int(dst_file.get("size") or 0):
+                    skipped.append(rel_path)
+                else:
+                    conflicts.append({"path": rel_path, "src_size": src_file.get("size"), "dst_size": dst_file.get("size")})
+            except Exception as e:
+                failed.append({"path": rel_path, "error": str(e)})
+
+        return {"copied": copied, "deleted": [], "moved": [], "skipped": skipped, "conflicts": conflicts, "failed": failed}
+
+    def _sync_event_mirror(self, job: dict, rel_base: str, rel_paths: list, from_file_list: bool) -> dict:
+        if from_file_list:
+            return self._sync_event_incremental(job, rel_paths)
+
+        src_scope = join_path(job["src_dir"], rel_base)
+        dst_scope = join_path(job["dst_dir"], rel_base)
+
+        src_files = self.walk_files(src_scope, job.get("exclude_rules") or [])
+        dst_files = self.walk_files(dst_scope, job.get("exclude_rules") or [])
+
+        copied, deleted, skipped, conflicts, failed = [], [], [], [], []
+
+        for local_rel, src_info in src_files.items():
+            full_rel = join_rel_path(rel_base, local_rel)
+            if local_rel not in dst_files:
+                try:
+                    self.copy_one(job["src_dir"], job["dst_dir"], full_rel)
+                    copied.append(full_rel)
+                except Exception as e:
+                    failed.append({"path": full_rel, "error": str(e)})
+            elif int(src_info.get("size") or 0) == int(dst_files[local_rel].get("size") or 0):
+                skipped.append(full_rel)
+            else:
+                conflicts.append({"path": full_rel, "src_size": src_info.get("size"), "dst_size": dst_files[local_rel].get("size")})
+
+        for local_rel in dst_files:
+            if local_rel not in src_files:
+                full_rel = join_rel_path(rel_base, local_rel)
+                try:
+                    self.remove_one(job["dst_dir"], full_rel)
+                    deleted.append(full_rel)
+                except Exception as e:
+                    failed.append({"path": full_rel, "error": str(e)})
+
+        return {"copied": copied, "deleted": deleted, "moved": [], "skipped": skipped, "conflicts": conflicts, "failed": failed}
+
+    def _sync_event_move(self, job: dict, rel_paths: list) -> dict:
+        copied, moved, skipped, conflicts, failed = [], [], [], [], []
+        expanded = self._expand_rel_paths_to_files(job, rel_paths)
+
+        for rel_path in expanded:
+            try:
+                src_file = self.client.get(join_path(job["src_dir"], rel_path))
+                if not src_file:
+                    failed.append({"path": rel_path, "error": "源文件不存在"})
+                    continue
+
+                dst_file = self.client.get(join_path(job["dst_dir"], rel_path))
+                if not dst_file:
+                    self.copy_one(job["src_dir"], job["dst_dir"], rel_path)
+                    copied.append(rel_path)
+                    verified = self.client.get(join_path(job["dst_dir"], rel_path))
+                    if verified and int(verified.get("size") or 0) == int(src_file.get("size") or 0):
+                        self.remove_one(job["src_dir"], rel_path)
+                        moved.append(rel_path)
+                    else:
+                        failed.append({"path": rel_path, "error": "复制后校验失败"})
+                elif int(src_file.get("size") or 0) == int(dst_file.get("size") or 0):
+                    self.remove_one(job["src_dir"], rel_path)
+                    moved.append(rel_path)
+                    skipped.append(rel_path)
+                else:
+                    conflicts.append({"path": rel_path, "src_size": src_file.get("size"), "dst_size": dst_file.get("size")})
+            except Exception as e:
+                failed.append({"path": rel_path, "error": str(e)})
+
+        return {"copied": copied, "deleted": [], "moved": moved, "skipped": skipped, "conflicts": conflicts, "failed": failed}
