@@ -9,8 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.core.event import Event, eventmanager
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas import NotificationType
-from app.schemas.types import EventType
+from app.schemas.types import EventType, NotificationType
 
 from .client import OpenListClient
 from .queue import CopyQueue, CopyTask
