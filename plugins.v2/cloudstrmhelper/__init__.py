@@ -513,6 +513,7 @@ class CloudStrmHelper(_PluginBase):
                 return JSONResponse({"state": False, "message": f"解析直链失败: {e}"}, status_code=502)
             resp = RedirectResponse(url=url, status_code=302)
             resp.headers["Cache-Control"] = "no-store"
+            resp.headers["X-CloudStrm-Mode"] = self._strm_url_mode
             return resp
         if mode == "resolve" and self._proxy is not None:
             try:

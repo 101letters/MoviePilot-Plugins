@@ -10,7 +10,7 @@ import types
 import unittest
 import json
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # 让插件目录可被 import
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
@@ -776,27 +776,49 @@ class TestProxyHandlerResolve(unittest.TestCase):
         """resolve_final_url=True 但预解析失败时，回退 _build_url 的原始 URL，不抛异常。"""
         ph = self._make_ph(resolve_final_url=True)
         ph.alist.fs_get.return_value = {"raw_url": "http://upstream/foo?token=abc"}
-        # _resolve_final_url 会 import httpx；stub httpx 不可用时返回 ""，回退原始 raw_url
-        import sys
-        httpx_stub = types.ModuleType("httpx")
-        class _Resp:
-            status_code = 200
-            url = "http://upstream/foo?token=abc"
-        class _Client:
-            def __init__(self, *a, **k): pass
-            def __enter__(self): return self
-            def __exit__(self, *a): return False
-            def request(self, *a, **k): raise Exception("simulated")
-        httpx_stub.Client = _Client
-        httpx_stub.Timeout = lambda *a, **k: None
-        httpx_stub.URL = lambda x: type("U", (), {"join": lambda self, l: l})()
-        sys.modules["httpx"] = httpx_stub
-        try:
+        with patch("cloudstrmhelper.proxy_handler.requests.Session") as session_cls:
+            session = MagicMock()
+            session.__enter__.return_value = session
+            session.__exit__.return_value = False
+            session.request.side_effect = Exception("simulated")
+            session_cls.return_value = session
             url = ph.resolve("/x.mkv")
-        finally:
-            del sys.modules["httpx"]
         # 预解析失败回退原始 raw_url
         self.assertEqual(url, "http://upstream/foo?token=abc")
+
+    def test_head_4xx_falls_back_to_get_range(self):
+        """HEAD 返回 4xx/5xx 时不能当成最终地址，应回退 GET Range 取可播放 URL。"""
+        ph = self._make_ph(resolve_final_url=True)
+        ph.alist.fs_get.return_value = {"raw_url": "http://upstream/start?token=abc"}
+
+        class _Resp:
+            def __init__(self, status_code, url, headers=None):
+                self.status_code = status_code
+                self.url = url
+                self.headers = headers or {}
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        with patch("cloudstrmhelper.proxy_handler.requests.Session") as session_cls:
+            session = MagicMock()
+            session.__enter__.return_value = session
+            session.__exit__.return_value = False
+            session.request.side_effect = [
+                _Resp(403, "http://upstream/start?token=abc"),
+                _Resp(206, "http://cdn.example.com/final?sig=xyz"),
+            ]
+            session_cls.return_value = session
+
+            url = ph.resolve("/x.mkv", ua="Infuse/8")
+
+        self.assertEqual(url, "http://cdn.example.com/final?sig=xyz")
+        calls = session.request.call_args_list
+        self.assertEqual(calls[0].args[0], "HEAD")
+        self.assertEqual(calls[1].args[0], "GET")
+        self.assertEqual(calls[1].kwargs["headers"]["Range"], "bytes=0-0")
+        self.assertTrue(calls[1].kwargs["stream"])
 
     def test_is_dir_raises(self):
         ph = self._make_ph()

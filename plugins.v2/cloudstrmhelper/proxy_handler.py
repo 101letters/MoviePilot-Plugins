@@ -8,8 +8,10 @@
 - 日志脱敏：_safe_url_for_log 只保留 scheme://host/path，去掉 query value。
 - 失败 raise，端点层捕获后写负缓存并返回 502 JSON。
 """
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 from typing import Optional
+
+import requests
 
 from app.log import logger
 
@@ -102,23 +104,17 @@ class ProxyHandler:
     def _resolve_final_url(self, url: str, ua: str) -> str:
         """跟随重定向链取最终 URL，失败回退空串（端点层用原始 URL 兜底）。
 
-        策略：HEAD → 失败回退 GET Range bytes=0-0（stream=False，不下载完整文件）→ 仍失败回退原始 URL。
+        策略：HEAD → 失败回退 GET Range bytes=0-0（stream=True，只取响应头）→ 仍失败回退原始 URL。
         最多 MAX_REDIRECT_ATTEMPTS 跳，循环检测。多策略带 (connect, read) 超时重试。
         """
-        try:
-            import httpx
-        except ImportError:
-            logger.debug("【302跳转】httpx 不可用，跳过最终 URL 预解析")
-            return ""
-
         for attempt, (connect_t, read_t) in enumerate(_RESOLVE_TIMEOUTS, 1):
             try:
-                final = self._follow_chain(httpx, url, ua, connect_t, read_t, method="HEAD")
+                final = self._follow_chain(url, ua, connect_t, read_t, method="HEAD")
                 if final is not None:
                     return final
                 # HEAD 不支持（405 等）→ 回退 GET Range
                 logger.debug(f"【302跳转】HEAD 未取到最终 URL，回退 GET Range: attempt={attempt}")
-                final = self._follow_chain(httpx, url, ua, connect_t, read_t, method="GET",
+                final = self._follow_chain(url, ua, connect_t, read_t, method="GET",
                                            extra_headers={"Range": "bytes=0-0"})
                 if final is not None:
                     return final
@@ -131,19 +127,19 @@ class ProxyHandler:
         logger.warning(f"【302跳转】预解析最终 URL 失败，回退原始 URL: {_safe_url_for_log(url)}")
         return ""
 
-    def _follow_chain(self, httpx, url: str, ua: str, connect_t: float, read_t: float,
+    def _follow_chain(self, url: str, ua: str, connect_t: float, read_t: float,
                       method: str = "HEAD", extra_headers: dict = None) -> Optional[str]:
         """跟随一条重定向链。返回最终 URL 或 None（应回退/重试）。
 
         None 表示「该 method 未取到最终 URL」（如 405/不允许），由调用方决定回退或重试。
-        遇到非 3xx 的成功响应，返回 resp.url（HEAD 时即最终地址）。
+        遇到非 3xx 的 2xx 成功响应，返回 resp.url（HEAD 时即最终地址）。
         """
-        timeout = httpx.Timeout(read_t, connect=connect_t)
+        timeout = (connect_t, read_t)
         headers = {"User-Agent": ua} if ua else {}
         if extra_headers:
             headers.update(extra_headers)
         try:
-            with httpx.Client(follow_redirects=False, timeout=timeout) as client:
+            with requests.Session() as session:
                 current = url
                 visited = set()
                 for _ in range(MAX_REDIRECT_ATTEMPTS + 1):
@@ -151,22 +147,33 @@ class ProxyHandler:
                         logger.warning(f"【302跳转】检测到循环重定向，回退原始 URL: {_safe_url_for_log(url)}")
                         return ""
                     visited.add(current)
-                    resp = client.request(method, current, headers=headers)
+                    # GET Range 只用于拿响应头和最终 URL；stream=True 避免服务端忽略 Range 时下载完整文件。
+                    resp = session.request(
+                        method,
+                        current,
+                        headers=headers,
+                        allow_redirects=False,
+                        timeout=timeout,
+                        stream=(method == "GET"),
+                    )
                     code = resp.status_code
-                    if 300 <= code < 400:
-                        location = resp.headers.get("location")
-                        if not location:
-                            return ""
-                        if location.startswith("http"):
-                            current = location
-                        else:
-                            current = str(httpx.URL(current).join(location))
-                        continue
-                    # 405 Method Not Allowed → HEAD 不被支持，回退调用方做 GET
-                    if code == 405:
-                        return None
-                    # 非重定向：取最终请求 URL
-                    return str(resp.url)
+                    try:
+                        if 300 <= code < 400:
+                            location = resp.headers.get("location")
+                            if not location:
+                                return ""
+                            current = urljoin(current, location)
+                            continue
+                        # 405 Method Not Allowed → HEAD 不被支持，回退调用方做 GET
+                        if code == 405:
+                            return None
+                        # 4xx/5xx 不是可播放最终地址；HEAD 失败后回退 GET Range，GET 失败则重试/兜底原始 URL。
+                        if code >= 400:
+                            return None
+                        # 非重定向成功：取最终请求 URL
+                        return str(resp.url)
+                    finally:
+                        resp.close()
         except Exception as e:
             raise e
         return None
