@@ -193,6 +193,9 @@ class TestStrmPathResolution(unittest.TestCase):
         plugin._refresh_enabled = False
         plugin._mediaservers = []
         plugin._transfer_mp_mediaserver_paths = ""
+        # 防御性过滤：测试用例默认不限制扩展名、不排除
+        plugin._rmt_mediaext = []
+        plugin._exclude_spec = None
         return StrmGenerator(plugin), plugin
 
     def test_basic_relative(self):
@@ -233,6 +236,43 @@ class TestStrmPathResolution(unittest.TestCase):
         gen = StrmGenerator(plugin)
         self.assertEqual(gen._plugin_id, "CloudStrmHelper")
         self.assertEqual(gen._redirect_path, "/api/v1/plugin/CloudStrmHelper/redirect")
+
+    def test_defensive_filter_skips_non_media_ext(self):
+        """防御性过滤：扩展名不在白名单则跳过 STRM 生成。"""
+        gen, plugin = self._make_plugin("/media/movies", "/strm/movies")
+        plugin._rmt_mediaext = ["mkv"]  # 只允许 mkv
+        ok, path, created = gen.generate("/media/movies/Foo.mp4", "/cloud/Foo.mp4")
+        self.assertFalse(ok)
+        self.assertIsNone(path)
+
+    def test_defensive_filter_skips_excluded(self):
+        """防御性过滤：命中排除规则则跳过 STRM 生成。"""
+        import pathspec
+        gen, plugin = self._make_plugin("/media/movies", "/strm/movies")
+        plugin._rmt_mediaext = []
+        plugin._exclude_spec = pathspec.PathSpec.from_lines(
+            pathspec.patterns.GitWildMatchPattern, ["sample/**"])
+        ok, path, created = gen.generate("/media/movies/sample/x.mkv", "/cloud/sample/x.mkv")
+        self.assertFalse(ok)
+        self.assertIsNone(path)
+
+    def test_defensive_filter_allows_media(self):
+        """防御性过滤：白名单内且未排除则正常生成。"""
+        import pathspec
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+            local_root = Path(tmp) / "media"
+            strm_root = Path(tmp) / "strm"
+            local_root.mkdir()
+            strm_root.mkdir()
+            media_file = local_root / "Foo.mkv"
+            media_file.write_bytes(b"movie")
+            gen, plugin = self._make_plugin(str(local_root), str(strm_root))
+            plugin._rmt_mediaext = ["mkv", "mp4"]
+            plugin._exclude_spec = pathspec.PathSpec.from_lines(
+                pathspec.patterns.GitWildMatchPattern, ["*.tmp"])
+            ok, path, created = gen.generate(str(media_file), "/cloud/Foo.mkv")
+            self.assertTrue(ok)
+            self.assertTrue(created)
 
     def test_overwrite_always_rewrites_existing_strm(self):
         with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:

@@ -1066,12 +1066,23 @@ class CloudStrmHelper(_PluginBase):
                                 "component": "VRow",
                                 "content": [
                                     {
-                                        "component": "VCol", "props": {"cols": 12, "md": 4},
+                                        "component": "VCol", "props": {"cols": 12, "md": 8},
                                         "content": [{"component": "VTextField", "props": {
                                             "model": "alist_target_path", "label": "AList 上传目标根目录",
                                             "placeholder": DEFAULT_ALIST_TARGET_PATH,
                                             "hint": "本地媒体会上传到这个 AList 目录下，并保留相对目录结构",
                                             "persistent-hint": True,
+                                        }}],
+                                    },
+                                    {
+                                        "component": "VCol", "props": {"cols": 12, "md": 4},
+                                        "content": [{"component": "VSelect", "props": {
+                                            "model": "sync_mode", "label": "同步模式",
+                                            "items": [
+                                                {"title": "复制（保留本地源文件）", "value": "copy"},
+                                                {"title": "移动（上传成功后删本地）", "value": "move"},
+                                            ],
+                                            "hint": "上传成功后是否删除本地源文件（不删云端文件）", "persistent-hint": True,
                                         }}],
                                     },
                                 ],
@@ -1124,8 +1135,8 @@ class CloudStrmHelper(_PluginBase):
                     {
                         "component": "VCardTitle",
                         "content": [
-                            {"component": "VIcon", "props": {"icon": "mdi-sync", "color": "primary", "class": "mr-2"}},
-                            {"component": "span", "text": "同步与过滤"},
+                            {"component": "VIcon", "props": {"icon": "mdi-filter-variant", "color": "primary", "class": "mr-2"}},
+                            {"component": "span", "text": "上传与 STRM 过滤"},
                         ],
                     },
                     {"component": "VDivider"},
@@ -1136,17 +1147,7 @@ class CloudStrmHelper(_PluginBase):
                                 "component": "VRow",
                                 "content": [
                                     {
-                                        "component": "VCol", "props": {"cols": 12, "md": 3},
-                                        "content": [{"component": "VSelect", "props": {
-                                            "model": "sync_mode", "label": "同步模式",
-                                            "items": [
-                                                {"title": "复制", "value": "copy"},
-                                                {"title": "移动", "value": "move"},
-                                            ],
-                                        }}],
-                                    },
-                                    {
-                                        "component": "VCol", "props": {"cols": 12, "md": 3},
+                                        "component": "VCol", "props": {"cols": 12, "md": 4},
                                         "content": [{"component": "VSelect", "props": {
                                             "model": "overwrite_mode", "label": "STRM 覆盖模式",
                                             "items": [
@@ -1156,17 +1157,18 @@ class CloudStrmHelper(_PluginBase):
                                         }}],
                                     },
                                     {
-                                        "component": "VCol", "props": {"cols": 12, "md": 3},
+                                        "component": "VCol", "props": {"cols": 12, "md": 4},
                                         "content": [{"component": "VTextField", "props": {
                                             "model": "upload_concurrency", "label": "并发上传数",
                                             "placeholder": "3", "type": "number",
                                         }}],
                                     },
                                     {
-                                        "component": "VCol", "props": {"cols": 12, "md": 3},
+                                        "component": "VCol", "props": {"cols": 12, "md": 4},
                                         "content": [{"component": "VTextField", "props": {
                                             "model": "rmt_mediaext", "label": "可处理媒体扩展名",
                                             "placeholder": "mp4,mkv,ts,iso,...",
+                                            "hint": "上传与 STRM 共用：仅这些扩展名会上传并生成 STRM", "persistent-hint": True,
                                         }}],
                                     },
                                 ],
@@ -1177,8 +1179,9 @@ class CloudStrmHelper(_PluginBase):
                                     "component": "VCol", "props": {"cols": 12},
                                     "content": [{
                                         "component": "VTextarea", "props": {
-                                            "model": "exclude_patterns", "label": "排除规则（gitignore 语法，一行一条）",
+                                            "model": "exclude_patterns", "label": "排除规则（上传与 STRM 共用，gitignore 语法，一行一条）",
                                             "rows": 3, "placeholder": DEFAULT_EXCLUDE_PATTERNS,
+                                            "hint": "命中规则的文件既不上传也不生成 STRM", "persistent-hint": True,
                                         },
                                     }],
                                 }],
@@ -1191,6 +1194,7 @@ class CloudStrmHelper(_PluginBase):
                                         "component": "VTextarea", "props": {
                                             "model": "event_filters", "label": "事件路径过滤（一行一个本地目录前缀，留空=全部处理）",
                                             "rows": 2, "placeholder": DEFAULT_EVENT_FILTERS,
+                                            "hint": "仅整理到这些目录前缀下的事件才处理（目录级白名单）", "persistent-hint": True,
                                         },
                                     }],
                                 }],

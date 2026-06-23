@@ -99,6 +99,41 @@ class StrmGenerator:
                        "请在插件配置填写 MoviePilot 内网访问地址")
         return "http://localhost:3000"
 
+    # ---- 防御性过滤（上传与 STRM 共用）----
+    def _should_skip(self, local_path: str) -> bool:
+        """扩展名 + 排除规则过滤，命中则跳过 STRM 生成。
+
+        与上传阶段（transfer_listener/run_once）共用同一套规则，这里做防御性二次校验，
+        避免外部调用绕过过滤。返回 True 表示应跳过。
+        """
+        # 扩展名白名单
+        media_exts = getattr(self.plugin, "_rmt_mediaext", None) or []
+        if media_exts:
+            ext = Path(local_path).suffix.lower().lstrip(".")
+            if ext not in media_exts:
+                logger.debug(f"【STRM生成】扩展名不在白名单，跳过: {local_path}")
+                return True
+        # 排除规则（gitignore，路径相对本地媒体根）
+        spec = getattr(self.plugin, "_exclude_spec", None)
+        if spec:
+            try:
+                roots = getattr(self.plugin, "_local_media_roots", None) or [self.plugin._local_media_path]
+                local = Path(local_path)
+                for root_value in roots:
+                    try:
+                        rel = str(local.relative_to(root_value)).replace("\\", "/")
+                    except ValueError:
+                        if self._has_prefix(local, Path(root_value)):
+                            rel = str(self._relative_to(local, Path(root_value))).replace("\\", "/")
+                        else:
+                            continue
+                    if spec.match_file(rel):
+                        logger.debug(f"【STRM生成】命中排除规则，跳过: {local_path}")
+                        return True
+            except Exception as e:
+                logger.debug(f"【STRM生成】排除规则校验异常，放行: {e}")
+        return False
+
     # ---- 生成 ----
     def generate(self, local_path: str, remote_path: str,
                  mediainfo: Any = None, meta: Any = None) -> Tuple[bool, Optional[Path], bool]:
@@ -109,6 +144,10 @@ class StrmGenerator:
         mediainfo   : MediaInfo（用于 Emby 刷新 RefreshMediaItem）
         """
         try:
+            # 防御性过滤：扩展名 + 排除规则（与上传阶段共用）
+            if self._should_skip(local_path):
+                return False, None, False
+
             strm_path = self._strm_output_path(local_path, remote_path)
             if strm_path is None:
                 return False, None, False
