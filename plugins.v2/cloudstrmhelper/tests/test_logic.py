@@ -151,11 +151,13 @@ def _stub_app_modules():
     app_helper_ms.MediaServerHelper = MediaServerHelper
     sys.modules["app.helper.mediaserver"] = app_helper_ms
 
-    # app.utils.system
+    # app.utils.system（is_bluray_dir 是 SystemUtils 类的静态方法，非模块级函数）
     app_utils_system = types.ModuleType("app.utils.system")
-    def is_bluray_dir(dir_path):
-        return False
-    app_utils_system.is_bluray_dir = is_bluray_dir
+    class SystemUtils:
+        @staticmethod
+        def is_bluray_dir(dir_path):
+            return False
+    app_utils_system.SystemUtils = SystemUtils
     sys.modules["app.utils.system"] = app_utils_system
 
 

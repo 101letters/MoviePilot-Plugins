@@ -12,7 +12,7 @@ from typing import List, Optional
 
 import pathspec
 from app.log import logger
-from app.utils.system import is_bluray_dir
+from app.utils.system import SystemUtils
 
 
 class TransferListener:
@@ -56,7 +56,7 @@ class TransferListener:
 
             # 蓝光目录跳过
             try:
-                if is_bluray_dir(Path(target_dir)):
+                if SystemUtils.is_bluray_dir(Path(target_dir)):
                     logger.info(f"【整理监听】蓝光目录，跳过: {target_dir}")
                     return
             except Exception:
