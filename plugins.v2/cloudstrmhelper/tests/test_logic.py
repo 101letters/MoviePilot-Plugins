@@ -333,6 +333,8 @@ class TestTransferListenerExclude(unittest.TestCase):
         plugin._local_media_path = "/media/movies"
         plugin._local_media_roots = ["/media/movies"]
         plugin._alist_target_path = "/cloud"
+        plugin._upload_path_mappings = "/media/movies#/cloud"
+        plugin._upload_mappings = [("/media/movies", "/cloud")]
         plugin._event_filter_prefixes = []
         plugin._exclude_spec = None
         plugin._rmt_mediaext = ["mkv"]
@@ -399,7 +401,7 @@ class TestPluginMetadata(unittest.TestCase):
     def test_metadata_present(self):
         from cloudstrmhelper import CloudStrmHelper
         self.assertEqual(CloudStrmHelper.plugin_name, "云端STRM整理助手")
-        self.assertEqual(CloudStrmHelper.plugin_version, "1.3.0")
+        self.assertEqual(CloudStrmHelper.plugin_version, "1.3.1")
         self.assertEqual(CloudStrmHelper.plugin_config_prefix, "cloudstrmhelper_")
         self.assertEqual(CloudStrmHelper.plugin_author, "101letters")
         self.assertEqual(CloudStrmHelper.auth_level, 1)
@@ -411,6 +413,8 @@ class TestPluginMetadata(unittest.TestCase):
         self.assertIsInstance(defaults, dict)
         self.assertIn("enabled", defaults)
         self.assertIn("alist_url", defaults)
+        self.assertIn("upload_path_mappings", defaults)
+        self.assertIn("strm_path_mappings", defaults)
         self.assertIn("local_strm_paths", defaults)
         self.assertIn("strm_output_path", defaults)
         self.assertFalse(defaults["enabled"])
@@ -418,6 +422,8 @@ class TestPluginMetadata(unittest.TestCase):
         self.assertEqual(defaults["moviepilot_address"], "http://192.168.31.6:3000")
         self.assertEqual(defaults["alist_url"], "http://192.168.31.6:5244/")
         self.assertEqual(defaults["alist_target_path"], "/123云盘/影视/华语电影")
+        self.assertIn("/media/movies#/123云盘/影视/华语电影", defaults["upload_path_mappings"])
+        self.assertIn("/123云盘/影视/华语电影#/strm/test/华语电影", defaults["strm_path_mappings"])
         self.assertIn("/media/movies", defaults["local_media_path"])
         self.assertIn("/media/tv", defaults["local_media_path"])
         self.assertIn("/media/movies#/strm/test/华语电影", defaults["local_strm_paths"])
@@ -514,6 +520,38 @@ class TestPathComputation(unittest.TestCase):
         self.assertEqual(
             plugin._build_remote_path("/media/tv/Show/Season 01/S01E01.mkv"),
             "/123云盘/影视/华语电影/Show/Season 01/S01E01.mkv",
+        )
+
+    def test_upload_path_mapping_custom_cloud_root(self):
+        plugin = self._make_plugin()
+        plugin._upload_path_mappings = "/media/华语电影#/123云盘/影视/华语电影"
+        plugin._upload_mappings = [("/media/华语电影", "/123云盘/影视/华语电影")]
+        self.assertEqual(
+            plugin._build_remote_path("/media/华语电影/流浪地球.mkv"),
+            "/123云盘/影视/华语电影/流浪地球.mkv",
+        )
+
+    def test_strm_path_mapping_custom_cloud_to_local(self):
+        plugin = self._make_plugin()
+        plugin._strm_path_mappings = "/123云盘/影视/华语电影#/strm/华语电影"
+        plugin._strm_mappings = [("/123云盘/影视/华语电影", "/strm/华语电影")]
+        plugin._strm_path_mappings_explicit = True
+        self.assertEqual(
+            plugin._strm_output_path_from_remote("/123云盘/影视/华语电影/流浪地球.mkv"),
+            Path("/strm/华语电影/流浪地球.strm"),
+        )
+
+    def test_explicit_strm_mapping_overrides_legacy_local_mapping(self):
+        plugin = self._make_plugin()
+        plugin._strm_path_mappings = "/123云盘/影视/电视剧#/strm/custom-tv"
+        plugin._strm_mappings = [("/123云盘/影视/电视剧", "/strm/custom-tv")]
+        plugin._strm_path_mappings_explicit = True
+        self.assertEqual(
+            plugin._strm_output_path_for(
+                "/media/tv/Show/Season 01/S01E01.mkv",
+                "/123云盘/影视/电视剧/Show/Season 01/S01E01.mkv",
+            ),
+            Path("/strm/custom-tv/Show/Season 01/S01E01.strm"),
         )
 
     def test_strm_path_from_remote_path(self):
@@ -1005,6 +1043,8 @@ class TestNewConfigPersistence(unittest.TestCase):
         plugin._alist_url = "http://alist:5244/"
         plugin._alist_token = "t"
         plugin._alist_target_path = "/cloud"
+        plugin._upload_path_mappings = "/media/movies#/cloud/movies"
+        plugin._strm_path_mappings = "/cloud/movies#/strm/movies"
         plugin._local_strm_paths = "/media/movies#/strm/movies"
         plugin._local_media_path = "/media/movies"
         plugin._strm_output_path = "/strm/movies"
@@ -1026,7 +1066,10 @@ class TestNewConfigPersistence(unittest.TestCase):
         captured = {}
         plugin.update_config = lambda cfg: captured.update(cfg)
         plugin._update_config()
-        for key in ("strm_url_mode", "resolve_final_url", "redirect_cache_ttl", "head_probe_mode"):
+        for key in (
+            "upload_path_mappings", "strm_path_mappings",
+            "strm_url_mode", "resolve_final_url", "redirect_cache_ttl", "head_probe_mode",
+        ):
             self.assertIn(key, captured, f"{key} 未持久化")
 
     def test_normalize_strm_url_mode(self):
