@@ -19,12 +19,20 @@ from app.schemas import RefreshMediaItem
 class StrmGenerator:
     """STRM 生成器。"""
 
-    # 插件 ID（类名）= CloudStrmHelper，redirect 端点路径固定
-    PLUGIN_ID = "CloudStrmHelper"
-    REDIRECT_PATH = f"/api/v1/plugin/{PLUGIN_ID}/redirect"
+    # redirect 端点路径前缀；插件 ID（类名）在运行时从 plugin 类取，避免写死字符串
+    REDIRECT_PREFIX = "/api/v1/plugin"
 
     def __init__(self, plugin: Any):
         self.plugin = plugin
+
+    @property
+    def _plugin_id(self) -> str:
+        """插件 ID = 主类名（规范：不要把插件 ID 写死到字符串里）。"""
+        return type(self.plugin).__name__
+
+    @property
+    def _redirect_path(self) -> str:
+        return f"{self.REDIRECT_PREFIX}/{self._plugin_id}/redirect"
 
     # ---- 路径计算 ----
     def _strm_output_path(self, local_path: str) -> Optional[Path]:
@@ -64,7 +72,7 @@ class StrmGenerator:
         from app.core.config import settings
         token = settings.API_TOKEN or ""
         return (
-            f"{mp_address.rstrip('/')}{self.REDIRECT_PATH}"
+            f"{mp_address.rstrip('/')}{self._redirect_path}"
             f"?apikey={token}&path={quote(remote_path, safe='/')}"
         )
 

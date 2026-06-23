@@ -206,13 +206,26 @@ class TestStrmPathResolution(unittest.TestCase):
         self.assertIsNone(p)
 
     def test_strm_url_format(self):
-        gen, _ = self._make_plugin("/media/movies", "/strm/movies")
+        gen, plugin = self._make_plugin("/media/movies", "/strm/movies")
         url = gen._build_strm_url("/媒体库/电影/Foo.mkv")
-        self.assertIn("/api/v1/plugin/CloudStrmHelper/redirect", url)
+        # 插件 ID 来自运行时类名（不写死字符串）；测试用 mock，故用其类名动态断言
+        plugin_id = type(plugin).__name__
+        self.assertIn(f"/api/v1/plugin/{plugin_id}/redirect", url)
         self.assertIn("apikey=test-token-123", url)
         self.assertIn("path=", url)
         # path 应被 urlenc（中文/空格）
         self.assertIn("%E5%AA%92%E4%BD%93%E5%BA%93", url)  # 媒体库 的 urlenc
+
+    def test_plugin_id_not_hardcoded(self):
+        """规范：不写死插件 ID 字符串。用真实 CloudStrmHelper 实例验证 redirect 路径含正确类名。"""
+        from cloudstrmhelper import CloudStrmHelper
+        from cloudstrmhelper.strm_generator import StrmGenerator
+        # 真实插件类（不传 config，避免触发 app 依赖）
+        plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+        plugin._moviepilot_address = "http://mp:3000"
+        gen = StrmGenerator(plugin)
+        self.assertEqual(gen._plugin_id, "CloudStrmHelper")
+        self.assertEqual(gen._redirect_path, "/api/v1/plugin/CloudStrmHelper/redirect")
 
 
 class TestExcludeSpec(unittest.TestCase):
@@ -299,6 +312,24 @@ class TestPluginMetadata(unittest.TestCase):
         self.assertIn("/redirect", paths)
         self.assertIn("/status", paths)
         self.assertIn("/sync_now", paths)
+
+    def test_api_has_auth(self):
+        """规范：不要默认匿名开放 API，每个端点须声明 auth。"""
+        from cloudstrmhelper import CloudStrmHelper
+        apis = CloudStrmHelper.get_api(CloudStrmHelper)
+        for a in apis:
+            self.assertIn("auth", a, f"端点 {a['path']} 缺少 auth 字段")
+            self.assertEqual(a["auth"], "apikey", f"端点 {a['path']} auth 应为 apikey")
+
+    def test_metadata_icon_and_version(self):
+        """规范：plugin_icon 必需，version 与 package.v2.json 一致。"""
+        import json
+        from cloudstrmhelper import CloudStrmHelper
+        self.assertTrue(CloudStrmHelper.plugin_icon, "plugin_icon 不能为空")
+        self.assertIn("cloudstrmhelper", CloudStrmHelper.plugin_icon)
+        with open(PLUGIN_DIR.parent.parent / "package.v2.json") as f:
+            pkg = json.load(f)
+        self.assertEqual(pkg["CloudStrmHelper"]["version"], CloudStrmHelper.plugin_version)
 
 
 class TestRemotePathComputation(unittest.TestCase):

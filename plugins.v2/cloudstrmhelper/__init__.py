@@ -40,10 +40,11 @@ DEFAULT_MEDIA_EXTS = (
 class CloudStrmHelper(_PluginBase):
     """云端STRM整理助手。"""
 
-    # ---- 插件元数据（类属性，MoviePilot V2 无 package.v2.json）----
+    # ---- 插件元数据（类属性；V2 索引同时写入仓库根 package.v2.json，version 须一致）----
     plugin_name = "云端STRM整理助手"
     plugin_desc = "整理入库自动复制到AList并生成STRM，Emby 302直链播放"
-    plugin_icon = ""  # 图标可后续补充 URL
+    # 图标：引用仓库 icons 目录下的图标文件（URL 形式，与官方插件一致）
+    plugin_icon = "https://raw.githubusercontent.com/101letters/MoviePilot-Plugins/main/icons/cloudstrmhelper.png"
     plugin_version = "1.0.0"
     plugin_author = "101letters"
     author_url = "https://github.com/101letters"
@@ -238,12 +239,17 @@ class CloudStrmHelper(_PluginBase):
     # API 端点
     # ============================================================
     def get_api(self) -> List[Dict[str, Any]]:
-        """注册插件 API：/redirect（302）、/status（状态）、/sync_now（手动触发）。"""
+        """注册插件 API：/redirect（302）、/status（状态）、/sync_now（手动触发）。
+
+        auth=apikey：面向外部系统/客户端调用（STRM 播放器、脚本）。
+        规范：如无特殊原因不要默认匿名开放，故显式声明鉴权方式。
+        """
         return [
             {
                 "path": "/redirect",
                 "endpoint": self.redirect,
                 "methods": ["GET", "HEAD"],
+                "auth": "apikey",
                 "summary": "302跳转",
                 "description": "解析云端路径为直链并 302 重定向（STRM 播放）",
             },
@@ -251,6 +257,7 @@ class CloudStrmHelper(_PluginBase):
                 "path": "/status",
                 "endpoint": self.status,
                 "methods": ["GET"],
+                "auth": "apikey",
                 "summary": "同步状态",
                 "description": "查询当前云同步任务进度",
             },
@@ -258,6 +265,7 @@ class CloudStrmHelper(_PluginBase):
                 "path": "/sync_now",
                 "endpoint": self.sync_now,
                 "methods": ["GET", "POST"],
+                "auth": "apikey",
                 "summary": "手动同步",
                 "description": "手动触发一次全量同步",
             },
