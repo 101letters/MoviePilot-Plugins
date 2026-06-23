@@ -58,7 +58,7 @@ class CloudStrmHelper(_PluginBase):
     plugin_desc = "整理入库自动复制到AList并生成STRM，Emby 302直链播放"
     # 图标：引用仓库 icons 目录下的图标文件（URL 形式，与官方插件一致）
     plugin_icon = "https://raw.githubusercontent.com/101letters/MoviePilot-Plugins/main/icons/cloudstrmhelper.png"
-    plugin_version = "1.3.1"
+    plugin_version = "1.3.2"
     plugin_author = "101letters"
     author_url = "https://github.com/101letters"
     plugin_config_prefix = "cloudstrmhelper_"
@@ -855,8 +855,10 @@ class CloudStrmHelper(_PluginBase):
 
     @staticmethod
     def _normalize_strm_url_mode(value: str) -> str:
-        """STRM URL 模式：moviepilot_redirect（默认/推荐）/ alist_direct（实验）。"""
+        """STRM URL 模式：moviepilot_redirect（默认/推荐）/ alist_direct / cloud_raw_url（实验）。"""
         normalized = (value or "moviepilot_redirect").strip().lower()
+        if normalized in ("cloud_raw_url", "cloud_raw", "raw_url", "raw", "cloud_direct"):
+            return "cloud_raw_url"
         if normalized in ("alist_direct", "alist", "direct"):
             return "alist_direct"
         return "moviepilot_redirect"
@@ -1468,8 +1470,9 @@ class CloudStrmHelper(_PluginBase):
                                             "items": [
                                                 {"title": "MoviePilot 302 模式（推荐）", "value": "moviepilot_redirect"},
                                                 {"title": "AList/OpenList 直链模式（实验）", "value": "alist_direct"},
+                                                {"title": "云盘 raw_url 直链模式（实验）", "value": "cloud_raw_url"},
                                             ],
-                                            "hint": "推荐模式实时解析直链；实验模式直写 /d/ 地址，可能受 sign/跨域影响",
+                                            "hint": "推荐模式只做302解析；/d 模式仍经过 AList/OpenList；raw_url 模式直写云盘链接但可能过期",
                                             "persistent-hint": True,
                                         }}],
                                     },

@@ -75,8 +75,11 @@ class StrmGenerator:
 
         - moviepilot_redirect（默认/推荐）：指向插件自带 /redirect 端点，播放时实时解析直链，链接不失效。
         - alist_direct（实验）：直接写入 AList/OpenList /d/... 下载地址，可能受 sign/权限/UA/跨域影响。
+        - cloud_raw_url（实验）：直接写入 AList/OpenList fs_get.raw_url/最终 CDN URL，绕过 MP/OpenList 数据流量。
         """
         mode = getattr(self.plugin, "_strm_url_mode", "moviepilot_redirect")
+        if mode == "cloud_raw_url":
+            return self._build_cloud_raw_url(remote_path)
         if mode == "alist_direct":
             return self._build_alist_direct_url(remote_path)
         return self._build_moviepilot_redirect_url(remote_path)
@@ -100,8 +103,7 @@ class StrmGenerator:
         构造 <alist_url>/d<quote(path)>，并尝试用 fs_get 取 sign 追加 ?sign=<sign>。
         注意：不写 raw_url（可能过期）；fs_get 失败仅 warning，生成无 sign 的 /d/ 地址，不中断 STRM 生成。
         """
-        alist_url = (getattr(self.plugin, "_alist_url", "") or "").rstrip("/")
-        base = f"{alist_url}/d{quote(remote_path, safe='/')}"
+        base = self._build_alist_download_url(remote_path)
         sign = ""
         alist_client = getattr(self.plugin, "_alist_client", None)
         if alist_client:
@@ -113,6 +115,44 @@ class StrmGenerator:
         if sign:
             return f"{base}?sign={sign}"
         return base
+
+    def _build_cloud_raw_url(self, remote_path: str) -> str:
+        """实验模式：STRM 内容 = AList/OpenList 返回的云盘 raw_url 或最终 CDN URL。
+
+        这是真正绕过 MoviePilot/OpenList 数据流量的模式，但 raw_url 可能过期；适合只想要
+        云盘厂商直链、且接受后续需要重新生成 STRM 的场景。
+        """
+        alist_client = getattr(self.plugin, "_alist_client", None)
+        if not alist_client:
+            logger.warning(f"【STRM生成】cloud_raw_url 需要 AList/OpenList 客户端，回退 /d 地址: {remote_path}")
+            return self._build_alist_download_url(remote_path)
+
+        try:
+            info = alist_client.fs_get(remote_path) or {}
+        except Exception as e:
+            logger.warning(f"【STRM生成】cloud_raw_url 取 raw_url 失败，回退 /d 地址: {remote_path} ({e})")
+            return self._build_alist_download_url(remote_path)
+
+        raw_url = info.get("raw_url") or ""
+        if raw_url:
+            if getattr(self.plugin, "_resolve_final_url", False):
+                try:
+                    from .proxy_handler import ProxyHandler
+                    final = ProxyHandler(alist_client)._resolve_final_url(raw_url, "")
+                    if final:
+                        return final
+                except Exception as e:
+                    logger.debug(f"【STRM生成】cloud_raw_url 预解析最终 URL 失败，使用 raw_url: {e}")
+            return raw_url
+
+        sign = info.get("sign") or ""
+        logger.warning(f"【STRM生成】cloud_raw_url 未拿到 raw_url，回退 AList/OpenList /d 地址: {remote_path}")
+        url = self._build_alist_download_url(remote_path)
+        return f"{url}?sign={sign}" if sign else url
+
+    def _build_alist_download_url(self, remote_path: str) -> str:
+        alist_url = (getattr(self.plugin, "_alist_url", "") or "").rstrip("/")
+        return f"{alist_url}/d{quote(remote_path, safe='/')}"
 
     def _get_mp_address(self) -> str:
         """获取 MP 内网访问地址：优先用户配置，回退 settings.MP_DOMAIN。"""

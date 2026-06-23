@@ -24,6 +24,10 @@ TRANSFER_KEYWORDS = (
 )
 
 
+class MoviePilotSseAuthError(RuntimeError):
+    """MoviePilot SSE endpoint refused API-token based authentication."""
+
+
 class MoviePilotSseListener:
     """监听 MoviePilot `/api/v1/system/message` SSE。"""
 
@@ -55,6 +59,12 @@ class MoviePilotSseListener:
             try:
                 self._listen_once()
                 backoff = 3
+            except MoviePilotSseAuthError as e:
+                logger.warning(
+                    "【SSE监听】鉴权失败，已停止 SSE 监听，仅保留内部 TransferComplete 事件兜底: %s",
+                    e,
+                )
+                return
             except Exception as e:
                 logger.warning(f"【SSE监听】连接异常，{backoff}s 后重试: {e}")
                 self._stop_event.wait(backoff)
@@ -64,25 +74,40 @@ class MoviePilotSseListener:
         base_url = self._get_base_url()
         endpoint = urljoin(base_url.rstrip("/") + "/", "api/v1/system/message")
         token = settings.API_TOKEN or ""
-        params = {"apikey": token} if token else None
-        headers = {
+
+        logger.info(f"【SSE监听】连接 MoviePilot 消息流: {endpoint}")
+        auth_failed_status = None
+        for label, params, headers in self._auth_candidates(token):
+            with requests.get(
+                endpoint,
+                params=params,
+                headers=headers,
+                stream=True,
+                timeout=(10, 90),
+            ) as resp:
+                if resp.status_code == 200:
+                    self._consume_lines(resp.iter_lines(decode_unicode=True))
+                    return
+                if resp.status_code not in (401, 403):
+                    raise RuntimeError(f"HTTP {resp.status_code}")
+                auth_failed_status = resp.status_code
+                logger.debug(f"【SSE监听】鉴权方式失败: {label}, HTTP {resp.status_code}")
+        raise MoviePilotSseAuthError(f"HTTP {auth_failed_status or 403}")
+
+    @staticmethod
+    def _auth_candidates(token: str):
+        base_headers = {
             "Accept": "text/event-stream",
             "Cache-Control": "no-cache",
         }
-        if token:
-            headers["Authorization"] = token
-
-        logger.info(f"【SSE监听】连接 MoviePilot 消息流: {endpoint}")
-        with requests.get(
-            endpoint,
-            params=params,
-            headers=headers,
-            stream=True,
-            timeout=(10, 90),
-        ) as resp:
-            if resp.status_code != 200:
-                raise RuntimeError(f"HTTP {resp.status_code}")
-            self._consume_lines(resp.iter_lines(decode_unicode=True))
+        if not token:
+            return [("anonymous", None, base_headers)]
+        return [
+            ("apikey+authorization", {"apikey": token}, {**base_headers, "Authorization": token}),
+            ("apikey+bearer", {"apikey": token}, {**base_headers, "Authorization": f"Bearer {token}"}),
+            ("apikey-only", {"apikey": token}, base_headers),
+            ("authorization-only", None, {**base_headers, "Authorization": token}),
+        ]
 
     def _consume_lines(self, lines: Iterable[str]) -> None:
         data_lines: List[str] = []

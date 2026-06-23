@@ -370,6 +370,50 @@ class TestTransferListenerExclude(unittest.TestCase):
         )
 
 
+class TestSseListenerAuth(unittest.TestCase):
+    class _Resp:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def iter_lines(self, decode_unicode=True):
+            return []
+
+    def test_sse_retries_bearer_auth_after_403(self):
+        from cloudstrmhelper.sse_listener import MoviePilotSseListener
+
+        plugin = MagicMock()
+        plugin._moviepilot_address = "http://mp:3000"
+        listener = MoviePilotSseListener(plugin)
+        listener._consume_lines = MagicMock()
+
+        with patch("cloudstrmhelper.sse_listener.requests.get") as get:
+            get.side_effect = [self._Resp(403), self._Resp(200)]
+            listener._listen_once()
+
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(get.call_args_list[0].kwargs["headers"]["Authorization"], "test-token-123")
+        self.assertEqual(get.call_args_list[1].kwargs["headers"]["Authorization"], "Bearer test-token-123")
+        listener._consume_lines.assert_called_once()
+
+    def test_sse_auth_error_stops_run_loop(self):
+        from cloudstrmhelper.sse_listener import MoviePilotSseListener
+
+        plugin = MagicMock()
+        plugin._moviepilot_address = "http://mp:3000"
+        listener = MoviePilotSseListener(plugin)
+
+        with patch("cloudstrmhelper.sse_listener.requests.get", return_value=self._Resp(403)) as get:
+            listener._run()
+
+        self.assertEqual(get.call_count, 4)
+
+
 class TestAlistClientBuildUrl(unittest.TestCase):
     """测试 ProxyHandler._build_url（不发起真实请求）。"""
     def test_raw_url_preferred(self):
@@ -401,7 +445,7 @@ class TestPluginMetadata(unittest.TestCase):
     def test_metadata_present(self):
         from cloudstrmhelper import CloudStrmHelper
         self.assertEqual(CloudStrmHelper.plugin_name, "云端STRM整理助手")
-        self.assertEqual(CloudStrmHelper.plugin_version, "1.3.1")
+        self.assertEqual(CloudStrmHelper.plugin_version, "1.3.2")
         self.assertEqual(CloudStrmHelper.plugin_config_prefix, "cloudstrmhelper_")
         self.assertEqual(CloudStrmHelper.plugin_author, "101letters")
         self.assertEqual(CloudStrmHelper.auth_level, 1)
@@ -728,6 +772,7 @@ class TestStrmUrlMode(unittest.TestCase):
         plugin._strm_url_mode = strm_url_mode
         plugin._alist_url = alist_url
         plugin._alist_client = alist_client
+        plugin._resolve_final_url = False
         return StrmGenerator(plugin), plugin
 
     def test_moviepilot_redirect_mode(self):
@@ -773,6 +818,22 @@ class TestStrmUrlMode(unittest.TestCase):
         url = gen._build_alist_direct_url("/cloud/Foo.mkv")
         self.assertNotIn("upstream", url)
         self.assertNotIn("raw_url", url)
+
+    def test_cloud_raw_url_mode_uses_raw_url(self):
+        alist = MagicMock()
+        alist.fs_get.return_value = {"raw_url": "http://cdn.example.com/Foo.mkv?sig=abc", "sign": "s"}
+        gen, _ = self._make_gen("cloud_raw_url", alist_client=alist)
+        url = gen._build_strm_url("/cloud/Foo.mkv")
+        self.assertEqual(url, "http://cdn.example.com/Foo.mkv?sig=abc")
+        self.assertNotIn("/redirect", url)
+        self.assertNotIn("/d/", url)
+
+    def test_cloud_raw_url_mode_falls_back_to_d_with_sign(self):
+        alist = MagicMock()
+        alist.fs_get.return_value = {"sign": "abc"}
+        gen, _ = self._make_gen("cloud_raw_url", alist_client=alist)
+        url = gen._build_strm_url("/cloud/Foo.mkv")
+        self.assertEqual(url, "http://192.168.31.6:5244/d/cloud/Foo.mkv?sign=abc")
 
 
 class TestSafeUrlForLog(unittest.TestCase):
@@ -1074,6 +1135,8 @@ class TestNewConfigPersistence(unittest.TestCase):
 
     def test_normalize_strm_url_mode(self):
         from cloudstrmhelper import CloudStrmHelper
+        self.assertEqual(CloudStrmHelper._normalize_strm_url_mode("cloud_raw_url"), "cloud_raw_url")
+        self.assertEqual(CloudStrmHelper._normalize_strm_url_mode("raw_url"), "cloud_raw_url")
         self.assertEqual(CloudStrmHelper._normalize_strm_url_mode("alist_direct"), "alist_direct")
         self.assertEqual(CloudStrmHelper._normalize_strm_url_mode("moviepilot_redirect"), "moviepilot_redirect")
         self.assertEqual(CloudStrmHelper._normalize_strm_url_mode("garbage"), "moviepilot_redirect")

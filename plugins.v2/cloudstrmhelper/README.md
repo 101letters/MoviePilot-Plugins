@@ -2,7 +2,7 @@
 
 MoviePilot V2 插件：监听 MoviePilot 整理完成/入库完成消息，按顺序上传到 AList/OpenList，基于云端路径生成 STRM，并刷新 Emby/Jellyfin 入库。
 
-> 版本：1.3.1
+> 版本：1.3.2
 
 ## 执行链路
 
@@ -114,13 +114,21 @@ STRM 文件内容固定指向 MoviePilot 插件 `/redirect`：
 http://<MoviePilot内网地址>/api/v1/plugin/CloudStrmHelper/redirect?apikey=<API_TOKEN>&path=<AList/OpenList虚拟路径>
 ```
 
-播放时插件 `/redirect` 端点实时向 AList/OpenList 获取 `raw_url` 或 `sign` 下载地址并 302 跳转，避免直链过期。
+播放时插件 `/redirect` 端点实时向 AList/OpenList 获取 `raw_url` 或 `sign` 下载地址并 302 跳转，避免直链过期。这个模式下 MoviePilot 只参与一次 URL 解析和 302 跳转，不代理视频数据；但外网客户端必须能访问 MoviePilot `/redirect`。
 
 ### 实验模式：AList/OpenList 直链（`alist_direct`，不默认启用）
 
 STRM 内容直接写入 AList/OpenList `/d/<path>?sign=<sign>` 下载地址（不写 `raw_url`，因 `raw_url` 可能过期）。取 `sign` 失败时仅 warning，生成无 `sign` 的 `/d/` 地址，不中断 STRM 生成。
 
-风险：可能受 `sign` 过期、权限、客户端 UA、跨域和云盘策略影响，仅用于测试。
+这个模式绕过 MoviePilot，但不一定绕过 AList/OpenList 服务器：是否由 OpenList 再跳转到云盘厂商 CDN，取决于具体存储驱动和分享/签名能力。
+
+### 实验模式：云盘 raw_url 直链（`cloud_raw_url`，不默认启用）
+
+STRM 内容直接写入 AList/OpenList `fs_get` 返回的 `raw_url`；如果开启“解析最终直链”，会先跟随上游重定向，尽量写入最终 CDN URL。
+
+这是唯一会尽量绕过 MoviePilot 和 AList/OpenList 数据流量的 STRM 模式。但 `raw_url`/CDN URL 通常有过期时间，过期后需要重新生成 STRM；如果 AList/OpenList 没返回 `raw_url`，插件会 warning 并回退到 `/d/<path>?sign=...`。
+
+风险：直链可能受过期时间、权限、客户端 UA、跨域和云盘策略影响，仅用于测试。
 
 ## 轻量 302 与完整前置代理的区别
 
