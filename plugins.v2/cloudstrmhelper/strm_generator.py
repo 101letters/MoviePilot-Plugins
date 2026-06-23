@@ -71,9 +71,20 @@ class StrmGenerator:
 
     # ---- STRM URL 构建 ----
     def _build_strm_url(self, remote_path: str) -> str:
-        """构建 .strm 文件内容 URL：指向插件 redirect 端点。
+        """构建 .strm 文件内容 URL，按插件 STRM URL 模式分流。
 
-        http://<mp_address>/api/v1/plugin/CloudStrmHelper/redirect?apikey=<token>&path=<urlenc 远端路径>
+        - moviepilot_redirect（默认/推荐）：指向插件自带 /redirect 端点，播放时实时解析直链，链接不失效。
+        - alist_direct（实验）：直接写入 AList/OpenList /d/... 下载地址，可能受 sign/权限/UA/跨域影响。
+        """
+        mode = getattr(self.plugin, "_strm_url_mode", "moviepilot_redirect")
+        if mode == "alist_direct":
+            return self._build_alist_direct_url(remote_path)
+        return self._build_moviepilot_redirect_url(remote_path)
+
+    def _build_moviepilot_redirect_url(self, remote_path: str) -> str:
+        """推荐模式：STRM 内容 = 指向插件 /redirect 端点的 URL。
+
+        http://<mp_address>/api/v1/plugin/<PluginID>/redirect?apikey=<token>&path=<urlenc 远端路径>
         """
         mp_address = self._get_mp_address()
         from app.core.config import settings
@@ -82,6 +93,26 @@ class StrmGenerator:
             f"{mp_address.rstrip('/')}{self._redirect_path}"
             f"?apikey={token}&path={quote(remote_path, safe='/')}"
         )
+
+    def _build_alist_direct_url(self, remote_path: str) -> str:
+        """实验模式：STRM 内容 = AList/OpenList /d/... 下载地址。
+
+        构造 <alist_url>/d<quote(path)>，并尝试用 fs_get 取 sign 追加 ?sign=<sign>。
+        注意：不写 raw_url（可能过期）；fs_get 失败仅 warning，生成无 sign 的 /d/ 地址，不中断 STRM 生成。
+        """
+        alist_url = (getattr(self.plugin, "_alist_url", "") or "").rstrip("/")
+        base = f"{alist_url}/d{quote(remote_path, safe='/')}"
+        sign = ""
+        alist_client = getattr(self.plugin, "_alist_client", None)
+        if alist_client:
+            try:
+                info = alist_client.fs_get(remote_path) or {}
+                sign = info.get("sign") or ""
+            except Exception as e:
+                logger.warning(f"【STRM生成】alist_direct 取 sign 失败，生成无 sign 地址: {remote_path} ({e})")
+        if sign:
+            return f"{base}?sign={sign}"
+        return base
 
     def _get_mp_address(self) -> str:
         """获取 MP 内网访问地址：优先用户配置，回退 settings.MP_DOMAIN。"""

@@ -1,52 +1,81 @@
 """proxy_handler.py — /redirect 302 端点的解析逻辑
 
-实现要点（参考 MediaWarp 的 AlistStrm 解析 + p123strmhelper 的自托管 302）：
-- 收到播放请求（.strm 内容 URL）→ 解析 path 参数 → AList FsGet 取真实直链。
+实现要点（参考 MediaWarp 的 AlistStrm 解析 + MediaRelay 的请求合并思想 + p123strmhelper 的自托管 302）：
+- 收到播放请求（.strm 内容 URL）→ 解析 path 参数 → AList/OpenList FsGet 取真实直链。
 - 优先 raw_url（AList 上游真实直链）；无则构建 {alist_url}/d{path}?sign={sign}。
-- 可选：跟随重定向取最终 URL（HEAD，传客户端 UA，≤10 跳，循环检测）——减少客户端重定向次数。
-- HEAD 请求由端点层放行（兼容 Infuse/Fileball 探测）。
-- 缓存：在插件主类 TTLCache 上做（按 path+ua），本模块只负责解析。
-- 失败 raise，端点层捕获返回 500 JSON。
+- resolve_final_url=True 时用 HEAD 跟随重定向取最终 URL（≤10 跳，循环检测），HEAD 失败回退 GET Range bytes=0-0，最终失败回退原始 URL 不中断播放。
+- head_probe_mode 由端点层使用（ok/redirect/resolve），本模块只负责解析。
+- 日志脱敏：_safe_url_for_log 只保留 scheme://host/path，去掉 query value。
+- 失败 raise，端点层捕获后写负缓存并返回 502 JSON。
 """
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
+from typing import Optional
 
 from app.log import logger
 
 # 跟随重定向的最大跳数（与 MediaWarp MaxRedirectAttempts 一致）
 MAX_REDIRECT_ATTEMPTS = 10
 
+# 最终 URL 解析的重试策略：(connect_timeout, read_timeout)
+_RESOLVE_TIMEOUTS = ((3.0, 10.0), (3.0, 15.0), (5.0, 20.0))
+
+
+def _safe_url_for_log(url: str) -> str:
+    """日志脱敏：保留 scheme://host/path，清空 query value（只留 key）。
+
+    避免 sign/token 等敏感信息进入日志。
+    """
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+        if not parts.query:
+            return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        # 只保留 query 的 key，不保留 value
+        keys = [pair.split("=", 1)[0] for pair in parts.query.split("&") if pair]
+        safe_query = "&".join(f"{k}=" for k in keys)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, safe_query, ""))
+    except Exception:
+        # 解析失败：退而求其次，截断可能含敏感信息的 query
+        return url.split("?", 1)[0] if "?" in url else url
+
 
 class ProxyHandler:
-    """302 解析器：把 AList 云端路径解析为可直链访问的 URL。"""
+    """302 解析器：把 AList/OpenList 云端路径解析为可直链访问的 URL。"""
 
-    def __init__(self, alist_client, follow_redirects: bool = True):
+    def __init__(self, alist_client, follow_redirects: bool = True,
+                 resolve_final_url: bool = True):
+        # follow_redirects 保留兼容；实际由 resolve_final_url 控制
         self.alist = alist_client
         self.follow_redirects = follow_redirects
+        self.resolve_final_url = resolve_final_url
 
-    def resolve(self, remote_path: str, ua: str = "") -> str:
-        """把 AList 云端路径解析为最终直链 URL。
+    def resolve(self, remote_path: str, ua: str = "",
+                resolve_final_url: Optional[bool] = None) -> str:
+        """把 AList/OpenList 云端路径解析为最终直链 URL。
 
         :param remote_path: AList 虚拟路径，如 /媒体库/电影/Foo.mkv
         :param ua: 客户端 User-Agent（解析最终 URL 时透传，部分 CDN 网关按 UA 限流）
+        :param resolve_final_url: 是否跟随重定向取最终 URL；None 用实例默认
         :return: 可 302 跳转的最终 URL
-        :raises Exception: 解析失败
+        :raises Exception: 解析失败（端点层捕获写负缓存）
         """
         if not self.alist:
-            raise Exception("AList 客户端未初始化")
+            raise Exception("AList/OpenList 客户端未初始化")
 
         # 1. FsGet 取文件信息（含 raw_url / sign / size）
         info = self.alist.fs_get(remote_path)
         if not info:
-            raise Exception(f"AList FsGet 无响应: {remote_path}")
-        # AList FsGet 响应 data 为文件对象（非 list），含 raw_url/sign/name/is_dir
+            raise Exception(f"AList/OpenList FsGet 无响应: {remote_path}")
         if info.get("is_dir"):
             raise Exception(f"目标路径是目录而非文件: {remote_path}")
 
         url = self._build_url(info, remote_path)
-        logger.info(f"【302跳转】解析直链: {remote_path} -> {url}")
+        logger.info(f"【302跳转】解析直链: {remote_path} -> {_safe_url_for_log(url)}")
 
         # 2. 可选：跟随重定向取最终 URL
-        if self.follow_redirects:
+        do_resolve = self.resolve_final_url if resolve_final_url is None else resolve_final_url
+        if do_resolve:
             final = self._resolve_final_url(url, ua)
             if final:
                 return final
@@ -71,45 +100,73 @@ class ProxyHandler:
         return download
 
     def _resolve_final_url(self, url: str, ua: str) -> str:
-        """跟随重定向链取最终 URL（HEAD，≤10 跳，循环检测）。
+        """跟随重定向链取最终 URL，失败回退空串（端点层用原始 URL 兜底）。
 
-        失败时返回空串，端点层回退到原始 URL（仍 302，只是未预解析）。
+        策略：HEAD → 失败回退 GET Range bytes=0-0（stream=False，不下载完整文件）→ 仍失败回退原始 URL。
+        最多 MAX_REDIRECT_ATTEMPTS 跳，循环检测。多策略带 (connect, read) 超时重试。
         """
         try:
             import httpx
         except ImportError:
-            # httpx 是 MoviePilot 自带依赖；若意外缺失则跳过预解析
             logger.debug("【302跳转】httpx 不可用，跳过最终 URL 预解析")
             return ""
 
+        for attempt, (connect_t, read_t) in enumerate(_RESOLVE_TIMEOUTS, 1):
+            try:
+                final = self._follow_chain(httpx, url, ua, connect_t, read_t, method="HEAD")
+                if final is not None:
+                    return final
+                # HEAD 不支持（405 等）→ 回退 GET Range
+                logger.debug(f"【302跳转】HEAD 未取到最终 URL，回退 GET Range: attempt={attempt}")
+                final = self._follow_chain(httpx, url, ua, connect_t, read_t, method="GET",
+                                           extra_headers={"Range": "bytes=0-0"})
+                if final is not None:
+                    return final
+                # 本轮超时策略失败，下一轮加长超时
+            except Exception as e:
+                if attempt >= len(_RESOLVE_TIMEOUTS):
+                    logger.warning(f"【302跳转】预解析最终 URL 全部失败，回退原始 URL: {_safe_url_for_log(url)} ({e})")
+                    return ""
+                logger.debug(f"【302跳转】预解析重试 {attempt}/{len(_RESOLVE_TIMEOUTS)}: {e}")
+        logger.warning(f"【302跳转】预解析最终 URL 失败，回退原始 URL: {_safe_url_for_log(url)}")
+        return ""
+
+    def _follow_chain(self, httpx, url: str, ua: str, connect_t: float, read_t: float,
+                      method: str = "HEAD", extra_headers: dict = None) -> Optional[str]:
+        """跟随一条重定向链。返回最终 URL 或 None（应回退/重试）。
+
+        None 表示「该 method 未取到最终 URL」（如 405/不允许），由调用方决定回退或重试。
+        遇到非 3xx 的成功响应，返回 resp.url（HEAD 时即最终地址）。
+        """
+        timeout = httpx.Timeout(read_t, connect=connect_t)
+        headers = {"User-Agent": ua} if ua else {}
+        if extra_headers:
+            headers.update(extra_headers)
         try:
-            with httpx.Client(follow_redirects=False, timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+            with httpx.Client(follow_redirects=False, timeout=timeout) as client:
                 current = url
                 visited = set()
-                chain = []
-                method = "HEAD"
                 for _ in range(MAX_REDIRECT_ATTEMPTS + 1):
                     if current in visited:
-                        logger.warning(f"【302跳转】检测到循环重定向，回退原始 URL: {url}")
+                        logger.warning(f"【302跳转】检测到循环重定向，回退原始 URL: {_safe_url_for_log(url)}")
                         return ""
                     visited.add(current)
-                    chain.append(current)
-                    headers = {"User-Agent": ua} if ua else {}
                     resp = client.request(method, current, headers=headers)
-                    if 300 <= resp.status_code < 400:
+                    code = resp.status_code
+                    if 300 <= code < 400:
                         location = resp.headers.get("location")
                         if not location:
                             return ""
-                        # 处理相对 Location
                         if location.startswith("http"):
                             current = location
                         else:
-                            import httpx as _hx
-                            current = str(_hx.URL(current).join(location))
+                            current = str(httpx.URL(current).join(location))
                         continue
+                    # 405 Method Not Allowed → HEAD 不被支持，回退调用方做 GET
+                    if code == 405:
+                        return None
                     # 非重定向：取最终请求 URL
                     return str(resp.url)
         except Exception as e:
-            logger.debug(f"【302跳转】预解析最终 URL 失败，回退原始: {url} ({e})")
-            return ""
-        return ""
+            raise e
+        return None

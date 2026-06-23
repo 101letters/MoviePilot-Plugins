@@ -399,7 +399,7 @@ class TestPluginMetadata(unittest.TestCase):
     def test_metadata_present(self):
         from cloudstrmhelper import CloudStrmHelper
         self.assertEqual(CloudStrmHelper.plugin_name, "云端STRM整理助手")
-        self.assertEqual(CloudStrmHelper.plugin_version, "1.2.0")
+        self.assertEqual(CloudStrmHelper.plugin_version, "1.3.0")
         self.assertEqual(CloudStrmHelper.plugin_config_prefix, "cloudstrmhelper_")
         self.assertEqual(CloudStrmHelper.plugin_author, "101letters")
         self.assertEqual(CloudStrmHelper.auth_level, 1)
@@ -677,6 +677,395 @@ class TestCloudSyncPolicy(unittest.TestCase):
             sync._poll_task(item)
         self.assertEqual(item.status, TASK_SKIPPED)
         alist.upload_task_delete.assert_called_once_with("task-1")
+
+
+class TestStrmUrlMode(unittest.TestCase):
+    """v1.3.0: STRM URL 双模式。"""
+
+    def _make_gen(self, strm_url_mode="moviepilot_redirect", alist_url="http://192.168.31.6:5244/",
+                  alist_client=None):
+        from cloudstrmhelper.strm_generator import StrmGenerator
+        plugin = MagicMock()
+        plugin._moviepilot_address = "http://mp:3000"
+        plugin._strm_url_mode = strm_url_mode
+        plugin._alist_url = alist_url
+        plugin._alist_client = alist_client
+        return StrmGenerator(plugin), plugin
+
+    def test_moviepilot_redirect_mode(self):
+        gen, _ = self._make_gen("moviepilot_redirect")
+        url = gen._build_strm_url("/cloud/Foo.mkv")
+        self.assertIn("/api/v1/plugin/", url)
+        self.assertIn("/redirect", url)
+        self.assertIn("apikey=", url)
+        self.assertIn("path=", url)
+        self.assertNotIn("/d/", url.split("?")[0].split("/redirect")[0])
+
+    def test_alist_direct_mode_with_sign(self):
+        alist = MagicMock()
+        alist.fs_get.return_value = {"sign": "abc", "name": "Foo.mkv"}
+        gen, _ = self._make_gen("alist_direct", alist_client=alist)
+        url = gen._build_alist_direct_url("/cloud/Foo.mkv")
+        self.assertTrue(url.startswith("http://192.168.31.6:5244/d/"))
+        self.assertIn("/d/", url)
+        self.assertNotIn("/redirect", url)
+        self.assertIn("?sign=abc", url)
+
+    def test_alist_direct_mode_no_sign_on_fs_get_failure(self):
+        """fs_get 失败时仍生成 /d/ 地址（无 sign），不中断。"""
+        alist = MagicMock()
+        alist.fs_get.side_effect = Exception("boom")
+        gen, _ = self._make_gen("alist_direct", alist_client=alist)
+        url = gen._build_alist_direct_url("/cloud/Foo.mkv")
+        self.assertTrue(url.startswith("http://192.168.31.6:5244/d/"))
+        self.assertNotIn("sign=", url)
+
+    def test_alist_direct_mode_empty_sign(self):
+        alist = MagicMock()
+        alist.fs_get.return_value = {"sign": "", "name": "Foo.mkv"}
+        gen, _ = self._make_gen("alist_direct", alist_client=alist)
+        url = gen._build_alist_direct_url("/cloud/Foo.mkv")
+        self.assertNotIn("sign=", url)
+
+    def test_alist_direct_does_not_write_raw_url(self):
+        """实验模式不写 raw_url（可能过期）。"""
+        alist = MagicMock()
+        alist.fs_get.return_value = {"sign": "s", "raw_url": "http://upstream/expiring?token=x"}
+        gen, _ = self._make_gen("alist_direct", alist_client=alist)
+        url = gen._build_alist_direct_url("/cloud/Foo.mkv")
+        self.assertNotIn("upstream", url)
+        self.assertNotIn("raw_url", url)
+
+
+class TestSafeUrlForLog(unittest.TestCase):
+    """v1.3.0: 日志脱敏。"""
+    def test_strips_query_values(self):
+        from cloudstrmhelper.proxy_handler import _safe_url_for_log
+        safe = _safe_url_for_log("http://h/p/d/foo.mkv?sign=secret&token=abc")
+        self.assertIn("http://h/p/d/foo.mkv", safe)
+        self.assertNotIn("secret", safe)
+        self.assertNotIn("abc", safe)
+
+    def test_no_query_unchanged(self):
+        from cloudstrmhelper.proxy_handler import _safe_url_for_log
+        self.assertEqual(_safe_url_for_log("http://h/p/foo.mkv"), "http://h/p/foo.mkv")
+
+
+class TestProxyHandlerResolve(unittest.TestCase):
+    """v1.3.0: 302 resolver 解析逻辑（不发起真实 HTTP）。"""
+
+    def _make_ph(self, resolve_final_url=False):
+        from cloudstrmhelper.proxy_handler import ProxyHandler
+        alist = MagicMock()
+        alist.url = "http://192.168.31.6:5244"
+        return ProxyHandler(alist, resolve_final_url=resolve_final_url)
+
+    def test_raw_url_preferred(self):
+        ph = self._make_ph()
+        ph.alist.fs_get.return_value = {"raw_url": "http://upstream/foo?token=abc", "name": "x.mkv"}
+        url = ph.resolve("/x.mkv", resolve_final_url=False)
+        self.assertEqual(url, "http://upstream/foo?token=abc")
+
+    def test_no_raw_url_uses_d_with_sign(self):
+        ph = self._make_ph()
+        ph.alist.fs_get.return_value = {"sign": "mysign", "name": "x.mkv"}
+        url = ph.resolve("/媒体库/Foo.mkv", resolve_final_url=False)
+        self.assertEqual(url, "http://192.168.31.6:5244/d/%E5%AA%92%E4%BD%93%E5%BA%93/Foo.mkv?sign=mysign")
+
+    def test_resolve_final_url_failure_falls_back_to_origin(self):
+        """resolve_final_url=True 但预解析失败时，回退 _build_url 的原始 URL，不抛异常。"""
+        ph = self._make_ph(resolve_final_url=True)
+        ph.alist.fs_get.return_value = {"raw_url": "http://upstream/foo?token=abc"}
+        # _resolve_final_url 会 import httpx；stub httpx 不可用时返回 ""，回退原始 raw_url
+        import sys
+        httpx_stub = types.ModuleType("httpx")
+        class _Resp:
+            status_code = 200
+            url = "http://upstream/foo?token=abc"
+        class _Client:
+            def __init__(self, *a, **k): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def request(self, *a, **k): raise Exception("simulated")
+        httpx_stub.Client = _Client
+        httpx_stub.Timeout = lambda *a, **k: None
+        httpx_stub.URL = lambda x: type("U", (), {"join": lambda self, l: l})()
+        sys.modules["httpx"] = httpx_stub
+        try:
+            url = ph.resolve("/x.mkv")
+        finally:
+            del sys.modules["httpx"]
+        # 预解析失败回退原始 raw_url
+        self.assertEqual(url, "http://upstream/foo?token=abc")
+
+    def test_is_dir_raises(self):
+        ph = self._make_ph()
+        ph.alist.fs_get.return_value = {"is_dir": True}
+        with self.assertRaises(Exception):
+            ph.resolve("/some/dir", resolve_final_url=False)
+
+
+class TestRedirectEndpointCaching(unittest.TestCase):
+    """v1.3.0: redirect 端点缓存命中/未命中 + 负缓存 + HEAD 策略。"""
+
+    def _make_plugin(self):
+        from cloudstrmhelper import CloudStrmHelper
+        plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+        plugin._strm_url_mode = "moviepilot_redirect"
+        plugin._resolve_final_url = False
+        plugin._redirect_cache_ttl = 120
+        plugin._head_probe_mode = "ok"
+        from cachetools import TTLCache
+        plugin._redirect_cache = TTLCache(maxsize=512, ttl=120)
+        plugin._redirect_error_cache = TTLCache(maxsize=256, ttl=30)
+        plugin._resolve_locks = {}
+        plugin._resolve_locks_guard = __import__("threading").Lock()
+        plugin._proxy = MagicMock()
+        plugin._proxy.resolve.return_value = "http://resolved/foo"
+        return plugin
+
+    def test_cache_key_contains_ua_hash_and_mode(self):
+        plugin = self._make_plugin()
+        k1 = plugin._redirect_cache_key("/p", "VLC/1")
+        k2 = plugin._redirect_cache_key("/p", "VLC/2")
+        k3 = plugin._redirect_cache_key("/p", "VLC/1")
+        self.assertEqual(len(k1), 3)
+        self.assertEqual(k1, k3)  # 同 UA 同 path 同 key
+        self.assertNotEqual(k1, k2)  # 不同 UA 不同 key
+        self.assertEqual(k1[0], "/p")
+        self.assertEqual(k1[2], "origin")  # resolve_final_url=False
+
+    def test_cached_resolve_hits_cache(self):
+        plugin = self._make_plugin()
+        key = plugin._redirect_cache_key("/p", "ua")
+        plugin._redirect_cache[key] = "http://cached/foo"
+        url = plugin._cached_resolve(key, "/p", "ua")
+        self.assertEqual(url, "http://cached/foo")
+        plugin._proxy.resolve.assert_not_called()
+
+    def test_cached_resolve_miss_calls_proxy(self):
+        plugin = self._make_plugin()
+        key = plugin._redirect_cache_key("/p", "ua")
+        url = plugin._cached_resolve(key, "/p", "ua")
+        self.assertEqual(url, "http://resolved/foo")
+        plugin._proxy.resolve.assert_called_once()
+        # 写入缓存
+        self.assertEqual(plugin._redirect_cache.get(key), "http://resolved/foo")
+
+    def test_cached_resolve_double_check_under_lock(self):
+        """in-flight 合并：锁内再次查缓存，避免并发重复调用。"""
+        plugin = self._make_plugin()
+        key = plugin._redirect_cache_key("/p", "ua")
+        # 预置缓存，模拟另一个线程刚写
+        plugin._redirect_cache[key] = "http://just-cached"
+        url = plugin._cached_resolve(key, "/p", "ua")
+        self.assertEqual(url, "http://just-cached")
+        plugin._proxy.resolve.assert_not_called()
+
+
+class TestStatsMigration(unittest.TestCase):
+    """v1.3.0: stats 旧结构迁移。"""
+
+    def test_migrate_old_stats(self):
+        from cloudstrmhelper import CloudStrmHelper
+        plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+        old = {"strm_count": 1, "last_strm_time": "2026-01-01 00:00:00",
+               "recent_files": [{"name": "a.strm", "time": "2026-01-01 00:00:00"}]}
+        plugin.get_data = lambda key=None, plugin_id=None: old if key == "stats" else None
+        plugin.save_data = lambda key, value, plugin_id=None: None
+        stats = plugin._load_stats()
+        self.assertEqual(stats["upload_count"], 0)
+        self.assertEqual(stats["last_upload_time"], "")
+        self.assertEqual(stats["recent_uploads"], [])
+        self.assertEqual(stats["strm_count"], 1)
+        self.assertEqual(stats["last_strm_time"], "2026-01-01 00:00:00")
+        # recent_files 迁移到 recent_strms
+        self.assertEqual(stats["recent_strms"][0]["name"], "a.strm")
+
+    def test_new_stats_kept(self):
+        from cloudstrmhelper import CloudStrmHelper
+        plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+        new = {"upload_count": 5, "last_upload_time": "t", "recent_uploads": [],
+               "strm_count": 9, "last_strm_time": "t2", "recent_strms": [{"name": "b.strm"}]}
+        plugin.get_data = lambda key=None, plugin_id=None: new if key == "stats" else None
+        plugin.save_data = lambda key, value, plugin_id=None: None
+        stats = plugin._load_stats()
+        self.assertEqual(stats["upload_count"], 5)
+        self.assertEqual(stats["strm_count"], 9)
+        self.assertEqual(stats["recent_strms"][0]["name"], "b.strm")
+
+
+class TestUploadStrmStats(unittest.TestCase):
+    """v1.3.0: 上传/STRM 统计计数与最近列表。"""
+
+    def _make_plugin(self):
+        from cloudstrmhelper import CloudStrmHelper
+        plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+        plugin._stats = None
+        plugin.get_data = lambda key=None, plugin_id=None: None
+        saved = {}
+        plugin.save_data = lambda key, value, plugin_id=None: saved.update({key: value})
+        plugin._load_stats = lambda: {
+            "upload_count": 0, "last_upload_time": "", "recent_uploads": [],
+            "strm_count": 0, "last_strm_time": "", "recent_strms": [],
+        }
+        plugin._save_stats = lambda: __import__("cloudstrmhelper", fromlist=["_dummy"]) or None
+        return plugin, saved
+
+    def test_upload_uploaded_increments(self):
+        from cloudstrmhelper import CloudStrmHelper
+        plugin, saved = self._make_plugin()
+        plugin._stats = plugin._load_stats()
+        plugin._save_stats = lambda: None
+        plugin._record_upload_stat("/l/Foo.mkv", "/c/Foo.mkv", 100, status="uploaded")
+        self.assertEqual(plugin._stats["upload_count"], 1)
+        self.assertTrue(plugin._stats["last_upload_time"])
+        self.assertEqual(plugin._stats["recent_uploads"][0]["status"], "uploaded")
+
+    def test_upload_skipped_does_not_increment(self):
+        from cloudstrmhelper import CloudStrmHelper
+        plugin, saved = self._make_plugin()
+        plugin._stats = plugin._load_stats()
+        plugin._save_stats = lambda: None
+        plugin._record_upload_stat("/l/Foo.mkv", "/c/Foo.mkv", 100, status="skipped")
+        self.assertEqual(plugin._stats["upload_count"], 0)
+        self.assertEqual(plugin._stats["recent_uploads"][0]["status"], "skipped")
+
+    def test_recent_uploads_max_20(self):
+        from cloudstrmhelper import CloudStrmHelper
+        plugin, _ = self._make_plugin()
+        plugin._stats = plugin._load_stats()
+        plugin._save_stats = lambda: None
+        for i in range(25):
+            plugin._record_upload_stat(f"/l/{i}.mkv", f"/c/{i}.mkv", 1, status="uploaded")
+        self.assertLessEqual(len(plugin._stats["recent_uploads"]), 20)
+
+    def test_strm_created_increments(self):
+        from cloudstrmhelper import CloudStrmHelper
+        from pathlib import Path
+        plugin, _ = self._make_plugin()
+        plugin._stats = plugin._load_stats()
+        plugin._save_stats = lambda: None
+        plugin._record_strm_stat(Path("/strm/Foo.strm"), created=True, remote_path="/c/Foo.mkv")
+        self.assertEqual(plugin._stats["strm_count"], 1)
+        self.assertTrue(plugin._stats["recent_strms"][0]["created"])
+
+    def test_strm_not_created_does_not_increment(self):
+        from cloudstrmhelper import CloudStrmHelper
+        from pathlib import Path
+        plugin, _ = self._make_plugin()
+        plugin._stats = plugin._load_stats()
+        plugin._save_stats = lambda: None
+        plugin._record_strm_stat(Path("/strm/Foo.strm"), created=False, remote_path="/c/Foo.mkv")
+        self.assertEqual(plugin._stats["strm_count"], 0)
+        self.assertFalse(plugin._stats["recent_strms"][0]["created"])
+
+    def test_recent_strms_max_20(self):
+        from cloudstrmhelper import CloudStrmHelper
+        from pathlib import Path
+        plugin, _ = self._make_plugin()
+        plugin._stats = plugin._load_stats()
+        plugin._save_stats = lambda: None
+        for i in range(25):
+            plugin._record_strm_stat(Path(f"/strm/{i}.strm"), created=True, remote_path=f"/c/{i}.mkv")
+        self.assertLessEqual(len(plugin._stats["recent_strms"]), 20)
+
+
+class TestNewConfigPersistence(unittest.TestCase):
+    """v1.3.0: 4 个新配置项被读取/持久化/诊断输出。"""
+
+    def test_update_config_includes_new_keys(self):
+        from cloudstrmhelper import CloudStrmHelper
+        plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+        plugin._enabled = True
+        plugin._moviepilot_address = "http://mp:3000"
+        plugin._cloud_storage_type = "alist"
+        plugin._alist_url = "http://alist:5244/"
+        plugin._alist_token = "t"
+        plugin._alist_target_path = "/cloud"
+        plugin._local_strm_paths = "/media/movies#/strm/movies"
+        plugin._local_media_path = "/media/movies"
+        plugin._strm_output_path = "/strm/movies"
+        plugin._sync_mode = "copy"
+        plugin._overwrite_mode = "never"
+        plugin._exclude_patterns = ""
+        plugin._event_filters = ""
+        plugin._refresh_enabled = True
+        plugin._mediaservers = []
+        plugin._transfer_mp_mediaserver_paths = ""
+        plugin._notify_enabled = True
+        plugin._rmt_mediaext = ["mkv"]
+        plugin._upload_concurrency = 3
+        plugin._once_sync = False
+        plugin._strm_url_mode = "moviepilot_redirect"
+        plugin._resolve_final_url = True
+        plugin._redirect_cache_ttl = 120
+        plugin._head_probe_mode = "ok"
+        captured = {}
+        plugin.update_config = lambda cfg: captured.update(cfg)
+        plugin._update_config()
+        for key in ("strm_url_mode", "resolve_final_url", "redirect_cache_ttl", "head_probe_mode"):
+            self.assertIn(key, captured, f"{key} 未持久化")
+
+    def test_normalize_strm_url_mode(self):
+        from cloudstrmhelper import CloudStrmHelper
+        self.assertEqual(CloudStrmHelper._normalize_strm_url_mode("alist_direct"), "alist_direct")
+        self.assertEqual(CloudStrmHelper._normalize_strm_url_mode("moviepilot_redirect"), "moviepilot_redirect")
+        self.assertEqual(CloudStrmHelper._normalize_strm_url_mode("garbage"), "moviepilot_redirect")
+        self.assertEqual(CloudStrmHelper._normalize_strm_url_mode(""), "moviepilot_redirect")
+
+    def test_normalize_head_probe_mode(self):
+        from cloudstrmhelper import CloudStrmHelper
+        self.assertEqual(CloudStrmHelper._normalize_head_probe_mode("ok"), "ok")
+        self.assertEqual(CloudStrmHelper._normalize_head_probe_mode("redirect"), "redirect")
+        self.assertEqual(CloudStrmHelper._normalize_head_probe_mode("resolve"), "resolve")
+        self.assertEqual(CloudStrmHelper._normalize_head_probe_mode("garbage"), "ok")
+
+    def test_diagnose_includes_redirect_fields(self):
+        from cloudstrmhelper import CloudStrmHelper
+        import json
+        plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+        plugin._enabled = True
+        plugin._moviepilot_address = "http://mp:3000"
+        plugin._cloud_storage_type = "alist"
+        plugin._alist_url = "http://alist:5244/"
+        plugin._alist_token = "secret-token-value"
+        plugin._alist_target_path = "/cloud"
+        plugin._local_strm_paths = "/media/movies#/strm/movies"
+        plugin._local_strm_mappings = [("/media/movies", "/strm/movies")]
+        plugin._local_media_path = "/media/movies"
+        plugin._local_media_roots = ["/media/movies"]
+        plugin._strm_output_path = "/strm/movies"
+        plugin._sync_mode = "copy"
+        plugin._overwrite_mode = "never"
+        plugin._upload_concurrency = 3
+        plugin._rmt_mediaext = ["mkv"]
+        plugin._event_filter_prefixes = []
+        plugin._refresh_enabled = True
+        plugin._mediaservers = []
+        plugin._transfer_mp_mediaserver_paths = ""
+        plugin._strm_url_mode = "moviepilot_redirect"
+        plugin._resolve_final_url = True
+        plugin._redirect_cache_ttl = 120
+        plugin._head_probe_mode = "ok"
+        from cachetools import TTLCache
+        plugin._redirect_cache = TTLCache(maxsize=10, ttl=10)
+        plugin._redirect_error_cache = TTLCache(maxsize=10, ttl=10)
+        plugin._sse_listener = None
+        plugin._alist_client = None
+        plugin._cloud_sync = None
+        plugin._strm_gen = None
+        plugin._proxy = None
+        plugin._stats = {"upload_count": 0, "last_upload_time": "", "recent_uploads": [],
+                         "strm_count": 0, "last_strm_time": "", "recent_strms": []}
+        data = plugin._diagnostic_snapshot(probe=False)
+        self.assertEqual(data["redirect"]["strm_url_mode"], "moviepilot_redirect")
+        self.assertEqual(data["redirect"]["resolve_final_url"], True)
+        self.assertEqual(data["redirect"]["redirect_cache_ttl"], 120)
+        self.assertEqual(data["redirect"]["head_probe_mode"], "ok")
+        self.assertEqual(data["redirect"]["redirect_cache_size"], 0)
+        # 不泄露 token
+        self.assertNotIn("secret-token-value", json.dumps(data, ensure_ascii=False))
 
 
 if __name__ == "__main__":

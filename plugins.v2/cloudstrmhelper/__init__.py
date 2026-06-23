@@ -50,7 +50,7 @@ class CloudStrmHelper(_PluginBase):
     plugin_desc = "整理入库自动复制到AList并生成STRM，Emby 302直链播放"
     # 图标：引用仓库 icons 目录下的图标文件（URL 形式，与官方插件一致）
     plugin_icon = "https://raw.githubusercontent.com/101letters/MoviePilot-Plugins/main/icons/cloudstrmhelper.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "101letters"
     author_url = "https://github.com/101letters"
     plugin_config_prefix = "cloudstrmhelper_"
@@ -82,6 +82,11 @@ class CloudStrmHelper(_PluginBase):
     _rmt_mediaext: List[str] = []
     _upload_concurrency = 3
     _once_sync = False
+    # 播放入口 / 302 可靠性配置
+    _strm_url_mode = "moviepilot_redirect"
+    _resolve_final_url = True
+    _redirect_cache_ttl = 120
+    _head_probe_mode = "ok"
 
     _scheduler: Optional[BackgroundScheduler] = None
     _alist_client = None
@@ -93,8 +98,13 @@ class CloudStrmHelper(_PluginBase):
     _sync_lock = threading.Lock()
     _stats: Dict[str, Any] = {}
 
-    # 302 解析缓存：按 (path, ua-hash) 缓存最终 URL，2 分钟 TTL（与 p123strmhelper 一致）
-    _redirect_cache = TTLCache(maxsize=512, ttl=120)
+    # 302 解析缓存：按 (path, ua-hash, mode) 缓存最终 URL；TTL 可配置，配置变更时重建
+    _redirect_cache: TTLCache = TTLCache(maxsize=512, ttl=120)
+    # 失败负缓存：坏路径短 TTL，避免疯狂请求
+    _redirect_error_cache: TTLCache = TTLCache(maxsize=256, ttl=30)
+    # in-flight 请求合并：同一 cache key 解析时加锁，避免并发重复请求 AList
+    _resolve_locks: Dict[str, threading.Lock] = {}
+    _resolve_locks_guard = threading.Lock()
 
     # ============================================================
     # 生命周期
@@ -133,8 +143,22 @@ class CloudStrmHelper(_PluginBase):
             except (TypeError, ValueError):
                 self._upload_concurrency = 3
             self._once_sync = bool(config.get("once_sync", False))
+            # 播放入口 / 302 可靠性
+            self._strm_url_mode = self._normalize_strm_url_mode(
+                config.get("strm_url_mode") or "moviepilot_redirect")
+            self._resolve_final_url = bool(config.get("resolve_final_url", True))
+            try:
+                self._redirect_cache_ttl = max(0, int(config.get("redirect_cache_ttl") or 120))
+            except (TypeError, ValueError):
+                self._redirect_cache_ttl = 120
+            self._head_probe_mode = self._normalize_head_probe_mode(
+                config.get("head_probe_mode") or "ok")
             self._update_config()
 
+        # 配置变更后重建 302 缓存（TTL 可配置）
+        self._redirect_cache = TTLCache(maxsize=512, ttl=self._redirect_cache_ttl)
+        self._redirect_error_cache = TTLCache(maxsize=256, ttl=30)
+        self._resolve_locks = {}
         # 派生：排除规则 PathSpec、事件前缀
         self._exclude_spec = self._build_exclude_spec(self._exclude_patterns)
         self._local_strm_mappings = self._parse_local_strm_mappings(self._local_strm_paths)
@@ -169,7 +193,10 @@ class CloudStrmHelper(_PluginBase):
             self._alist_client = None
 
         # 构建各模块
-        self._proxy = ProxyHandler(self._alist_client) if self._alist_client else None
+        self._proxy = ProxyHandler(
+            self._alist_client,
+            resolve_final_url=self._resolve_final_url,
+        ) if self._alist_client else None
         self._strm_gen = StrmGenerator(self)
         self._cloud_sync = CloudSync(
             self, self._alist_client, sync_mode=self._sync_mode,
@@ -256,81 +283,122 @@ class CloudStrmHelper(_PluginBase):
         return []
 
     def get_page(self) -> List[dict]:
-        """插件首页统计面板。"""
+        """插件首页统计面板：4 统计卡片 + 最近上传表 + 最近 STRM 表。"""
         stats = self._stats or self._load_stats()
-        recent_files = stats.get("recent_files") or []
-        rows = [
-            {
-                "component": "tr",
-                "content": [
-                    {"component": "td", "text": item.get("name") or "-"},
-                    {"component": "td", "text": item.get("time") or "-"},
-                ],
-            }
-            for item in recent_files[:10]
+        recent_uploads = stats.get("recent_uploads") or []
+        recent_strms = stats.get("recent_strms") or []
+        upload_count = stats.get("upload_count") or 0
+        last_upload_time = stats.get("last_upload_time") or ""
+        strm_count = stats.get("strm_count") or 0
+        last_strm_time = stats.get("last_strm_time") or ""
+
+        def _status_text(s):
+            return {"uploaded": "已上传", "skipped": "远端已存在"}.get(s, s or "-")
+
+        def _strm_status_text(created):
+            return "新生成" if created else "已存在/已跳过"
+
+        def _fmt_size(v):
+            try:
+                v = int(v or 0)
+            except Exception:
+                v = 0
+            if v <= 0:
+                return "-"
+            for unit in ("B", "KB", "MB", "GB", "TB"):
+                if v < 1024:
+                    return f"{v:.2f} {unit}"
+                v /= 1024
+            return f"{v:.2f} PB"
+
+        # 最近上传表行
+        upload_rows = [
+            {"component": "tr", "content": [
+                {"component": "td", "text": it.get("name") or "-"},
+                {"component": "td", "text": _status_text(it.get("status"))},
+                {"component": "td", "text": _fmt_size(it.get("size"))},
+                {"component": "td", "text": it.get("time") or "-"},
+                {"component": "td", "props": {"class": "text-caption text-grey"}, "text": it.get("remote") or "-"},
+            ]}
+            for it in recent_uploads[:10]
         ]
-        if not rows:
-            rows = [{
-                "component": "tr",
-                "content": [
-                    {"component": "td", "props": {"colspan": 2, "class": "text-grey"}, "text": "暂无记录"},
-                ],
-            }]
+        if not upload_rows:
+            upload_rows = [{"component": "tr", "content": [
+                {"component": "td", "props": {"colspan": 5, "class": "text-grey"}, "text": "暂无记录"},
+            ]}]
+
+        # 最近 STRM 表行
+        strm_rows = [
+            {"component": "tr", "content": [
+                {"component": "td", "text": it.get("name") or "-"},
+                {"component": "td", "text": _strm_status_text(it.get("created"))},
+                {"component": "td", "text": it.get("time") or "-"},
+                {"component": "td", "props": {"class": "text-caption text-grey"}, "text": it.get("path") or "-"},
+                {"component": "td", "props": {"class": "text-caption text-grey"}, "text": it.get("remote") or "-"},
+            ]}
+            for it in recent_strms[:10]
+        ]
+        if not strm_rows:
+            strm_rows = [{"component": "tr", "content": [
+                {"component": "td", "props": {"colspan": 5, "class": "text-grey"}, "text": "暂无记录"},
+            ]}]
+
+        def _stat_card(caption, value):
+            return {
+                "component": "VCard", "props": {"variant": "outlined"},
+                "content": [{"component": "VCardText", "content": [
+                    {"component": "div", "props": {"class": "text-caption text-grey"}, "text": caption},
+                    {"component": "div", "props": {"class": "text-h5"}, "text": str(value)},
+                ]}],
+            }
+
         return [
             {
                 "component": "VRow",
                 "content": [
-                    {
-                        "component": "VCol", "props": {"cols": 12, "md": 4},
-                        "content": [{
-                            "component": "VCard", "props": {"variant": "outlined"},
-                            "content": [
-                                {"component": "VCardText", "content": [
-                                    {"component": "div", "props": {"class": "text-caption text-grey"}, "text": "已生成 STRM 数量"},
-                                    {"component": "div", "props": {"class": "text-h5"}, "text": str(stats.get("strm_count") or 0)},
-                                ]},
-                            ],
-                        }],
-                    },
-                    {
-                        "component": "VCol", "props": {"cols": 12, "md": 4},
-                        "content": [{
-                            "component": "VCard", "props": {"variant": "outlined"},
-                            "content": [
-                                {"component": "VCardText", "content": [
-                                    {"component": "div", "props": {"class": "text-caption text-grey"}, "text": "最近一次 STRM 生成时间"},
-                                    {"component": "div", "props": {"class": "text-subtitle-1"}, "text": stats.get("last_strm_time") or "-"},
-                                ]},
-                            ],
-                        }],
-                    },
-                    {
-                        "component": "VCol", "props": {"cols": 12, "md": 4},
-                        "content": [{
-                            "component": "VCard", "props": {"variant": "outlined"},
-                            "content": [
-                                {"component": "VCardText", "content": [
-                                    {"component": "div", "props": {"class": "text-caption text-grey"}, "text": "最近入库文件"},
-                                    {"component": "div", "props": {"class": "text-subtitle-1 text-truncate"}, "text": (recent_files[0].get("name") if recent_files else "-")},
-                                    {"component": "div", "props": {"class": "text-caption text-grey"}, "text": (recent_files[0].get("time") if recent_files else "-")},
-                                ]},
-                            ],
-                        }],
-                    },
+                    {"component": "VCol", "props": {"cols": 12, "md": 3},
+                     "content": [_stat_card("累计上传数量", upload_count)]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 3},
+                     "content": [_stat_card("最近上传时间", last_upload_time or "-")]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 3},
+                     "content": [_stat_card("累计生成 STRM 数量", strm_count)]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 3},
+                     "content": [_stat_card("最近生成 STRM 时间", last_strm_time or "-")]},
                 ],
             },
             {
                 "component": "VCard",
                 "props": {"variant": "outlined", "class": "mt-3"},
                 "content": [
-                    {"component": "VCardTitle", "text": "最近入库文件"},
+                    {"component": "VCardTitle", "text": "最近上传列表"},
                     {"component": "VDivider"},
                     {"component": "VTable", "content": [
                         {"component": "thead", "content": [{"component": "tr", "content": [
                             {"component": "th", "text": "文件名"},
+                            {"component": "th", "text": "状态"},
+                            {"component": "th", "text": "大小"},
                             {"component": "th", "text": "时间"},
+                            {"component": "th", "text": "云端路径"},
                         ]}]},
-                        {"component": "tbody", "content": rows},
+                        {"component": "tbody", "content": upload_rows},
+                    ]},
+                ],
+            },
+            {
+                "component": "VCard",
+                "props": {"variant": "outlined", "class": "mt-3"},
+                "content": [
+                    {"component": "VCardTitle", "text": "最近生成 STRM 列表"},
+                    {"component": "VDivider"},
+                    {"component": "VTable", "content": [
+                        {"component": "thead", "content": [{"component": "tr", "content": [
+                            {"component": "th", "text": "文件名"},
+                            {"component": "th", "text": "状态"},
+                            {"component": "th", "text": "时间"},
+                            {"component": "th", "text": "STRM 路径"},
+                            {"component": "th", "text": "云端路径"},
+                        ]}]},
+                        {"component": "tbody", "content": strm_rows},
                     ]},
                 ],
             },
@@ -383,7 +451,12 @@ class CloudStrmHelper(_PluginBase):
     def redirect(self, request: Request, apikey: str = "", path: str = ""):
         """302 跳转端点：校验 apikey → 解析 path 为直链 → 302。
 
-        HEAD 请求放行（兼容 Infuse/Fileball 探测）：返回 200 空 body 而非 302。
+        可靠性增强（v1.3.0）：
+        - cache key 含 UA 哈希与解析模式，避免缓存串/爆炸；
+        - in-flight 请求合并：同 key 并发只解析一次；
+        - 失败负缓存：坏路径短 TTL 内直接 502，避免疯狂请求；
+        - HEAD 策略（head_probe_mode）：ok=返回200(兼容)、redirect=同GET返回302、resolve=200+X-Resolved-Url；
+        - 日志脱敏：不打印带 sign/token 的完整 URL。
         """
         # 鉴权
         if not apikey or apikey != (settings.API_TOKEN or ""):
@@ -391,34 +464,106 @@ class CloudStrmHelper(_PluginBase):
         if not path:
             return JSONResponse({"state": False, "message": "缺少 path 参数"}, status_code=400)
 
-        # HEAD 放行（部分客户端先 HEAD 探测）
+        ua = request.headers.get("User-Agent", "")
+
+        # 失败负缓存：最近解析失败的 path 直接 502
+        err = self._redirect_error_cache.get(path)
+        if err:
+            return JSONResponse(
+                {"state": False, "message": f"最近解析失败，稍后重试: {err}"},
+                status_code=502,
+            )
+
+        # HEAD 请求策略
         if request.method == "HEAD":
-            if self._proxy is None:
-                return JSONResponse({"state": False, "message": "代理未初始化"}, status_code=503)
-            return JSONResponse({"state": True}, status_code=200)
+            return self._handle_head(ua, path)
 
         if self._proxy is None:
             return JSONResponse({"state": False, "message": "代理未初始化（AList 未连接）"}, status_code=503)
 
-        ua = request.headers.get("User-Agent", "")
+        cache_key = self._redirect_cache_key(path, ua)
         try:
-            # 缓存按 (path, ua) —— ua 可能很长，用前 64 字符做 cache key 避免爆缓存
-            cache_key = (path, ua[:64])
             url = self._cached_resolve(cache_key, path, ua)
         except Exception as e:
+            # 写负缓存并返回 502
+            self._redirect_error_cache[path] = str(e)[:200]
             logger.error(f"【302跳转】解析失败: path={path}, err={e}", exc_info=True)
-            return JSONResponse({"state": False, "message": f"解析直链失败: {e}"}, status_code=500)
+            return JSONResponse({"state": False, "message": f"解析直链失败: {e}"}, status_code=502)
 
-        return RedirectResponse(url=url, status_code=302)
+        resp = RedirectResponse(url=url, status_code=302)
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["X-CloudStrm-Mode"] = self._strm_url_mode
+        return resp
+
+    def _handle_head(self, ua: str, path: str):
+        """HEAD 请求按 head_probe_mode 处理。
+
+        - ok（默认兼容）：返回 200，不跳转。兼容 Infuse/Fileball 先 HEAD 探测。
+        - redirect：同 GET，解析后返回 302（严格模式）。
+        - resolve：解析目标 URL 但返回 200，header 附带脱敏 X-Resolved-Url（仅 host）。
+        """
+        mode = self._head_probe_mode
+        if mode == "redirect":
+            if self._proxy is None:
+                return JSONResponse({"state": False, "message": "代理未初始化"}, status_code=503)
+            try:
+                url = self._cached_resolve(self._redirect_cache_key(path, ua), path, ua)
+            except Exception as e:
+                self._redirect_error_cache[path] = str(e)[:200]
+                return JSONResponse({"state": False, "message": f"解析直链失败: {e}"}, status_code=502)
+            resp = RedirectResponse(url=url, status_code=302)
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+        if mode == "resolve" and self._proxy is not None:
+            try:
+                url = self._proxy.resolve(path, ua)
+                from .proxy_handler import _safe_url_for_log
+                resp = JSONResponse({"state": True}, status_code=200)
+                resp.headers["X-Resolved-Url"] = _safe_url_for_log(url)
+                return resp
+            except Exception as e:
+                self._redirect_error_cache[path] = str(e)[:200]
+                return JSONResponse({"state": False, "message": f"解析直链失败: {e}"}, status_code=502)
+        # ok 模式
+        return JSONResponse({"state": True}, status_code=200)
+
+    def _redirect_cache_key(self, path: str, ua: str) -> Tuple[str, str, str]:
+        """cache key = (path, ua-hash[:16], 解析模式)，避免完整 UA 进缓存。"""
+        import hashlib
+        ua_key = hashlib.sha256((ua or "").encode()).hexdigest()[:16]
+        mode_key = "final" if self._resolve_final_url else "origin"
+        return (path, ua_key, mode_key)
+
+    def _get_resolve_lock(self, cache_key) -> threading.Lock:
+        """获取 cache key 对应的 in-flight 锁（请求合并）。"""
+        key_str = str(cache_key)
+        with self._resolve_locks_guard:
+            lock = self._resolve_locks.get(key_str)
+            if lock is None:
+                lock = threading.Lock()
+                self._resolve_locks[key_str] = lock
+            return lock
 
     def _cached_resolve(self, cache_key, path: str, ua: str) -> str:
-        """带 TTL 缓存的解析（缓存失效或异常时重新解析）。"""
+        """带 TTL 缓存 + in-flight 合并的解析。
+
+        1. 查缓存命中直接返回；
+        2. 获取该 key 锁，进入后再查一次缓存（double-check）；
+        3. 未命中才真正调用 AList/OpenList；
+        4. 写缓存后释放锁。
+        """
         cached_url = self._redirect_cache.get(cache_key)
         if cached_url:
             return cached_url
-        url = self._proxy.resolve(path, ua)
-        self._redirect_cache[cache_key] = url
-        return url
+        lock = self._get_resolve_lock(cache_key)
+        with lock:
+            # double-check
+            cached_url = self._redirect_cache.get(cache_key)
+            if cached_url:
+                return cached_url
+            url = self._proxy.resolve(path, ua)
+            self._redirect_cache[cache_key] = url
+            return url
 
     def status(self, request: Request = None):
         """返回云同步进度快照。"""
@@ -493,6 +638,7 @@ class CloudStrmHelper(_PluginBase):
                     try:
                         if not self._cloud_sync.need_upload(local_path, remote_path):
                             logger.info(f"【云端STRM】Phase 2 跳过：远端已存在 {remote_path}")
+                            self._record_upload_stat(local_path, remote_path, 0, status="skipped")
                             ready_for_strm.append((local_path, remote_path, mediainfo, meta))
                             skipped += 1
                             continue
@@ -505,6 +651,8 @@ class CloudStrmHelper(_PluginBase):
             finished = self._cloud_sync.wait_for_batch()
             for item in finished:
                 if item.status in (TASK_SUCCEEDED, TASK_SKIPPED):
+                    status = "skipped" if item.status == TASK_SKIPPED else "uploaded"
+                    self._record_upload_stat(item.local_path, item.remote_path, item.file_size or 0, status=status)
                     ready_for_strm.append((item.local_path, item.remote_path, item.mediainfo, item.meta))
             logger.info(f"【云端STRM】Phase 2 完成：可生成 STRM {len(ready_for_strm)} 条")
 
@@ -523,7 +671,7 @@ class CloudStrmHelper(_PluginBase):
             return False
         ok, strm_path, created = self._strm_gen.generate(local_path, remote_path, mediainfo, meta)
         if ok:
-            self._record_strm_stat(strm_path, created)
+            self._record_strm_stat(strm_path, created, remote_path)
             self._cleanup_local_after_move(local_path)
         return ok
 
@@ -582,6 +730,7 @@ class CloudStrmHelper(_PluginBase):
                         continue
                     try:
                         if not self._cloud_sync.need_upload(local_path, remote_path):
+                            self._record_upload_stat(local_path, remote_path, 0, status="skipped")
                             ready_for_strm.append((local_path, remote_path, None, None))
                             skipped += 1
                             continue
@@ -595,6 +744,8 @@ class CloudStrmHelper(_PluginBase):
         finished = self._cloud_sync.wait_for_batch()
         for item in finished:
             if item.status in (TASK_SUCCEEDED, TASK_SKIPPED):
+                status = "skipped" if item.status == TASK_SKIPPED else "uploaded"
+                self._record_upload_stat(item.local_path, item.remote_path, item.file_size or 0, status=status)
                 ready_for_strm.append((item.local_path, item.remote_path, item.mediainfo, item.meta))
         logger.info(f"【云端STRM】全量 Phase 2 完成：可生成 STRM {len(ready_for_strm)} 条")
         for local_path, remote_path, mediainfo, meta in ready_for_strm:
@@ -634,6 +785,24 @@ class CloudStrmHelper(_PluginBase):
         if normalized in ("always", "总是"):
             return "always"
         return "never"
+
+    @staticmethod
+    def _normalize_strm_url_mode(value: str) -> str:
+        """STRM URL 模式：moviepilot_redirect（默认/推荐）/ alist_direct（实验）。"""
+        normalized = (value or "moviepilot_redirect").strip().lower()
+        if normalized in ("alist_direct", "alist", "direct"):
+            return "alist_direct"
+        return "moviepilot_redirect"
+
+    @staticmethod
+    def _normalize_head_probe_mode(value: str) -> str:
+        """HEAD 探测策略：ok（兼容200）/ redirect（严格302）/ resolve（诊断200+header）。"""
+        normalized = (value or "ok").strip().lower()
+        if normalized in ("redirect", "302"):
+            return "redirect"
+        if normalized in ("resolve", "diagnose"):
+            return "resolve"
+        return "ok"
 
     @classmethod
     def _parse_local_strm_mappings(cls, raw: str) -> List[Tuple[str, str]]:
@@ -814,6 +983,10 @@ class CloudStrmHelper(_PluginBase):
                 "refresh_enabled": self._refresh_enabled,
                 "mediaservers": self._mediaservers,
                 "path_mapping": self._transfer_mp_mediaserver_paths,
+                "strm_url_mode": self._strm_url_mode,
+                "resolve_final_url": self._resolve_final_url,
+                "redirect_cache_ttl": self._redirect_cache_ttl,
+                "head_probe_mode": self._head_probe_mode,
             },
             "modules": {
                 "sse_listener": bool(self._sse_listener),
@@ -821,6 +994,14 @@ class CloudStrmHelper(_PluginBase):
                 "cloud_sync": bool(self._cloud_sync),
                 "strm_generator": bool(self._strm_gen),
                 "proxy": bool(self._proxy),
+            },
+            "redirect": {
+                "strm_url_mode": self._strm_url_mode,
+                "resolve_final_url": self._resolve_final_url,
+                "redirect_cache_ttl": self._redirect_cache_ttl,
+                "head_probe_mode": self._head_probe_mode,
+                "redirect_cache_size": len(self._redirect_cache),
+                "redirect_error_cache_size": len(self._redirect_error_cache),
             },
             "local_roots": [
                 {"path": root, "exists": os.path.exists(root), "is_dir": os.path.isdir(root)}
@@ -855,26 +1036,78 @@ class CloudStrmHelper(_PluginBase):
         return str(Path(local_roots[0]) / "example.mkv")
 
     def _probe_alist(self) -> Dict[str, Any]:
-        """AList 只读连通性探测。"""
+        """AList 只读连通性探测：校验 token，并尝试对样本远端路径 fs_get（脱敏输出）。
+
+        probe 输出不含 raw_url/sign 完整内容，只输出是否存在、is_dir、size、name。
+        """
         if not self._alist_client:
             return {"ok": False, "message": "AList 客户端未初始化"}
+        result: Dict[str, Any] = {"ok": False}
         try:
             user = self._alist_client.verify()
-            return {"ok": True, "user": user}
+            result["ok"] = True
+            result["user"] = user
         except Exception as e:
-            return {"ok": False, "message": str(e)}
+            result["message"] = f"Token 校验失败: {e}"
+            return result
+
+        # 尝试对样本远端路径做只读 fs_get（路径通常不存在，仅测连通与字段形态）
+        sample_remote = ""
+        try:
+            local_roots = self._local_media_roots or self._parse_path_lines(self._local_media_path)
+            sample_local = self._sample_local_path(local_roots)
+            sample_remote = self._build_remote_path(sample_local) if sample_local else ""
+        except Exception:
+            sample_remote = ""
+        if sample_remote:
+            try:
+                info = self._alist_client.fs_get(sample_remote) or {}
+                result["fs_get"] = {
+                    "path": sample_remote,
+                    "name": info.get("name") or "",
+                    "is_dir": bool(info.get("is_dir")),
+                    "size": info.get("size"),
+                    "has_raw_url": bool(info.get("raw_url")),
+                    "has_sign": bool(info.get("sign")),
+                }
+            except Exception as e:
+                # 路径不存在属正常，记录但不影响 ok
+                result["fs_get"] = {"path": sample_remote, "error": str(e)[:200]}
+        return result
 
     def _load_stats(self) -> Dict[str, Any]:
+        """加载统计并迁移旧结构。
+
+        旧: {strm_count, last_strm_time, recent_files:[{name,time}]}
+        新: {upload_count, last_upload_time, recent_uploads:[...],
+             strm_count, last_strm_time, recent_strms:[...]}
+        """
         try:
             data = self.get_data("stats")
             if isinstance(data, dict):
+                # 迁移 recent_files -> recent_strms
+                recent_strms = data.get("recent_strms")
+                if recent_strms is None:
+                    recent_strms = [
+                        {"name": item.get("name", ""), "path": "",
+                         "remote": "", "time": item.get("time", ""),
+                         "created": True}
+                        for item in (data.get("recent_files") or [])
+                        if isinstance(item, dict)
+                    ]
+                data.setdefault("upload_count", 0)
+                data.setdefault("last_upload_time", "")
+                data.setdefault("recent_uploads", [])
                 data.setdefault("strm_count", 0)
                 data.setdefault("last_strm_time", "")
-                data.setdefault("recent_files", [])
+                data.setdefault("recent_strms", recent_strms)
                 return data
         except Exception as e:
             logger.debug(f"【云端STRM】读取统计失败: {e}")
-        return {"strm_count": 0, "last_strm_time": "", "recent_files": []}
+        return {
+            "upload_count": 0, "last_upload_time": "", "recent_uploads": [],
+            "strm_count": 0, "last_strm_time": "", "recent_strms": [],
+        }
 
     def _save_stats(self) -> None:
         try:
@@ -882,8 +1115,45 @@ class CloudStrmHelper(_PluginBase):
         except Exception as e:
             logger.debug(f"【云端STRM】保存统计失败: {e}")
 
-    def _record_strm_stat(self, strm_path: Optional[Path], created: bool) -> None:
-        """记录统计；跳过已存在 STRM 不重复增加累计数量。"""
+    def _record_upload_stat(self, local_path: str, remote_path: str,
+                            size: int = 0, status: str = "uploaded") -> None:
+        """记录上传统计。
+
+        - status="uploaded"：真正上传成功，upload_count += 1
+        - status="skipped"：远端已存在跳过，不增加 upload_count
+        - last_upload_time 在 uploaded/skipped 时都更新
+        - recent_uploads 最多 20 条，单批次内按 remote 去重
+        """
+        from datetime import datetime
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if not self._stats:
+            self._stats = self._load_stats()
+        if status == "uploaded":
+            self._stats["upload_count"] = int(self._stats.get("upload_count") or 0) + 1
+        self._stats["last_upload_time"] = now
+        recent = list(self._stats.get("recent_uploads") or [])
+        # 单批次去重：同 remote 路径不重复记录
+        if not any(item.get("remote") == remote_path for item in recent):
+            recent.insert(0, {
+                "name": Path(local_path).name,
+                "local": local_path,
+                "remote": remote_path,
+                "size": size,
+                "time": now,
+                "status": status,
+            })
+            self._stats["recent_uploads"] = recent[:20]
+        self._save_stats()
+
+    def _record_strm_stat(self, strm_path: Optional[Path], created: bool,
+                          remote_path: str = "") -> None:
+        """记录 STRM 生成统计。
+
+        - created=True 时 strm_count += 1
+        - created=False 不增加累计数量
+        - last_strm_time 总是更新
+        - recent_strms 最多 20 条
+        """
         if not strm_path:
             return
         from datetime import datetime
@@ -893,9 +1163,15 @@ class CloudStrmHelper(_PluginBase):
         if created:
             self._stats["strm_count"] = int(self._stats.get("strm_count") or 0) + 1
         self._stats["last_strm_time"] = now
-        recent = list(self._stats.get("recent_files") or [])
-        recent.insert(0, {"name": strm_path.name, "time": now})
-        self._stats["recent_files"] = recent[:20]
+        recent = list(self._stats.get("recent_strms") or [])
+        recent.insert(0, {
+            "name": strm_path.name,
+            "path": str(strm_path),
+            "remote": remote_path,
+            "time": now,
+            "created": bool(created),
+        })
+        self._stats["recent_strms"] = recent[:20]
         self._save_stats()
 
     # ============================================================
@@ -941,6 +1217,10 @@ class CloudStrmHelper(_PluginBase):
             "rmt_mediaext": ",".join(self._rmt_mediaext) if self._rmt_mediaext else DEFAULT_MEDIA_EXTS,
             "upload_concurrency": self._upload_concurrency,
             "once_sync": self._once_sync,
+            "strm_url_mode": self._strm_url_mode,
+            "resolve_final_url": self._resolve_final_url,
+            "redirect_cache_ttl": self._redirect_cache_ttl,
+            "head_probe_mode": self._head_probe_mode,
         })
 
     @staticmethod
@@ -956,7 +1236,7 @@ class CloudStrmHelper(_PluginBase):
             return None
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """配置页面（Vuetify 组件树 + 默认值）。参照 p123strmhelper 表单范式。"""
+        """配置页面（6 卡片 Vuetify 组件树 + 默认值）。"""
         # 媒体服务器选项
         try:
             mediaserver_items = [
@@ -968,7 +1248,7 @@ class CloudStrmHelper(_PluginBase):
             mediaserver_items = []
 
         return [
-            # 基础设置卡片
+            # 1. 基础设置
             {
                 "component": "VCard",
                 "props": {"variant": "outlined", "class": "mb-3"},
@@ -992,26 +1272,7 @@ class CloudStrmHelper(_PluginBase):
                                         "component": "VCol", "props": {"cols": 12, "md": 3},
                                         "content": [{"component": "VSwitch", "props": {
                                             "model": "enabled", "label": "启用插件",
-                                            "hint": "开启后监听 MoviePilot SSE 整理完成/入库完成事件", "persistent-hint": True,
-                                        }}],
-                                    },
-                                    {
-                                        "component": "VCol", "props": {"cols": 12, "md": 3},
-                                        "content": [{"component": "VSelect", "props": {
-                                            "model": "cloud_storage_type", "label": "云端存储类型",
-                                            "items": [
-                                                {"title": "AList / alist", "value": "alist"},
-                                            ],
-                                            "disabled": True,
-                                        }}],
-                                    },
-                                    {
-                                        "component": "VCol", "props": {"cols": 12, "md": 3},
-                                        "content": [{"component": "VTextField", "props": {
-                                            "model": "moviepilot_address", "label": "MoviePilot 内网地址",
-                                            "placeholder": DEFAULT_MOVIEPILOT_ADDRESS,
-                                            "hint": "用于构建 STRM 内的 302 跳转 URL，留空则用 MP_DOMAIN",
-                                            "persistent-hint": True,
+                                            "hint": "开启后监听整理完成/入库完成事件", "persistent-hint": True,
                                         }}],
                                     },
                                     {
@@ -1021,13 +1282,28 @@ class CloudStrmHelper(_PluginBase):
                                             "hint": "保存后触发一次（用完自动关闭）", "persistent-hint": True,
                                         }}],
                                     },
+                                    {
+                                        "component": "VCol", "props": {"cols": 12, "md": 3},
+                                        "content": [{"component": "VSwitch", "props": {
+                                            "model": "notify_enabled", "label": "任务完成通知",
+                                            "hint": "同步完成或失败后通过 MP 消息渠道通知", "persistent-hint": True,
+                                        }}],
+                                    },
+                                    {
+                                        "component": "VCol", "props": {"cols": 12, "md": 3},
+                                        "content": [{"component": "VTextField", "props": {
+                                            "model": "upload_concurrency", "label": "上传并发数",
+                                            "placeholder": "3", "type": "number",
+                                            "hint": "同时上传到 AList/OpenList 的文件数", "persistent-hint": True,
+                                        }}],
+                                    },
                                 ],
                             },
                         ],
                     },
                 ],
             },
-            # AList 设置卡片
+            # 2. 播放入口设置
             {
                 "component": "VCard",
                 "props": {"variant": "outlined", "class": "mb-3"},
@@ -1035,8 +1311,8 @@ class CloudStrmHelper(_PluginBase):
                     {
                         "component": "VCardTitle",
                         "content": [
-                            {"component": "VIcon", "props": {"icon": "mdi-cloud", "color": "primary", "class": "mr-2"}},
-                            {"component": "span", "text": "云端（AList）设置"},
+                            {"component": "VIcon", "props": {"icon": "mdi-play-circle", "color": "primary", "class": "mr-2"}},
+                            {"component": "span", "text": "播放入口设置"},
                         ],
                     },
                     {"component": "VDivider"},
@@ -1049,15 +1325,22 @@ class CloudStrmHelper(_PluginBase):
                                     {
                                         "component": "VCol", "props": {"cols": 12, "md": 6},
                                         "content": [{"component": "VTextField", "props": {
-                                            "model": "alist_url", "label": "AList 地址",
-                                            "placeholder": DEFAULT_ALIST_URL,
+                                            "model": "moviepilot_address", "label": "MoviePilot 内网地址",
+                                            "placeholder": DEFAULT_MOVIEPILOT_ADDRESS,
+                                            "hint": "生成 STRM 内的 /redirect 播放入口 URL；留空用 MP_DOMAIN",
+                                            "persistent-hint": True,
                                         }}],
                                     },
                                     {
                                         "component": "VCol", "props": {"cols": 12, "md": 6},
-                                        "content": [{"component": "VTextField", "props": {
-                                            "model": "alist_token", "label": "AList Token",
-                                            "hint": "AList 管理后台 → 设置 → 令牌", "persistent-hint": True,
+                                        "content": [{"component": "VSelect", "props": {
+                                            "model": "strm_url_mode", "label": "STRM URL 模式",
+                                            "items": [
+                                                {"title": "MoviePilot 302 模式（推荐）", "value": "moviepilot_redirect"},
+                                                {"title": "AList/OpenList 直链模式（实验）", "value": "alist_direct"},
+                                            ],
+                                            "hint": "推荐模式实时解析直链；实验模式直写 /d/ 地址，可能受 sign/跨域影响",
+                                            "persistent-hint": True,
                                         }}],
                                     },
                                 ],
@@ -1066,23 +1349,30 @@ class CloudStrmHelper(_PluginBase):
                                 "component": "VRow",
                                 "content": [
                                     {
-                                        "component": "VCol", "props": {"cols": 12, "md": 8},
+                                        "component": "VCol", "props": {"cols": 12, "md": 4},
+                                        "content": [{"component": "VSwitch", "props": {
+                                            "model": "resolve_final_url", "label": "解析最终直链",
+                                            "hint": "HEAD 跟随上游重定向，把最终 URL 直接返回客户端", "persistent-hint": True,
+                                        }}],
+                                    },
+                                    {
+                                        "component": "VCol", "props": {"cols": 12, "md": 4},
                                         "content": [{"component": "VTextField", "props": {
-                                            "model": "alist_target_path", "label": "AList 上传目标根目录",
-                                            "placeholder": DEFAULT_ALIST_TARGET_PATH,
-                                            "hint": "本地媒体会上传到这个 AList 目录下，并保留相对目录结构",
-                                            "persistent-hint": True,
+                                            "model": "redirect_cache_ttl", "label": "直链缓存时间（秒）",
+                                            "placeholder": "120", "type": "number",
+                                            "hint": "缓存 AList/OpenList 解析结果，降低 API 请求频率", "persistent-hint": True,
                                         }}],
                                     },
                                     {
                                         "component": "VCol", "props": {"cols": 12, "md": 4},
                                         "content": [{"component": "VSelect", "props": {
-                                            "model": "sync_mode", "label": "同步模式",
+                                            "model": "head_probe_mode", "label": "HEAD 探测策略",
                                             "items": [
-                                                {"title": "复制（保留本地源文件）", "value": "copy"},
-                                                {"title": "移动（上传成功后删本地）", "value": "move"},
+                                                {"title": "HEAD 返回 200（兼容模式）", "value": "ok"},
+                                                {"title": "HEAD 返回 302（严格模式）", "value": "redirect"},
+                                                {"title": "HEAD 解析但不跳转（诊断模式）", "value": "resolve"},
                                             ],
-                                            "hint": "上传成功后是否删除本地源文件（不删云端文件）", "persistent-hint": True,
+                                            "hint": "部分客户端先 HEAD 探测，默认返回 200 避免误判", "persistent-hint": True,
                                         }}],
                                     },
                                 ],
@@ -1091,7 +1381,68 @@ class CloudStrmHelper(_PluginBase):
                     },
                 ],
             },
-            # 本地与 STRM 路径映射卡片
+            # 3. 云端存储设置
+            {
+                "component": "VCard",
+                "props": {"variant": "outlined", "class": "mb-3"},
+                "content": [
+                    {
+                        "component": "VCardTitle",
+                        "content": [
+                            {"component": "VIcon", "props": {"icon": "mdi-cloud", "color": "primary", "class": "mr-2"}},
+                            {"component": "span", "text": "云端存储设置"},
+                        ],
+                    },
+                    {"component": "VDivider"},
+                    {
+                        "component": "VCardText",
+                        "content": [
+                            {
+                                "component": "VRow",
+                                "content": [
+                                    {
+                                        "component": "VCol", "props": {"cols": 12, "md": 4},
+                                        "content": [{"component": "VSelect", "props": {
+                                            "model": "cloud_storage_type", "label": "云端存储类型",
+                                            "items": [{"title": "AList / OpenList", "value": "alist"}],
+                                            "disabled": True,
+                                        }}],
+                                    },
+                                    {
+                                        "component": "VCol", "props": {"cols": 12, "md": 4},
+                                        "content": [{"component": "VTextField", "props": {
+                                            "model": "alist_url", "label": "AList/OpenList 地址",
+                                            "placeholder": DEFAULT_ALIST_URL,
+                                            "hint": "用于上传、查询文件、解析直链", "persistent-hint": True,
+                                        }}],
+                                    },
+                                    {
+                                        "component": "VCol", "props": {"cols": 12, "md": 4},
+                                        "content": [{"component": "VTextField", "props": {
+                                            "model": "alist_token", "label": "AList/OpenList Token",
+                                            "hint": "用于上传、查询文件信息、解析直链", "persistent-hint": True,
+                                        }}],
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VRow",
+                                "content": [
+                                    {
+                                        "component": "VCol", "props": {"cols": 12},
+                                        "content": [{"component": "VTextField", "props": {
+                                            "model": "alist_target_path", "label": "AList/OpenList 上传目标根目录",
+                                            "placeholder": DEFAULT_ALIST_TARGET_PATH,
+                                            "hint": "插件会把本地媒体相对路径追加到此目录下", "persistent-hint": True,
+                                        }}],
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+            # 4. 本地与 STRM 路径映射
             {
                 "component": "VCard",
                 "props": {"variant": "outlined", "class": "mb-3"},
@@ -1127,7 +1478,7 @@ class CloudStrmHelper(_PluginBase):
                     },
                 ],
             },
-            # 同步设置卡片
+            # 5. 同步与过滤
             {
                 "component": "VCard",
                 "props": {"variant": "outlined", "class": "mb-3"},
@@ -1135,8 +1486,8 @@ class CloudStrmHelper(_PluginBase):
                     {
                         "component": "VCardTitle",
                         "content": [
-                            {"component": "VIcon", "props": {"icon": "mdi-filter-variant", "color": "primary", "class": "mr-2"}},
-                            {"component": "span", "text": "上传与 STRM 过滤"},
+                            {"component": "VIcon", "props": {"icon": "mdi-sync", "color": "primary", "class": "mr-2"}},
+                            {"component": "span", "text": "同步与过滤"},
                         ],
                     },
                     {"component": "VDivider"},
@@ -1146,6 +1497,17 @@ class CloudStrmHelper(_PluginBase):
                             {
                                 "component": "VRow",
                                 "content": [
+                                    {
+                                        "component": "VCol", "props": {"cols": 12, "md": 4},
+                                        "content": [{"component": "VSelect", "props": {
+                                            "model": "sync_mode", "label": "同步模式",
+                                            "items": [
+                                                {"title": "复制（上传后保留本地源文件）", "value": "copy"},
+                                                {"title": "移动（上传+STRM 成功后删本地）", "value": "move"},
+                                            ],
+                                            "hint": "不删云端文件", "persistent-hint": True,
+                                        }}],
+                                    },
                                     {
                                         "component": "VCol", "props": {"cols": 12, "md": 4},
                                         "content": [{"component": "VSelect", "props": {
@@ -1159,16 +1521,9 @@ class CloudStrmHelper(_PluginBase):
                                     {
                                         "component": "VCol", "props": {"cols": 12, "md": 4},
                                         "content": [{"component": "VTextField", "props": {
-                                            "model": "upload_concurrency", "label": "并发上传数",
-                                            "placeholder": "3", "type": "number",
-                                        }}],
-                                    },
-                                    {
-                                        "component": "VCol", "props": {"cols": 12, "md": 4},
-                                        "content": [{"component": "VTextField", "props": {
                                             "model": "rmt_mediaext", "label": "可处理媒体扩展名",
                                             "placeholder": "mp4,mkv,ts,iso,...",
-                                            "hint": "上传与 STRM 共用：仅这些扩展名会上传并生成 STRM", "persistent-hint": True,
+                                            "hint": "上传与 STRM 共用", "persistent-hint": True,
                                         }}],
                                     },
                                 ],
@@ -1179,7 +1534,7 @@ class CloudStrmHelper(_PluginBase):
                                     "component": "VCol", "props": {"cols": 12},
                                     "content": [{
                                         "component": "VTextarea", "props": {
-                                            "model": "exclude_patterns", "label": "排除规则（上传与 STRM 共用，gitignore 语法，一行一条）",
+                                            "model": "exclude_patterns", "label": "排除规则（gitignore 语法，一行一条）",
                                             "rows": 3, "placeholder": DEFAULT_EXCLUDE_PATTERNS,
                                             "hint": "命中规则的文件既不上传也不生成 STRM", "persistent-hint": True,
                                         },
@@ -1194,7 +1549,7 @@ class CloudStrmHelper(_PluginBase):
                                         "component": "VTextarea", "props": {
                                             "model": "event_filters", "label": "事件路径过滤（一行一个本地目录前缀，留空=全部处理）",
                                             "rows": 2, "placeholder": DEFAULT_EVENT_FILTERS,
-                                            "hint": "仅整理到这些目录前缀下的事件才处理（目录级白名单）", "persistent-hint": True,
+                                            "hint": "只处理这些本地路径前缀下的整理事件", "persistent-hint": True,
                                         },
                                     }],
                                 }],
@@ -1203,7 +1558,7 @@ class CloudStrmHelper(_PluginBase):
                     },
                 ],
             },
-            # 媒体服务器与通知卡片
+            # 6. 媒体服务器刷新
             {
                 "component": "VCard",
                 "props": {"variant": "outlined"},
@@ -1212,7 +1567,7 @@ class CloudStrmHelper(_PluginBase):
                         "component": "VCardTitle",
                         "content": [
                             {"component": "VIcon", "props": {"icon": "mdi-server-network", "color": "primary", "class": "mr-2"}},
-                            {"component": "span", "text": "媒体服务器设置"},
+                            {"component": "span", "text": "媒体服务器刷新"},
                         ],
                     },
                     {"component": "VDivider"},
@@ -1230,17 +1585,11 @@ class CloudStrmHelper(_PluginBase):
                                         }}],
                                     },
                                     {
-                                        "component": "VCol", "props": {"cols": 12, "md": 4},
+                                        "component": "VCol", "props": {"cols": 12, "md": 8},
                                         "content": [{"component": "VSelect", "props": {
                                             "model": "transfer_monitor_mediaservers", "label": "媒体服务器",
                                             "items": mediaserver_items,
                                             "multiple": True, "chips": True, "clearable": True,
-                                        }}],
-                                    },
-                                    {
-                                        "component": "VCol", "props": {"cols": 12, "md": 4},
-                                        "content": [{"component": "VSwitch", "props": {
-                                            "model": "notify_enabled", "label": "任务完成通知",
                                         }}],
                                     },
                                 ],
@@ -1252,9 +1601,9 @@ class CloudStrmHelper(_PluginBase):
                                     "content": [{
                                         "component": "VTextarea", "props": {
                                             "model": "transfer_mp_mediaserver_paths",
-                                            "label": "路径映射（媒体服务器路径#MP路径，一行一条）",
+                                            "label": "路径映射（媒体服务器看到的路径#MoviePilot 看到的路径，一行一条）",
                                             "rows": 2, "placeholder": DEFAULT_PATH_MAPPING,
-                                            "hint": "媒体服务器与 MP 路径不同时用于刷新入库", "persistent-hint": True,
+                                            "hint": "用于 Emby/Jellyfin 刷新入库", "persistent-hint": True,
                                         },
                                     }],
                                 }],
@@ -1265,7 +1614,14 @@ class CloudStrmHelper(_PluginBase):
             },
         ], {
             "enabled": False,
+            "once_sync": False,
+            "notify_enabled": True,
+            "upload_concurrency": 3,
             "moviepilot_address": DEFAULT_MOVIEPILOT_ADDRESS,
+            "strm_url_mode": "moviepilot_redirect",
+            "resolve_final_url": True,
+            "redirect_cache_ttl": 120,
+            "head_probe_mode": "ok",
             "cloud_storage_type": "alist",
             "alist_url": DEFAULT_ALIST_URL,
             "alist_token": "",
@@ -1275,13 +1631,10 @@ class CloudStrmHelper(_PluginBase):
             "strm_output_path": DEFAULT_STRM_OUTPUT_PATH,
             "sync_mode": "copy",
             "overwrite_mode": "never",
+            "rmt_mediaext": DEFAULT_MEDIA_EXTS,
             "exclude_patterns": DEFAULT_EXCLUDE_PATTERNS,
             "event_filters": DEFAULT_EVENT_FILTERS,
             "transfer_monitor_media_server_refresh_enabled": True,
             "transfer_monitor_mediaservers": [],
             "transfer_mp_mediaserver_paths": DEFAULT_PATH_MAPPING,
-            "notify_enabled": True,
-            "rmt_mediaext": DEFAULT_MEDIA_EXTS,
-            "upload_concurrency": 3,
-            "once_sync": False,
         }
