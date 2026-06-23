@@ -4,7 +4,7 @@
 - taosync 只做 AList↔AList copy，本地→云端必须用 AList 的 `PUT /api/fs/put`（流式上传）。
 - `As-Task: true` 让上传变为可轮询进度的 AList 任务，轮询 `POST /api/admin/task/upload/info?tid=`（注意是 `/upload/` 任务组，非 `/copy/`）。
 - 鉴权用裸 `Authorization` token（无 Bearer），`GET /api/me` 校验。
-- 增量判定：list 远端目录一次建 name→size dict，缺失或 size 不一致才上传（与 taosync size-only 一致，局限见注释）。
+- 增量判定：list 远端目录一次建 name→size dict，仅缺失才上传，远端已存在永不覆盖。
 - 队列/进度：照 taosync `JobTask` 三列表（waiting/doing/finish）简化，并发上限可配。
 """
 import os
@@ -22,7 +22,10 @@ from app.log import logger
 # 0=Pending,1=Running,2=Succeeded,3=Canceling,4=Canceled,5=Errored,6=Failing,7=Failed
 TASK_SUCCEEDED = 2
 TASK_CANCELED = 4
+TASK_ERRORED = 5
+TASK_FAILING = 6
 TASK_FAILED = 7
+TASK_SKIPPED = 8
 TASK_TERMINAL = (TASK_SUCCEEDED, TASK_CANCELED, TASK_FAILED)
 
 
@@ -49,6 +52,16 @@ def _convert_seconds(seconds: float) -> Tuple[int, int, int]:
 
 class AlistError(Exception):
     """AList API 错误。"""
+
+
+class AlistAlreadyExists(AlistError):
+    """AList 上传目标已存在。"""
+
+
+def _is_already_exists_message(message: Any) -> bool:
+    """判断 AList 返回文本是否表示目标已存在。"""
+    text = str(message or "").lower()
+    return any(token in text for token in ("exist", "already", "存在", "已存在"))
 
 
 class AlistClient:
@@ -151,10 +164,6 @@ class AlistClient:
         """获取单个文件/目录信息，含 raw_url / sign / size（用于构建直链）。"""
         return self.post("/api/fs/get", data={"path": path}) or {}
 
-    def remove(self, dir_path: str, names: List[str]) -> None:
-        """删除文件/目录（full 同步模式清理远端多余文件用）。"""
-        self.post("/api/fs/remove", data={"dir": dir_path, "names": names})
-
     # ---- 上传 ----
     def put_stream(self, local_path: str, remote_path: str, as_task: bool = True) -> Optional[str]:
         """流式上传本地文件到 AList 远端路径。
@@ -169,7 +178,7 @@ class AlistClient:
             "Authorization": self.token,
             "File-Path": quote(remote_path, safe="/"),
             "Content-Length": str(size),
-            "Overwrite": "true",
+            "Overwrite": "false",
         }
         if as_task:
             headers["As-Task"] = "true"
@@ -179,13 +188,18 @@ class AlistClient:
             r = requests.put(self.url + "/api/fs/put", data=f, headers=headers, timeout=self.timeout)
 
         if r.status_code != 200:
+            if _is_already_exists_message(getattr(r, "text", "")):
+                raise AlistAlreadyExists(f"AList 上传目标已存在: {remote_path}")
             raise AlistError(f"AList 上传 HTTP {r.status_code}: {r.text[:200]}")
         try:
             res = r.json()
         except Exception:
             raise AlistError("AList 上传响应非 JSON")
         if res.get("code") != 200:
-            raise AlistError(f"AList 上传错误 [{res.get('code')}]: {res.get('message')}")
+            message = str(res.get("message") or "")
+            if _is_already_exists_message(message):
+                raise AlistAlreadyExists(f"AList 上传目标已存在: {remote_path}")
+            raise AlistError(f"AList 上传错误 [{res.get('code')}]: {message}")
         data = res.get("data") or {}
         # as_task 时 data 含 {"task": {...}}，否则 data 通常为 null/None
         if as_task and isinstance(data, dict):
@@ -257,7 +271,7 @@ class CloudSync:
                  sync_mode: str = "new", concurrency: int = 3):
         self.plugin = plugin
         self.alist = alist_client
-        self.sync_mode = sync_mode  # new / full
+        self.sync_mode = sync_mode  # 固定仅新增；保留字段用于状态兼容
         self.concurrency = max(1, int(concurrency or 3))
 
         self.waiting: List[_SyncItem] = []
@@ -277,12 +291,26 @@ class CloudSync:
     # ---- 生命周期 ----
     def start(self) -> None:
         if self._started:
+            if self._worker_thread and self._worker_thread.is_alive():
+                return
+            self._worker_thread = threading.Thread(target=self._dispatch, daemon=True, name="CloudSyncDispatch")
+            self._worker_thread.start()
             return
         self._started = True
         self.break_flag = False
         self.scan_finish = False
         self._worker_thread = threading.Thread(target=self._dispatch, daemon=True, name="CloudSyncDispatch")
         self._worker_thread.start()
+
+    def prepare_batch(self) -> None:
+        """开始新批次前重置批次状态并确保分发线程运行。"""
+        with self._cond:
+            self.create_time = time.time()
+            self.scan_finish = False
+            self.finish = []
+            self.break_flag = False
+            self._cond.notify_all()
+        self.start()
 
     def stop(self) -> None:
         self.break_flag = True
@@ -389,6 +417,10 @@ class CloudSync:
             try:
                 tid = self.alist.put_stream(item.local_path, item.remote_path, as_task=True)
                 break
+            except AlistAlreadyExists:
+                logger.info(f"【云同步】远端已存在，视为同步完成: {item.remote_path}")
+                item.status = TASK_SKIPPED
+                return
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, AlistError) as e:
                 last_err = e
                 if attempt < 2:
@@ -426,11 +458,18 @@ class CloudSync:
 
             state = info.get("state")
             progress = info.get("progress")
+            error = info.get("error") or None
+            if state in (TASK_ERRORED, TASK_FAILING, TASK_FAILED) and _is_already_exists_message(error):
+                item.status = TASK_SKIPPED
+                item.err_msg = None
+                if item.alist_task_id and self.alist:
+                    self.alist.upload_task_delete(item.alist_task_id)
+                break
             if state == item.status and progress == item.progress:
                 continue
             item.status = state if state is not None else item.status
             item.progress = progress
-            item.err_msg = info.get("error") or None
+            item.err_msg = error
             # 终态：删除 AList 任务记录避免堆积
             if state in TASK_TERMINAL:
                 if item.alist_task_id and self.alist:
@@ -442,37 +481,12 @@ class CloudSync:
         with self._lock:
             self.doing.pop(getattr(item, "doing_key", -1), None)
             self.finish.append(item)
-        # 成功则回调插件生成 STRM
-        if item.status == TASK_SUCCEEDED:
-            try:
-                if self.plugin and hasattr(self.plugin, "_on_file_synced"):
-                    self.plugin._on_file_synced(
-                        item.local_path, item.remote_path, item.mediainfo, item.meta
-                    )
-            except Exception as e:
-                logger.error(f"【云同步】同步后回调失败: {e}", exc_info=True)
-        # full 模式：成功后清理远端多余文件（按目录）
-        if self.sync_mode == "full" and item.status == TASK_SUCCEEDED:
-            try:
-                self._cleanup_remote_dir(item.remote_parent)
-            except Exception as e:
-                logger.debug(f"【云同步】full 清理远端异常: {e}")
-
-    def _cleanup_remote_dir(self, remote_dir: str) -> None:
-        """full 模式：删除远端目录中本地不存在的文件。
-
-        简化实现：本插件以事件/手动同步驱动，本地「应有」集合不易完整重建，
-        默认不主动删远端文件以免误删。full 模式仅补传，删除逻辑留作扩展点。
-        """
-        # 预留：如需严格 mirror，需遍历 local_media_path 重建本地集合后比对远端 list_dir 结果
-        return
-
     # ---- 批次结束 ----
     def _on_batch_finish(self) -> None:
         if not self.plugin or not getattr(self.plugin, "_notify_enabled", False):
             return
         try:
-            success = [it for it in self.finish if it.status == TASK_SUCCEEDED]
+            success = [it for it in self.finish if it.status in (TASK_SUCCEEDED, TASK_SKIPPED)]
             failed = [it for it in self.finish if it.status in (TASK_FAILED, TASK_CANCELED)]
             total_size = sum(it.file_size for it in success if it.file_size)
             duration = time.time() - self.create_time
@@ -493,6 +507,19 @@ class CloudSync:
                 self.plugin._notify(title, text)
         except Exception as e:
             logger.debug(f"【云同步】批次结束通知异常: {e}")
+
+    def wait_for_batch(self, timeout: Optional[float] = None) -> List[_SyncItem]:
+        """等待当前批次完成并返回完成列表快照。"""
+        start = time.time()
+        while True:
+            with self._lock:
+                done = self.scan_finish and not self.waiting and not self.doing
+                finish = list(self.finish)
+            if done:
+                return finish
+            if timeout is not None and time.time() - start >= timeout:
+                return finish
+            time.sleep(0.5)
 
     # ---- 状态快照 ----
     def get_status(self) -> Dict[str, Any]:
@@ -516,14 +543,17 @@ class CloudSync:
             "num": {
                 "waiting": len(current["waiting"]),
                 "running": len(current["doing"]),
-                "success": len(_bucket(current["finish"], TASK_SUCCEEDED)),
+                "success": len(_bucket(current["finish"], TASK_SUCCEEDED)) + len(_bucket(current["finish"], TASK_SKIPPED)),
                 "fail": len(_bucket(current["finish"], TASK_FAILED))
                        + len(_bucket(current["finish"], TASK_CANCELED)),
             },
             "size": {
                 "waiting": sum(it.file_size for it in current["waiting"] if it.file_size),
                 "running": sum(it.file_size for it in current["doing"] if it.file_size),
-                "success": sum(it.file_size for it in _bucket(current["finish"], TASK_SUCCEEDED) if it.file_size),
+                "success": sum(
+                    it.file_size for it in current["finish"]
+                    if it.status in (TASK_SUCCEEDED, TASK_SKIPPED) and it.file_size
+                ),
                 "fail": sum(it.file_size for it in current["finish"] if it.status in (TASK_FAILED, TASK_CANCELED) and it.file_size),
             },
             "items": [
@@ -542,14 +572,12 @@ class CloudSync:
 
     # ---- 增量判定 ----
     def need_upload(self, local_path: str, remote_path: str) -> bool:
-        """增量判定：远端缺失或 size 不一致才需上传。
+        """增量判定：仅远端缺失才上传。
 
-        本地→云端无法双向 list 比对，这里 list 远端所在目录建 name→size dict（与 taosync size-only 一致）。
-        局限：同 size 不同内容不会重传（媒体重编码一般 size 变化，可接受；如需更强可用 fs_get 的 hash_info）。
+        需求要求 never overwrite，因此只要远端存在同名文件就跳过，不按 size/hash 重传。
         """
         if not self.alist:
             return True
-        local_size = os.path.getsize(local_path)
         remote_name = Path(remote_path).name
         remote_parent = str(Path(remote_path).parent)
         if remote_parent in ("", ".", "/"):
@@ -564,32 +592,4 @@ class CloudSync:
         remote_size = listing[remote_name]
         if not isinstance(remote_size, int):
             return True  # 是目录，同名冲突
-        return local_size != remote_size
-
-
-class WebdavClient:
-    """WebDAV 云端客户端（预留，本期未实现）。
-
-    后续可基于 webdav3client 或 requests 实现 PROPFIND/MKCOL/PUT。
-    """
-
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError("WebDAV 云端类型暂未实现，请使用 alist 或 local")
-
-
-class LocalCloudClient:
-    """本地挂载目录作为「云端」的退化实现：直接复制文件。
-
-    适用于 AList/网盘已挂载到本地路径的场景，省去上传，但仍生成 STRM 指向 redirect 端点。
-    """
-
-    def __init__(self, target_path: str):
-        self.target_path = target_path
-
-    def put_stream(self, local_path: str, remote_path: str, as_task: bool = True) -> Optional[str]:
-        import shutil
-        # remote_path 以 target_path 为根
-        dest = Path(self.target_path) / remote_path.lstrip("/")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(local_path, dest)
-        return None  # 本地复制无任务
+        return False

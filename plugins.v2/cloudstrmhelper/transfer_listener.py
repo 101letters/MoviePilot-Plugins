@@ -1,40 +1,48 @@
-"""transfer_listener.py — 整理完成事件的过滤与分发
+"""transfer_listener.py — Phase 1 整理完成事件记录。
 
-实现要点（参考 p123strmhelper 的 generate_strm 事件处理 + chinesesubfinder）：
-- MoviePilot「整理完成」通过进程内 EventType.TransferComplete 事件传递（非 SSE）。
-- event.event_data 含 mediainfo/meta/transferinfo/fileitem。
-- 过滤链：事件路径前缀过滤 → pathspec 排除 → 扩展名过滤 → 蓝光目录跳过。
-- 对 transferinfo.file_list_new 中每个文件计算 local/remote 路径，增量判定后入队 cloud_sync。
+Phase 1 只做事件识别、路径过滤与记录构造，不做本地文件检查、不访问 AList、
+不生成 STRM。真正的文件扫描/上传在插件主类进入 Phase 2 后执行。
 """
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
-import pathspec
 from app.log import logger
-from app.utils.system import SystemUtils
+
+
+@dataclass
+class TransferRecord:
+    """一次有效事件中提取出的待处理路径记录。"""
+
+    source: str
+    local_path: str
+    remote_path: str
+    mediainfo: Any = None
+    meta: Any = None
+    event_text: str = ""
 
 
 class TransferListener:
-    """整理完成事件监听/分发器。"""
+    """整理完成事件记录器。"""
 
     def __init__(self, plugin):
         self.plugin = plugin
 
-    def handle(self, event) -> None:
-        """处理 TransferComplete 事件。"""
+    def handle(self, event) -> List[TransferRecord]:
+        """处理进程内 TransferComplete 事件，返回 Phase 1 记录。"""
         try:
             data = event.event_data or {}
             transferinfo = data.get("transferinfo")
             if transferinfo is None:
                 logger.debug("【整理监听】事件无 transferinfo，跳过")
-                return
+                return []
 
             # 整理成功才处理
             success = getattr(transferinfo, "success", None)
             if success is False:
                 logger.debug("【整理监听】整理未成功，跳过")
-                return
+                return []
 
             mediainfo = data.get("mediainfo")
             meta = data.get("meta")
@@ -47,20 +55,12 @@ class TransferListener:
                     target_diritem = target_item
             if target_diritem is None:
                 logger.warning("【整理监听】事件无 target_diritem，无法定位目标目录")
-                return
+                return []
 
             target_dir = getattr(target_diritem, "path", None) or ""
             if not target_dir:
                 logger.warning("【整理监听】目标目录 path 为空，跳过")
-                return
-
-            # 蓝光目录跳过
-            try:
-                if SystemUtils.is_bluray_dir(Path(target_dir)):
-                    logger.info(f"【整理监听】蓝光目录，跳过: {target_dir}")
-                    return
-            except Exception:
-                pass
+                return []
 
             # 整理后新文件相对路径列表
             file_list = getattr(transferinfo, "file_list_new", None)
@@ -68,90 +68,120 @@ class TransferListener:
                 file_list = getattr(transferinfo, "file_list", None)
             if not file_list:
                 logger.debug(f"【整理监听】无新文件列表，跳过: {target_dir}")
-                return
+                return []
 
-            self._process_files(target_dir, file_list, mediainfo, meta)
+            records = self._records_from_file_list(
+                source="event",
+                target_dir=target_dir,
+                file_list=file_list,
+                mediainfo=mediainfo,
+                meta=meta,
+            )
+            logger.info(f"【整理监听】Phase 1 记录整理事件: {target_dir}, 有效路径 {len(records)}")
+            return records
         except Exception as e:
             logger.error(f"【整理监听】处理事件异常: {e}", exc_info=True)
+            return []
 
-    def _process_files(self, target_dir: str, file_list: list,
-                       mediainfo, meta) -> None:
-        """对每个新文件计算路径、过滤、增量判定、入队。"""
+    def handle_sse_paths(self, paths: List[str], event_text: str = "") -> List[TransferRecord]:
+        """处理 SSE 中提取出的路径，返回 Phase 1 记录。"""
+        records: List[TransferRecord] = []
+        for path in paths or []:
+            local_path = str(path).strip()
+            if not local_path:
+                continue
+            record = self._build_record(
+                source="sse",
+                local_path=local_path,
+                mediainfo=None,
+                meta=None,
+                event_text=event_text,
+            )
+            if record:
+                records.append(record)
+        if records:
+            logger.info(f"【SSE监听】Phase 1 记录整理事件，有效路径 {len(records)}")
+        return records
+
+    def _records_from_file_list(self, source: str, target_dir: str, file_list: list,
+                                mediainfo, meta) -> List[TransferRecord]:
+        """把事件内文件列表转换成记录；不触碰文件系统。"""
+        records: List[TransferRecord] = []
+        for item in file_list:
+            local_path = self._resolve_file_item_path(target_dir, item)
+            if not local_path:
+                continue
+            record = self._build_record(source, local_path, mediainfo, meta)
+            if record:
+                records.append(record)
+        return records
+
+    @staticmethod
+    def _resolve_file_item_path(target_dir: str, item) -> str:
+        """从 MoviePilot file_list 条目解析本地路径，兼容相对路径、绝对路径和 FileItem。"""
+        raw_path = getattr(item, "path", None) or getattr(item, "file_path", None) or str(item)
+        path = str(raw_path).strip().replace("\\", "/")
+        if not path:
+            return ""
+        if Path(path).is_absolute():
+            return path
+        return os.path.join(target_dir, path.lstrip("/"))
+
+    def _build_record(self, source: str, local_path: str, mediainfo, meta,
+                      event_text: str = "") -> Optional[TransferRecord]:
+        """构造单条 Phase 1 记录；只做字符串级过滤。"""
         local_root = self.plugin._local_media_path
         cloud_root = self.plugin._alist_target_path
         if not local_root or not cloud_root:
             logger.warning("【整理监听】未配置本地媒体路径或云端目标路径，跳过")
-            return
+            return None
 
         exclude_spec = self.plugin._exclude_spec
         event_prefixes = self.plugin._event_filter_prefixes
         media_exts = self.plugin._rmt_mediaext
 
-        queued = 0
-        skipped = 0
-        for rel in file_list:
-            # rel 可能是相对路径字符串
-            rel_str = str(rel).replace("\\", "/").lstrip("/")
-            local_path = os.path.join(target_dir, rel_str)
+        if event_prefixes and not any(local_path.startswith(p) for p in event_prefixes):
+            return None
 
-            # 1. 事件前缀过滤
-            if event_prefixes and not any(local_path.startswith(p) for p in event_prefixes):
-                skipped += 1
-                continue
+        if exclude_spec and self._is_excluded(local_path, local_root, exclude_spec):
+            logger.debug(f"【整理监听】命中排除规则，跳过: {local_path}")
+            return None
 
-            # 2. 排除规则（pathspec，相对 local_root）
-            if exclude_spec and self._is_excluded(local_path, local_root, exclude_spec):
-                logger.debug(f"【整理监听】命中排除规则，跳过: {local_path}")
-                skipped += 1
-                continue
+        ext = Path(local_path).suffix.lower().lstrip(".")
+        if ext and ext not in media_exts:
+            return None
 
-            # 3. 扩展名过滤
-            ext = Path(local_path).suffix.lower().lstrip(".")
-            if ext not in media_exts:
-                skipped += 1
-                continue
+        remote_path = self.plugin._build_remote_path(local_path)
+        if not remote_path:
+            logger.debug(f"【整理监听】无法映射云端路径，跳过: {local_path}")
+            return None
 
-            # 4. 本地文件存在性
-            if not os.path.exists(local_path):
-                logger.debug(f"【整理监听】本地文件不存在，跳过: {local_path}")
-                skipped += 1
-                continue
-
-            # 5. 计算云端路径：cloud_root + (local_path 相对 local_root 的部分)
-            try:
-                rel_to_root = Path(local_path).relative_to(local_root)
-            except ValueError:
-                # target_dir 可能不在 local_root 下（如整理到其他目录），用 rel 推导
-                rel_to_root = Path(rel_str)
-            remote_path = (cloud_root.rstrip("/") + "/" + str(rel_to_root).replace("\\", "/")).rstrip("/")
-
-            # 6. 增量判定
-            cloud_sync = self.plugin._cloud_sync
-            if cloud_sync is None:
-                logger.warning("【整理监听】云同步引擎未初始化，跳过")
-                return
-            try:
-                if not cloud_sync.need_upload(local_path, remote_path):
-                    logger.debug(f"【整理监听】远端已存在且一致，跳过上传: {remote_path}")
-                    # 即使不上传也尝试生成 STRM（可能 STRM 缺失）
-                    if self.plugin and hasattr(self.plugin, "_on_file_synced"):
-                        self.plugin._on_file_synced(local_path, remote_path, mediainfo, meta)
-                    skipped += 1
-                    continue
-            except Exception as e:
-                logger.warning(f"【整理监听】增量判定异常，按需上传: {e}")
-
-            # 7. 入队
-            cloud_sync.enqueue_file(local_path, remote_path, mediainfo, meta)
-            queued += 1
-
-        logger.info(f"【整理监听】目录 {target_dir}: 入队 {queued}，跳过 {skipped}")
+        return TransferRecord(
+            source=source,
+            local_path=local_path,
+            remote_path=remote_path,
+            mediainfo=mediainfo,
+            meta=meta,
+            event_text=event_text,
+        )
 
     @staticmethod
     def _is_excluded(local_path: str, root: str, spec) -> bool:
         """pathspec gitignore 匹配，路径相对 root。"""
+        roots = [line.strip() for line in str(root or "").splitlines() if line.strip()]
+        if not roots:
+            roots = [root]
+        for item in roots:
+            if not item:
+                continue
+            try:
+                rel = str(Path(local_path).relative_to(item)).replace("\\", "/")
+            except ValueError:
+                continue
+            if spec.match_file(rel):
+                return True
         try:
-            rel = str(Path(local_path).relative_to(root)).replace("\\", "/")
+            rel = str(Path(local_path)).replace("\\", "/")
         except ValueError:
             rel = local_path
         return spec.match_file(rel)

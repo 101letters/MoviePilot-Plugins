@@ -5,7 +5,7 @@
 - 优先 raw_url（AList 上游真实直链）；无则构建 {alist_url}/d{path}?sign={sign}。
 - 可选：跟随重定向取最终 URL（HEAD，传客户端 UA，≤10 跳，循环检测）——减少客户端重定向次数。
 - HEAD 请求由端点层放行（兼容 Infuse/Fileball 探测）。
-- 缓存：在 __init__.py 的 @cached(TTLCache) 上做（按 path+ua），本模块只负责解析。
+- 缓存：在插件主类 TTLCache 上做（按 path+ua），本模块只负责解析。
 - 失败 raise，端点层捕获返回 500 JSON。
 """
 from urllib.parse import quote

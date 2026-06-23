@@ -35,23 +35,27 @@ class StrmGenerator:
         return f"{self.REDIRECT_PREFIX}/{self._plugin_id}/redirect"
 
     # ---- 路径计算 ----
-    def _strm_output_path(self, local_path: str) -> Optional[Path]:
-        """计算 STRM 输出路径：strm_output_path + 相对 local_media_path 的部分 + stem.strm。
+    def _strm_output_path(self, local_path: str, remote_path: str = "") -> Optional[Path]:
+        """计算 STRM 输出路径：优先按云端路径映射，兼容旧测试的本地路径映射。"""
+        if remote_path and hasattr(self.plugin, "_strm_output_path_from_remote"):
+            path = self.plugin._strm_output_path_from_remote(remote_path)
+            if path:
+                return path
 
-        若 local_path 不在 local_media_path 下，返回 None。
-        """
         local = Path(local_path)
-        root = Path(self.plugin._local_media_path)
-        try:
-            rel = local.relative_to(root)
-        except ValueError:
-            # 不在监控根下：尝试用 has_prefix 思路兼容（路径分段前缀匹配）
-            if not self._has_prefix(local, root):
-                logger.debug(f"【STRM生成】文件不在本地媒体根下，跳过: {local_path}")
-                return None
-            rel = self._relative_to(local, root)
-        out_root = Path(self.plugin._strm_output_path)
-        return out_root / rel.parent / (local.stem + ".strm")
+        roots = getattr(self.plugin, "_local_media_roots", None) or [self.plugin._local_media_path]
+        for root_value in roots:
+            root = Path(root_value)
+            try:
+                rel = local.relative_to(root)
+            except ValueError:
+                if not self._has_prefix(local, root):
+                    continue
+                rel = self._relative_to(local, root)
+            out_root = Path(self.plugin._strm_output_path)
+            return out_root / rel.parent / (local.stem + ".strm")
+        logger.debug(f"【STRM生成】文件不在本地媒体根下，跳过: {local_path}")
+        return None
 
     @staticmethod
     def _has_prefix(full: Path, prefix: Path) -> bool:
@@ -94,22 +98,22 @@ class StrmGenerator:
 
     # ---- 生成 ----
     def generate(self, local_path: str, remote_path: str,
-                 mediainfo: Any = None, meta: Any = None) -> Tuple[bool, Optional[Path]]:
-        """生成单个 STRM 文件。返回 (是否成功, strm 路径)。
+                 mediainfo: Any = None, meta: Any = None) -> Tuple[bool, Optional[Path], bool]:
+        """生成单个 STRM 文件。返回 (是否成功, strm 路径, 是否新建)。
 
         local_path  : 本地媒体文件绝对路径（用于推导 STRM 输出位置）
         remote_path : AList 云端路径（写入 .strm 内容，播放时由 redirect 端点解析）
         mediainfo   : MediaInfo（用于 Emby 刷新 RefreshMediaItem）
         """
         try:
-            strm_path = self._strm_output_path(local_path)
+            strm_path = self._strm_output_path(local_path, remote_path)
             if strm_path is None:
-                return False, None
+                return False, None, False
 
             # overwrite 判定
-            if strm_path.exists() and self.plugin._overwrite_mode == "never":
+            if strm_path.exists():
                 logger.debug(f"【STRM生成】已存在且覆盖模式 never，跳过: {strm_path}")
-                return True, strm_path
+                return True, strm_path, False
 
             strm_path.parent.mkdir(parents=True, exist_ok=True)
             strm_url = self._build_strm_url(remote_path)
@@ -126,10 +130,10 @@ class StrmGenerator:
                 except Exception as e:
                     logger.error(f"【STRM生成】媒体服务器刷新失败: {e}", exc_info=True)
 
-            return True, strm_path
+            return True, strm_path, True
         except Exception as e:
             logger.error(f"【STRM生成】生成失败: {local_path}: {e}", exc_info=True)
-            return False, None
+            return False, None, False
 
     # ---- Emby/Jellyfin 刷新 ----
     def refresh_emby(self, strm_path: Path, mediainfo: Any) -> None:
