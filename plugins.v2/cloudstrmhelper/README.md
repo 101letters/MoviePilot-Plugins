@@ -11,15 +11,15 @@ Phase 1 监听事件
         |
         v
 Phase 2 AList 同步
-  本地媒体路径 -> 云端目标路径
+  本地媒体路径 -> AList 上传目标根目录
   SSE 如只记录到目录，在本阶段展开目录内媒体文件
   仅新增，远端已存在即跳过，永不删除远端文件
         |
         v
 Phase 3 STRM 生成
-  云端路径 -> STRM 输出路径
+  按“本地媒体库路径#STRM输出目录”映射生成 STRM
   STRM 内容为 MoviePilot /redirect 302 URL
-  已存在 STRM 永不覆盖
+  STRM 覆盖模式可选“从不/总是”
         |
         v
 Phase 4 媒体库刷新
@@ -35,11 +35,10 @@ Phase 4 媒体库刷新
 | MoviePilot 内网地址 | `http://192.168.31.6:3000` |
 | 云存储类型 | `alist` |
 | AList 地址 | `http://192.168.31.6:5244/` |
-| 云端目标路径 | `/123云盘/影视/华语电影` |
-| 本地媒体库路径 | `/media/movies`、`/media/tv` |
-| STRM 输出目录 | `/strm/test/华语电影` |
-| 同步模式 | 仅新增 |
-| STRM 覆盖模式 | 从不覆盖 |
+| AList 上传目标根目录 | `/123云盘/影视/华语电影` |
+| 本地与 STRM 路径映射 | `/media/movies#/strm/test/华语电影`、`/media/tv#/strm/test/电视剧` |
+| 同步模式 | 复制 |
+| STRM 覆盖模式 | 从不 |
 | 并发上传数 | `3` |
 | 媒体扩展名 | `mp4,mkv,ts,iso,rmvb,avi,mov,mpeg,mpg,wmv,3gp,asf,m4v,flv,m2ts,tp,f4v` |
 | 排除规则 | `*.tmp`、`**/.DS_Store`、`/sample/**` |
@@ -48,7 +47,7 @@ Phase 4 媒体库刷新
 
 ## 路径映射
 
-本地路径先按多行本地媒体根做前缀匹配，再映射到 AList 目标根：
+AList 上传目标根目录就是同步上传到云端的根目录。插件会把本地媒体相对路径追加到这个根目录下：
 
 ```text
 /media/movies/Foo/Foo.mkv
@@ -58,11 +57,27 @@ Phase 4 媒体库刷新
 -> /123云盘/影视/华语电影/Show/S01E01.mkv
 ```
 
-STRM 输出必须基于云端路径映射：
+本地与 STRM 路径用一行一个映射配置，格式是：
 
 ```text
-/123云盘/影视/华语电影/movie.mp4
--> /strm/test/华语电影/movie.strm
+本地媒体库路径#STRM输出目录
+```
+
+示例：
+
+```text
+/media/movies#/strm/test/华语电影
+/media/tv#/strm/test/电视剧
+```
+
+对应生成：
+
+```text
+/media/movies/Foo/Foo.mkv
+-> /strm/test/华语电影/Foo/Foo.strm
+
+/media/tv/Show/S01E01.mkv
+-> /strm/test/电视剧/Show/S01E01.strm
 ```
 
 STRM 内容格式：
@@ -82,6 +97,16 @@ http://<MoviePilot内网地址>/api/v1/plugin/CloudStrmHelper/redirect?apikey=<A
 3. 本地与 STRM 路径
 4. 同步与过滤
 5. 媒体服务器设置
+
+同步模式：
+
+- `复制`：上传到 AList 后保留本地源文件。
+- `移动`：上传到 AList 且 STRM 生成成功后删除本地源文件；不会删除远端文件。
+
+STRM 覆盖模式：
+
+- `从不`：已有 STRM 直接跳过。
+- `总是`：重新写入已有 STRM。
 
 插件首页展示实时统计：
 
@@ -105,7 +130,7 @@ cachetools
 
 ## 验证
 
-1. 配置 AList 地址、Token、云端目标路径、本地媒体路径、STRM 输出目录和媒体服务器路径映射。
+1. 配置 AList 地址、Token、AList 上传目标根目录、本地与 STRM 路径映射、媒体服务器路径映射。
 2. 启用插件，观察日志出现 `【SSE监听】连接 MoviePilot 消息流`。
 3. 让 MoviePilot 完成一次整理入库，日志应按顺序出现：
    - `Phase 1 完成`
@@ -133,6 +158,6 @@ cachetools
 
 - 不删除远端文件。
 - 不覆盖远端已有文件。
-- 不覆盖已有 STRM。
+- STRM 是否覆盖由“STRM 覆盖模式”控制。
 - Phase 1 不做任何文件系统或 AList 操作。
 - 每个批次先完成 AList 同步，再生成 STRM 和刷新媒体库。

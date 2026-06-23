@@ -3,7 +3,7 @@
 实现要点（参考 p123strmhelper）：
 - `.strm` 内容 = 指向插件自带 `/api/v1/plugin/<id>/redirect` 302 端点的 URL（自托管 302，链接不失效）。
 - 文件名：原媒体文件 stem + `.strm`；`open(w, utf-8).write(url)` 不加换行。
-- 路径重定向：strm_output_path + (local_path 相对 local_media_path 的相对部分)，用 Path.relative_to。
+- 路径重定向：按插件的 `本地媒体库路径#STRM输出目录` 映射生成。
 - overwrite_mode：never=跳过已存在，always=覆盖。
 - Emby 刷新：MediaServerHelper + RefreshMediaItem，支持路径映射替换（媒体服务器路径#MP路径）。
 """
@@ -37,10 +37,13 @@ class StrmGenerator:
     # ---- 路径计算 ----
     def _strm_output_path(self, local_path: str, remote_path: str = "") -> Optional[Path]:
         """计算 STRM 输出路径：优先按云端路径映射，兼容旧测试的本地路径映射。"""
-        if remote_path and hasattr(self.plugin, "_strm_output_path_from_remote"):
-            path = self.plugin._strm_output_path_from_remote(remote_path)
-            if path:
+        resolver = getattr(self.plugin, "_strm_output_path_for", None)
+        if remote_path and callable(resolver):
+            path = resolver(local_path, remote_path)
+            if isinstance(path, Path):
                 return path
+            if isinstance(path, str) and path:
+                return Path(path)
 
         local = Path(local_path)
         roots = getattr(self.plugin, "_local_media_roots", None) or [self.plugin._local_media_path]
@@ -110,9 +113,9 @@ class StrmGenerator:
             if strm_path is None:
                 return False, None, False
 
-            # overwrite 判定
-            if strm_path.exists():
-                logger.debug(f"【STRM生成】已存在且覆盖模式 never，跳过: {strm_path}")
+            existed = strm_path.exists()
+            if existed and self.plugin._overwrite_mode == "never":
+                logger.debug(f"【STRM生成】已存在且 STRM 模式 never，跳过: {strm_path}")
                 return True, strm_path, False
 
             strm_path.parent.mkdir(parents=True, exist_ok=True)
@@ -130,7 +133,7 @@ class StrmGenerator:
                 except Exception as e:
                     logger.error(f"【STRM生成】媒体服务器刷新失败: {e}", exc_info=True)
 
-            return True, strm_path, True
+            return True, strm_path, not existed
         except Exception as e:
             logger.error(f"【STRM生成】生成失败: {local_path}: {e}", exc_info=True)
             return False, None, False

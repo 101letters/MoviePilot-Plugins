@@ -268,7 +268,7 @@ class CloudSync:
     """
 
     def __init__(self, plugin: Any, alist_client: Optional[AlistClient],
-                 sync_mode: str = "new", concurrency: int = 3):
+                 sync_mode: str = "copy", concurrency: int = 3):
         self.plugin = plugin
         self.alist = alist_client
         self.sync_mode = sync_mode  # 固定仅新增；保留字段用于状态兼容

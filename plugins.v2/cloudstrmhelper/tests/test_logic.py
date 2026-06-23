@@ -185,6 +185,8 @@ class TestStrmPathResolution(unittest.TestCase):
         plugin = MagicMock()
         plugin._local_media_path = local_root
         plugin._local_media_roots = [local_root]
+        plugin._local_strm_paths = f"{local_root}#{strm_root}"
+        plugin._local_strm_mappings = [(local_root, strm_root)]
         plugin._strm_output_path = strm_root
         plugin._moviepilot_address = "http://mp:3000"
         plugin._overwrite_mode = "never"
@@ -231,6 +233,26 @@ class TestStrmPathResolution(unittest.TestCase):
         gen = StrmGenerator(plugin)
         self.assertEqual(gen._plugin_id, "CloudStrmHelper")
         self.assertEqual(gen._redirect_path, "/api/v1/plugin/CloudStrmHelper/redirect")
+
+    def test_overwrite_always_rewrites_existing_strm(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+            local_root = Path(tmp) / "media"
+            strm_root = Path(tmp) / "strm"
+            local_root.mkdir()
+            strm_root.mkdir()
+            media_file = local_root / "Foo.mkv"
+            media_file.write_bytes(b"movie")
+            strm_file = strm_root / "Foo.strm"
+            strm_file.write_text("old", encoding="utf-8")
+
+            gen, plugin = self._make_plugin(str(local_root), str(strm_root))
+            plugin._overwrite_mode = "always"
+            ok, path, created = gen.generate(str(media_file), "/cloud/Foo.mkv")
+
+            self.assertTrue(ok)
+            self.assertEqual(path, strm_file)
+            self.assertFalse(created)
+            self.assertNotEqual(strm_file.read_text(encoding="utf-8"), "old")
 
 
 class TestExcludeSpec(unittest.TestCase):
@@ -337,7 +359,7 @@ class TestPluginMetadata(unittest.TestCase):
     def test_metadata_present(self):
         from cloudstrmhelper import CloudStrmHelper
         self.assertEqual(CloudStrmHelper.plugin_name, "云端STRM整理助手")
-        self.assertEqual(CloudStrmHelper.plugin_version, "1.1.0")
+        self.assertEqual(CloudStrmHelper.plugin_version, "1.2.0")
         self.assertEqual(CloudStrmHelper.plugin_config_prefix, "cloudstrmhelper_")
         self.assertEqual(CloudStrmHelper.plugin_author, "101letters")
         self.assertEqual(CloudStrmHelper.auth_level, 1)
@@ -349,6 +371,7 @@ class TestPluginMetadata(unittest.TestCase):
         self.assertIsInstance(defaults, dict)
         self.assertIn("enabled", defaults)
         self.assertIn("alist_url", defaults)
+        self.assertIn("local_strm_paths", defaults)
         self.assertIn("strm_output_path", defaults)
         self.assertFalse(defaults["enabled"])
         self.assertEqual(defaults["cloud_storage_type"], "alist")
@@ -357,7 +380,10 @@ class TestPluginMetadata(unittest.TestCase):
         self.assertEqual(defaults["alist_target_path"], "/123云盘/影视/华语电影")
         self.assertIn("/media/movies", defaults["local_media_path"])
         self.assertIn("/media/tv", defaults["local_media_path"])
+        self.assertIn("/media/movies#/strm/test/华语电影", defaults["local_strm_paths"])
+        self.assertIn("/media/tv#/strm/test/电视剧", defaults["local_strm_paths"])
         self.assertEqual(defaults["strm_output_path"], "/strm/test/华语电影")
+        self.assertEqual(defaults["sync_mode"], "copy")
 
     def test_api_endpoints(self):
         from cloudstrmhelper import CloudStrmHelper
@@ -395,10 +421,12 @@ class TestPluginMetadata(unittest.TestCase):
         plugin._alist_url = "http://alist:5244/"
         plugin._alist_token = "secret-token-value"
         plugin._alist_target_path = "/cloud"
+        plugin._local_strm_paths = "/media/movies#/strm/movies\n/media/tv#/strm/tv"
+        plugin._local_strm_mappings = [("/media/movies", "/strm/movies"), ("/media/tv", "/strm/tv")]
         plugin._local_media_path = "/media/movies\n/media/tv"
         plugin._local_media_roots = ["/media/movies", "/media/tv"]
-        plugin._strm_output_path = "/strm"
-        plugin._sync_mode = "new"
+        plugin._strm_output_path = "/strm/movies\n/strm/tv"
+        plugin._sync_mode = "copy"
         plugin._overwrite_mode = "never"
         plugin._upload_concurrency = 3
         plugin._rmt_mediaext = ["mkv", "mp4"]
@@ -418,7 +446,7 @@ class TestPluginMetadata(unittest.TestCase):
         self.assertNotIn("secret-token-value", serialized)
         self.assertEqual(data["config"]["alist_token"], "secr...alue")
         self.assertEqual(data["mapping_sample"]["remote"], "/cloud/example.mkv")
-        self.assertEqual(data["mapping_sample"]["strm"], "/strm/example.strm")
+        self.assertEqual(data["mapping_sample"]["strm"], "/strm/movies/example.strm")
         self.assertEqual(data["phase_order"], ["listen", "sync", "strm", "refresh"])
 
 
@@ -430,8 +458,10 @@ class TestPathComputation(unittest.TestCase):
         plugin = CloudStrmHelper.__new__(CloudStrmHelper)
         plugin._local_media_path = "/media/movies\n/media/tv"
         plugin._local_media_roots = ["/media/movies", "/media/tv"]
+        plugin._local_strm_paths = "/media/movies#/strm/movies\n/media/tv#/strm/tv"
+        plugin._local_strm_mappings = [("/media/movies", "/strm/movies"), ("/media/tv", "/strm/tv")]
         plugin._alist_target_path = "/123云盘/影视/华语电影"
-        plugin._strm_output_path = "/strm/test/华语电影"
+        plugin._strm_output_path = "/strm/movies\n/strm/tv"
         plugin._rmt_mediaext = ["mp4", "mkv"]
         return plugin
 
@@ -450,11 +480,21 @@ class TestPathComputation(unittest.TestCase):
         plugin = self._make_plugin()
         self.assertEqual(
             plugin._strm_output_path_from_remote("/123云盘/影视/华语电影/movie.mp4"),
-            Path("/strm/test/华语电影/movie.strm"),
+            Path("/strm/movies/movie.strm"),
         )
         self.assertEqual(
             plugin._strm_output_path_from_remote("/123云盘/影视/华语电影/Show/S01E01.mkv"),
-            Path("/strm/test/华语电影/Show/S01E01.strm"),
+            Path("/strm/movies/Show/S01E01.strm"),
+        )
+
+    def test_strm_path_uses_matching_local_mapping(self):
+        plugin = self._make_plugin()
+        self.assertEqual(
+            plugin._strm_output_path_for(
+                "/media/tv/Show/Season 01/S01E01.mkv",
+                "/123云盘/影视/华语电影/Show/Season 01/S01E01.mkv",
+            ),
+            Path("/strm/tv/Show/Season 01/S01E01.strm"),
         )
 
     def test_expand_sse_directory_record_in_phase2(self):
@@ -472,6 +512,8 @@ class TestPathComputation(unittest.TestCase):
             (root / "sample" / "Sample.mkv").write_bytes(b"skip")
 
             plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+            plugin._local_strm_paths = f"{root}#/strm"
+            plugin._local_strm_mappings = [(str(root), "/strm")]
             plugin._local_media_path = str(root)
             plugin._local_media_roots = [str(root)]
             plugin._alist_target_path = "/cloud"
@@ -484,6 +526,26 @@ class TestPathComputation(unittest.TestCase):
 
         remote_paths = sorted(item[1] for item in files)
         self.assertEqual(remote_paths, ["/cloud/Bar.mp4", "/cloud/Foo.mkv"])
+
+    def test_move_mode_removes_local_file_after_success(self):
+        from cloudstrmhelper import CloudStrmHelper
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+            media_file = Path(tmp) / "Foo.mkv"
+            media_file.write_bytes(b"movie")
+            plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+            plugin._sync_mode = "move"
+            plugin._cleanup_local_after_move(str(media_file))
+            self.assertFalse(media_file.exists())
+
+    def test_copy_mode_keeps_local_file_after_success(self):
+        from cloudstrmhelper import CloudStrmHelper
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+            media_file = Path(tmp) / "Foo.mkv"
+            media_file.write_bytes(b"movie")
+            plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+            plugin._sync_mode = "copy"
+            plugin._cleanup_local_after_move(str(media_file))
+            self.assertTrue(media_file.exists())
 
 
 class TestCloudSyncPolicy(unittest.TestCase):

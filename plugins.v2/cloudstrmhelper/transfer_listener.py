@@ -133,7 +133,7 @@ class TransferListener:
         local_root = self.plugin._local_media_path
         cloud_root = self.plugin._alist_target_path
         if not local_root or not cloud_root:
-            logger.warning("【整理监听】未配置本地媒体路径或云端目标路径，跳过")
+            logger.warning("【整理监听】未配置本地路径映射或 AList 上传目标根目录，跳过")
             return None
 
         exclude_spec = self.plugin._exclude_spec

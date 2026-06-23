@@ -36,6 +36,7 @@ DEFAULT_ALIST_URL = "http://192.168.31.6:5244/"
 DEFAULT_ALIST_TARGET_PATH = "/123云盘/影视/华语电影"
 DEFAULT_LOCAL_MEDIA_PATH = "/media/movies\n/media/tv"
 DEFAULT_STRM_OUTPUT_PATH = "/strm/test/华语电影"
+DEFAULT_LOCAL_STRM_PATHS = "/media/movies#/strm/test/华语电影\n/media/tv#/strm/test/电视剧"
 DEFAULT_EXCLUDE_PATTERNS = "*.tmp\n**/.DS_Store\n/sample/**"
 DEFAULT_EVENT_FILTERS = "/media/movies\n/media/tv"
 DEFAULT_PATH_MAPPING = "/media#/data"
@@ -49,7 +50,7 @@ class CloudStrmHelper(_PluginBase):
     plugin_desc = "整理入库自动复制到AList并生成STRM，Emby 302直链播放"
     # 图标：引用仓库 icons 目录下的图标文件（URL 形式，与官方插件一致）
     plugin_icon = "https://raw.githubusercontent.com/101letters/MoviePilot-Plugins/main/icons/cloudstrmhelper.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "101letters"
     author_url = "https://github.com/101letters"
     plugin_config_prefix = "cloudstrmhelper_"
@@ -65,8 +66,10 @@ class CloudStrmHelper(_PluginBase):
     _alist_target_path = ""
     _local_media_path = ""
     _local_media_roots: List[str] = []
+    _local_strm_paths = ""
+    _local_strm_mappings: List[Tuple[str, str]] = []
     _strm_output_path = ""
-    _sync_mode = "new"
+    _sync_mode = "copy"
     _overwrite_mode = "never"
     _exclude_patterns = ""
     _exclude_spec: Optional[pathspec.PathSpec] = None
@@ -105,10 +108,9 @@ class CloudStrmHelper(_PluginBase):
             self._alist_url = (config.get("alist_url") or DEFAULT_ALIST_URL).strip()
             self._alist_token = (config.get("alist_token") or "").strip()
             self._alist_target_path = (config.get("alist_target_path") or DEFAULT_ALIST_TARGET_PATH).strip()
-            self._local_media_path = (config.get("local_media_path") or DEFAULT_LOCAL_MEDIA_PATH).strip()
-            self._strm_output_path = (config.get("strm_output_path") or DEFAULT_STRM_OUTPUT_PATH).strip()
-            self._sync_mode = "new"
-            self._overwrite_mode = "never"
+            self._local_strm_paths = self._normalize_local_strm_paths(config).strip()
+            self._sync_mode = self._normalize_sync_mode(config.get("sync_mode") or "copy")
+            self._overwrite_mode = self._normalize_overwrite_mode(config.get("overwrite_mode") or "never")
             self._exclude_patterns = (
                 config.get("exclude_patterns")
                 if config.get("exclude_patterns") is not None
@@ -135,7 +137,11 @@ class CloudStrmHelper(_PluginBase):
 
         # 派生：排除规则 PathSpec、事件前缀
         self._exclude_spec = self._build_exclude_spec(self._exclude_patterns)
-        self._local_media_roots = self._parse_path_lines(self._local_media_path)
+        self._local_strm_mappings = self._parse_local_strm_mappings(self._local_strm_paths)
+        self._local_media_roots = [local for local, _ in self._local_strm_mappings]
+        self._local_media_path = "\n".join(self._local_media_roots)
+        strm_roots = self._unique_paths([strm for _, strm in self._local_strm_mappings])
+        self._strm_output_path = "\n".join(strm_roots)
         self._event_filter_prefixes = [
             p.strip() for p in (self._event_filters or "").splitlines() if p.strip()
         ]
@@ -148,11 +154,11 @@ class CloudStrmHelper(_PluginBase):
             return
 
         # 校验必填
-        if not self._local_media_roots or not self._strm_output_path:
-            logger.warning("【云端STRM】未配置本地媒体路径或 STRM 输出路径，插件不启动")
+        if not self._local_strm_mappings:
+            logger.warning("【云端STRM】未配置本地路径和 STRM 输出路径映射，插件不启动")
             return
         if not self._alist_target_path:
-            logger.warning("【云端STRM】未配置云端目标路径，插件不启动")
+            logger.warning("【云端STRM】未配置 AList 上传目标根目录，插件不启动")
             return
 
         # 构建云端客户端
@@ -511,13 +517,26 @@ class CloudStrmHelper(_PluginBase):
     # Phase 3/4
     # ============================================================
     def _on_file_synced(self, local_path: str, remote_path: str,
-                        mediainfo: Any = None, meta: Any = None) -> None:
+                        mediainfo: Any = None, meta: Any = None) -> bool:
         """Phase 2 单文件完成后执行 Phase 3/4。"""
         if self._strm_gen is None:
-            return
+            return False
         ok, strm_path, created = self._strm_gen.generate(local_path, remote_path, mediainfo, meta)
         if ok:
             self._record_strm_stat(strm_path, created)
+            self._cleanup_local_after_move(local_path)
+        return ok
+
+    def _cleanup_local_after_move(self, local_path: str) -> None:
+        """移动模式：远端同步和 STRM 成功后删除本地源文件。"""
+        if self._sync_mode != "move":
+            return
+        try:
+            if os.path.isfile(local_path):
+                os.remove(local_path)
+                logger.info(f"【云端STRM】移动模式：已删除本地源文件 {local_path}")
+        except Exception as e:
+            logger.error(f"【云端STRM】移动模式删除本地源文件失败: {local_path}: {e}", exc_info=True)
 
     # ============================================================
     # 全量同步
@@ -590,19 +609,89 @@ class CloudStrmHelper(_PluginBase):
         """解析多行路径配置。"""
         return [line.strip().rstrip("/") for line in (raw or "").splitlines() if line.strip()]
 
+    @classmethod
+    def _normalize_local_strm_paths(cls, config: Dict[str, Any]) -> str:
+        """读取新映射配置；缺失时从旧 local_media_path/strm_output_path 迁移。"""
+        raw = config.get("local_strm_paths")
+        if raw:
+            return str(raw)
+        local_roots = cls._parse_path_lines(config.get("local_media_path") or DEFAULT_LOCAL_MEDIA_PATH)
+        strm_root = (config.get("strm_output_path") or DEFAULT_STRM_OUTPUT_PATH).strip().rstrip("/")
+        return "\n".join(f"{local}#{strm_root}" for local in local_roots if local)
+
+    @staticmethod
+    def _normalize_sync_mode(value: str) -> str:
+        """同步模式：copy=复制，move=移动；兼容旧 new。"""
+        normalized = (value or "copy").strip().lower()
+        if normalized in ("move", "移动"):
+            return "move"
+        return "copy"
+
+    @staticmethod
+    def _normalize_overwrite_mode(value: str) -> str:
+        """STRM 覆盖模式：never=从不，always=总是。"""
+        normalized = (value or "never").strip().lower()
+        if normalized in ("always", "总是"):
+            return "always"
+        return "never"
+
+    @classmethod
+    def _parse_local_strm_mappings(cls, raw: str) -> List[Tuple[str, str]]:
+        """解析路径映射：每行 `本地媒体库路径#STRM输出目录`。"""
+        mappings: List[Tuple[str, str]] = []
+        seen = set()
+        for line in (raw or "").splitlines():
+            line = line.strip()
+            if not line or "#" not in line:
+                continue
+            local, strm = line.split("#", 1)
+            local = local.strip().rstrip("/")
+            strm = strm.strip().rstrip("/")
+            if not local or not strm:
+                continue
+            key = (local, strm)
+            if key in seen:
+                continue
+            seen.add(key)
+            mappings.append(key)
+        return mappings
+
+    @staticmethod
+    def _unique_paths(paths: List[str]) -> List[str]:
+        result: List[str] = []
+        seen = set()
+        for path in paths:
+            if path and path not in seen:
+                seen.add(path)
+                result.append(path)
+        return result
+
     def _build_remote_path(self, local_path: str) -> Optional[str]:
         """本地媒体路径 → AList 云端路径。"""
-        rel = self._relative_to_local_roots(local_path)
-        if rel is None:
+        matched = self._match_local_strm_mapping(local_path)
+        if matched is None:
             return None
+        _, _, rel = matched
         rel_str = str(rel).replace("\\", "/").lstrip("/")
         return f"{self._alist_target_path.rstrip('/')}/{rel_str}".rstrip("/")
 
     def _relative_to_local_roots(self, local_path: str) -> Optional[Path]:
+        matched = self._match_local_strm_mapping(local_path)
+        return matched[2] if matched else None
+
+    def _match_local_strm_mapping(self, local_path: str) -> Optional[Tuple[str, str, Path]]:
+        """匹配本地路径所属映射，返回 (本地根, STRM 根, 相对路径)。"""
         local = Path(local_path)
-        for root in self._local_media_roots or self._parse_path_lines(self._local_media_path):
+        mappings = (
+            getattr(self, "_local_strm_mappings", None)
+            or self._parse_local_strm_mappings(getattr(self, "_local_strm_paths", ""))
+        )
+        if not mappings:
+            strm_root = getattr(self, "_strm_output_path", DEFAULT_STRM_OUTPUT_PATH)
+            mappings = [(root, strm_root) for root in getattr(self, "_local_media_roots", [])]
+        for root, strm_root in mappings:
             try:
-                return local.relative_to(root)
+                return root, strm_root, local.relative_to(root)
             except ValueError:
                 continue
         return None
@@ -624,12 +713,22 @@ class CloudStrmHelper(_PluginBase):
         full_parts, prefix_parts = full.parts, prefix.parts
         return len(prefix_parts) <= len(full_parts) and full_parts[:len(prefix_parts)] == prefix_parts
 
+    def _strm_output_path_for(self, local_path: str, remote_path: str) -> Optional[Path]:
+        """本地路径 + AList 云端路径 → 对应 STRM 输出路径。"""
+        matched = self._match_local_strm_mapping(local_path)
+        if matched:
+            _, strm_root, rel = matched
+            return Path(strm_root) / rel.parent / (rel.stem + ".strm")
+        return self._strm_output_path_from_remote(remote_path)
+
     def _strm_output_path_from_remote(self, remote_path: str) -> Optional[Path]:
-        """AList 云端路径 → STRM 输出路径。"""
+        """AList 云端路径 → STRM 输出路径；无法定位本地映射时使用第一条 STRM 根兜底。"""
         rel = self._remote_relative_path(remote_path)
         if rel is None:
             return None
-        return Path(self._strm_output_path) / rel.parent / (rel.stem + ".strm")
+        mappings = getattr(self, "_local_strm_mappings", None) or []
+        strm_root = mappings[0][1] if mappings else getattr(self, "_strm_output_path", DEFAULT_STRM_OUTPUT_PATH)
+        return Path(strm_root) / rel.parent / (rel.stem + ".strm")
 
     def _is_media_file(self, path: str) -> bool:
         ext = Path(path).suffix.lower().lstrip(".")
@@ -701,8 +800,12 @@ class CloudStrmHelper(_PluginBase):
                 "alist_token": self._mask_secret(self._alist_token),
                 "alist_token_configured": bool(self._alist_token),
                 "alist_target_path": self._alist_target_path,
+                "local_strm_paths": self._local_strm_paths,
+                "local_strm_mappings": [
+                    {"local": local, "strm": strm}
+                    for local, strm in self._local_strm_mappings
+                ],
                 "local_media_roots": local_roots,
-                "strm_output_path": self._strm_output_path,
                 "sync_mode": self._sync_mode,
                 "overwrite_mode": self._overwrite_mode,
                 "upload_concurrency": self._upload_concurrency,
@@ -824,6 +927,7 @@ class CloudStrmHelper(_PluginBase):
             "alist_url": self._alist_url,
             "alist_token": self._alist_token,
             "alist_target_path": self._alist_target_path,
+            "local_strm_paths": self._local_strm_paths,
             "local_media_path": self._local_media_path,
             "strm_output_path": self._strm_output_path,
             "sync_mode": self._sync_mode,
@@ -964,8 +1068,10 @@ class CloudStrmHelper(_PluginBase):
                                     {
                                         "component": "VCol", "props": {"cols": 12, "md": 4},
                                         "content": [{"component": "VTextField", "props": {
-                                            "model": "alist_target_path", "label": "云端目标路径",
+                                            "model": "alist_target_path", "label": "AList 上传目标根目录",
                                             "placeholder": DEFAULT_ALIST_TARGET_PATH,
+                                            "hint": "本地媒体会上传到这个 AList 目录下，并保留相对目录结构",
+                                            "persistent-hint": True,
                                         }}],
                                     },
                                 ],
@@ -974,7 +1080,7 @@ class CloudStrmHelper(_PluginBase):
                     },
                 ],
             },
-            # 本地与 STRM 路径卡片
+            # 本地与 STRM 路径映射卡片
             {
                 "component": "VCard",
                 "props": {"variant": "outlined", "class": "mb-3"},
@@ -983,7 +1089,7 @@ class CloudStrmHelper(_PluginBase):
                         "component": "VCardTitle",
                         "content": [
                             {"component": "VIcon", "props": {"icon": "mdi-folder-sync", "color": "primary", "class": "mr-2"}},
-                            {"component": "span", "text": "本地与 STRM 路径"},
+                            {"component": "span", "text": "本地与 STRM 路径映射"},
                         ],
                     },
                     {"component": "VDivider"},
@@ -994,17 +1100,14 @@ class CloudStrmHelper(_PluginBase):
                                 "component": "VRow",
                                 "content": [
                                     {
-                                        "component": "VCol", "props": {"cols": 12, "md": 6},
+                                        "component": "VCol", "props": {"cols": 12},
                                         "content": [{"component": "VTextarea", "props": {
-                                            "model": "local_media_path", "label": "本地媒体库路径",
-                                            "rows": 2, "placeholder": DEFAULT_LOCAL_MEDIA_PATH,
-                                        }}],
-                                    },
-                                    {
-                                        "component": "VCol", "props": {"cols": 12, "md": 6},
-                                        "content": [{"component": "VTextField", "props": {
-                                            "model": "strm_output_path", "label": "STRM 输出目录",
-                                            "placeholder": DEFAULT_STRM_OUTPUT_PATH,
+                                            "model": "local_strm_paths",
+                                            "label": "路径映射（本地媒体库路径#STRM输出目录，一行一条）",
+                                            "rows": 3,
+                                            "placeholder": DEFAULT_LOCAL_STRM_PATHS,
+                                            "hint": "每条本地路径会上传到 AList 目标根目录，并在对应 STRM 输出目录生成同相对路径的 .strm",
+                                            "persistent-hint": True,
                                         }}],
                                     },
                                 ],
@@ -1037,9 +1140,9 @@ class CloudStrmHelper(_PluginBase):
                                         "content": [{"component": "VSelect", "props": {
                                             "model": "sync_mode", "label": "同步模式",
                                             "items": [
-                                                {"title": "仅新增（不删远端）", "value": "new"},
+                                                {"title": "复制", "value": "copy"},
+                                                {"title": "移动", "value": "move"},
                                             ],
-                                            "disabled": True,
                                         }}],
                                     },
                                     {
@@ -1048,8 +1151,8 @@ class CloudStrmHelper(_PluginBase):
                                             "model": "overwrite_mode", "label": "STRM 覆盖模式",
                                             "items": [
                                                 {"title": "从不（跳过已存在）", "value": "never"},
+                                                {"title": "总是（覆盖已有 STRM）", "value": "always"},
                                             ],
-                                            "disabled": True,
                                         }}],
                                     },
                                     {
@@ -1163,9 +1266,10 @@ class CloudStrmHelper(_PluginBase):
             "alist_url": DEFAULT_ALIST_URL,
             "alist_token": "",
             "alist_target_path": DEFAULT_ALIST_TARGET_PATH,
+            "local_strm_paths": DEFAULT_LOCAL_STRM_PATHS,
             "local_media_path": DEFAULT_LOCAL_MEDIA_PATH,
             "strm_output_path": DEFAULT_STRM_OUTPUT_PATH,
-            "sync_mode": "new",
+            "sync_mode": "copy",
             "overwrite_mode": "never",
             "exclude_patterns": DEFAULT_EXCLUDE_PATTERNS,
             "event_filters": DEFAULT_EVENT_FILTERS,
