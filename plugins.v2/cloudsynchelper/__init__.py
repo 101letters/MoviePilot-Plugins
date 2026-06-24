@@ -900,7 +900,7 @@ class CloudSyncHelper(_PluginBase):
                             incremental: bool, label: str) -> None:
         if not self._cloud_sync:
             logger.warning(f"【云盘上传】{label} 取消：云同步未初始化")
-            return []
+            return
 
         queued = 0
         skipped = 0
@@ -917,17 +917,27 @@ class CloudSyncHelper(_PluginBase):
             )
         self._cloud_sync.prepare_batch(label=label)
 
-        remote_cache = {}
-        if media_items:
+        # 小批量（事件触发）不做全量预加载，单文件按需查询远端目录
+        # 大批量（全量同步）预加载所有远端目录，避免逐文件 list_dir 网络开销
+        is_small_batch = len(media_items) <= 20
+        if is_small_batch:
+            logger.info(f"【云盘上传】小批量模式（{len(media_items)} 个），跳过云端目录预加载，按文件单查远端")
+            remote_cache = {}
+        elif media_items:
             remote_roots = [cloud for _, cloud in self._upload_mappings if cloud]
             logger.info(f"【云盘上传】预加载云端目录列表: {remote_roots}")
             remote_cache = self._cloud_sync.preload_remote_dirs(remote_roots)
             logger.info(f"【云盘上传】预加载完成：缓存 {len(remote_cache)} 个远端目录")
+        else:
+            remote_cache = {}
 
         for local_path, remote_path, mediainfo, meta in media_items:
             checked += 1
             try:
-                if not self._cloud_sync.need_upload_cached(remote_path, remote_cache):
+                need = (self._cloud_sync.need_upload(remote_path)
+                        if is_small_batch
+                        else self._cloud_sync.need_upload_cached(remote_path, remote_cache))
+                if not need:
                     message = f"【云盘上传】Phase 2 跳过：云端已存在同名文件 {remote_path}"
                     if detail_logging:
                         logger.info(message)
