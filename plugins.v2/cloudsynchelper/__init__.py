@@ -934,7 +934,7 @@ class CloudSyncHelper(_PluginBase):
         for local_path, remote_path, mediainfo, meta in media_items:
             checked += 1
             try:
-                need = (self._cloud_sync.need_upload(remote_path)
+                need = (self._cloud_sync.need_upload(local_path, remote_path)
                         if is_small_batch
                         else self._cloud_sync.need_upload_cached(remote_path, remote_cache))
                 if not need:
