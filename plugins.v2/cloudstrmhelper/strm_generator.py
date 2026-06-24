@@ -214,7 +214,8 @@ class StrmGenerator:
 
     # ---- 生成 ----
     def generate(self, local_path: str, remote_path: str,
-                 mediainfo: Any = None, meta: Any = None) -> Tuple[bool, Optional[Path], bool]:
+                 mediainfo: Any = None, meta: Any = None,
+                 refresh: bool = True) -> Tuple[bool, Optional[Path], bool]:
         """生成单个 STRM 文件。返回 (是否成功, strm 路径, 是否新建)。
 
         local_path  : 本地媒体文件绝对路径（用于推导 STRM 输出位置）
@@ -244,7 +245,7 @@ class StrmGenerator:
             logger.info(f"【STRM生成】生成成功: {strm_path} -> {remote_path}")
 
             # Emby/Jellyfin 刷新
-            if self.plugin._refresh_enabled:
+            if refresh and self.plugin._refresh_enabled:
                 try:
                     self.refresh_emby(strm_path, mediainfo)
                 except Exception as e:
@@ -262,27 +263,31 @@ class StrmGenerator:
         路径映射：transfer_mp_mediaserver_paths "媒体服务器路径#MP路径" 一行一条，
         将 MP 看到的 STRM 路径替换为媒体服务器看到的路径后再刷新。
         """
-        target_path_str = str(strm_path)
-        # 路径映射替换
-        mapping = self._parse_path_mapping(self.plugin._transfer_mp_mediaserver_paths)
-        for mp_path, ms_path in mapping:
-            if target_path_str.startswith(mp_path):
-                target_path_str = target_path_str.replace(mp_path, ms_path, 1)
-                logger.debug(f"【STRM生成】媒体服务器路径替换: {mp_path} -> {ms_path}")
-                break
+        self.refresh_emby_batch([(strm_path, mediainfo)])
 
-        # 构建 RefreshMediaItem
-        title = getattr(mediainfo, "title", None) or "未知"
-        year = getattr(mediainfo, "year", None)
-        mtype = getattr(mediainfo, "type", None)
-        category = getattr(mediainfo, "category", None)
-        items = [RefreshMediaItem(
-            title=title,
-            year=year,
-            type=mtype,
-            category=category,
-            target_path=Path(target_path_str),
-        )]
+    def refresh_emby_batch(self, refresh_targets: List[Tuple[Path, Any]]) -> None:
+        """批量通知媒体服务器刷新，避免批量生成 STRM 时逐文件刷新媒体库。"""
+        items: List[RefreshMediaItem] = []
+        target_paths: List[str] = []
+        for strm_path, mediainfo in refresh_targets or []:
+            target_path_str = str(strm_path)
+            target_path_str = self._map_media_server_path(target_path_str)
+            target_paths.append(target_path_str)
+
+            title = getattr(mediainfo, "title", None) or "未知"
+            year = getattr(mediainfo, "year", None)
+            mtype = getattr(mediainfo, "type", None)
+            category = getattr(mediainfo, "category", None)
+            items.append(RefreshMediaItem(
+                title=title,
+                year=year,
+                type=mtype,
+                category=category,
+                target_path=Path(target_path_str),
+            ))
+
+        if not items:
+            return
 
         # 选择媒体服务器并刷新
         helper = MediaServerHelper()
@@ -302,7 +307,10 @@ class StrmGenerator:
                 continue
             if hasattr(instance, "refresh_library_by_items"):
                 instance.refresh_library_by_items(items)
-                logger.info(f"【STRM生成】已通知 {name} 刷新: {target_path_str}")
+                if len(items) == 1:
+                    logger.info(f"【STRM生成】已通知 {name} 刷新: {target_paths[0]}")
+                else:
+                    logger.info(f"【STRM生成】已通知 {name} 批量刷新: {len(items)} 个 STRM")
                 refreshed = True
             elif hasattr(instance, "refresh_root_library"):
                 instance.refresh_root_library()
@@ -313,6 +321,17 @@ class StrmGenerator:
 
         if not refreshed:
             logger.warning("【STRM生成】没有可用的媒体服务器刷新方法")
+
+    def _map_media_server_path(self, target_path_str: str) -> str:
+        """按配置把 MoviePilot 可见路径转换为媒体服务器可见路径。"""
+        # 路径映射替换
+        mapping = self._parse_path_mapping(self.plugin._transfer_mp_mediaserver_paths)
+        for mp_path, ms_path in mapping:
+            if target_path_str.startswith(mp_path):
+                target_path_str = target_path_str.replace(mp_path, ms_path, 1)
+                logger.debug(f"【STRM生成】媒体服务器路径替换: {mp_path} -> {ms_path}")
+                break
+        return target_path_str
 
     @staticmethod
     def _parse_path_mapping(raw: str) -> List[Tuple[str, str]]:

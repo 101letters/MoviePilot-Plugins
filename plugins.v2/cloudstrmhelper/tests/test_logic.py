@@ -308,6 +308,52 @@ class TestStrmPathResolution(unittest.TestCase):
             self.assertFalse(created)
             self.assertNotEqual(strm_file.read_text(encoding="utf-8"), "old")
 
+    def test_generate_can_defer_refresh(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+            local_root = Path(tmp) / "media"
+            strm_root = Path(tmp) / "strm"
+            local_root.mkdir()
+            strm_root.mkdir()
+            media_file = local_root / "Foo.mkv"
+            media_file.write_bytes(b"movie")
+
+            gen, plugin = self._make_plugin(str(local_root), str(strm_root))
+            plugin._refresh_enabled = True
+            with patch.object(gen, "refresh_emby") as refresh:
+                ok, path, created = gen.generate(str(media_file), "/cloud/Foo.mkv", refresh=False)
+
+            self.assertTrue(ok)
+            self.assertTrue(created)
+            self.assertIsNotNone(path)
+            refresh.assert_not_called()
+
+    def test_refresh_emby_batch_calls_server_once_with_all_items(self):
+        gen, plugin = self._make_plugin("/media/movies", "/strm/movies")
+        plugin._refresh_enabled = True
+        plugin._mediaservers = []
+        plugin._transfer_mp_mediaserver_paths = "/server/strm#/strm/movies"
+
+        class _Instance:
+            def __init__(self):
+                self.calls = []
+
+            def refresh_library_by_items(self, items):
+                self.calls.append(items)
+
+        instance = _Instance()
+        service = types.SimpleNamespace(instance=instance)
+        with patch("cloudstrmhelper.strm_generator.MediaServerHelper") as helper_cls:
+            helper_cls.return_value.get_services.return_value = {"Emby": service}
+            gen.refresh_emby_batch([
+                (Path("/strm/movies/A.strm"), None),
+                (Path("/strm/movies/B.strm"), None),
+            ])
+
+        self.assertEqual(len(instance.calls), 1)
+        self.assertEqual(len(instance.calls[0]), 2)
+        self.assertEqual(instance.calls[0][0].target_path, Path("/server/strm/A.strm"))
+        self.assertEqual(instance.calls[0][1].target_path, Path("/server/strm/B.strm"))
+
 
 class TestExcludeSpec(unittest.TestCase):
     def test_pathspec_gitignore(self):
@@ -1217,6 +1263,88 @@ class TestCloudSyncPolicy(unittest.TestCase):
         self.assertEqual(item.status, TASK_SKIPPED)
         alist.upload_task_delete.assert_called_once_with("task-1")
 
+    def test_upload_task_errored_is_terminal_failure(self):
+        from unittest.mock import patch
+        from cloudstrmhelper.cloud_sync import CloudSync, TASK_ERRORED, _SyncItem
+        alist = MagicMock()
+        alist.upload_task_info.return_value = {
+            "state": TASK_ERRORED,
+            "progress": None,
+            "error": "upload failed",
+        }
+        sync = CloudSync(plugin=None, alist_client=alist)
+        item = _SyncItem("/media/movies/Foo.mkv", "/cloud/Foo.mkv", 1)
+        item.alist_task_id = "task-1"
+        with patch("cloudstrmhelper.cloud_sync.time.sleep", return_value=None):
+            sync._poll_task(item)
+        self.assertEqual(item.status, TASK_ERRORED)
+        self.assertEqual(item.err_msg, "upload failed")
+        alist.upload_task_delete.assert_called_once_with("task-1")
+
+    def test_status_exposes_batch_and_failed_samples(self):
+        from cloudstrmhelper.cloud_sync import CloudSync, TASK_FAILED, _SyncItem
+        sync = CloudSync(plugin=None, alist_client=None)
+        sync.prepare_batch(label="批量上传云端")
+        try:
+            item = _SyncItem("/media/movies/Foo.mkv", "/cloud/Foo.mkv", 1)
+            item.status = TASK_FAILED
+            item.err_msg = "boom"
+            sync._finish_item(item)
+
+            status = sync.get_status()
+
+            self.assertEqual(status["batch"]["label"], "批量上传云端")
+            self.assertTrue(status["batch"]["id"])
+            self.assertEqual(status["failedSamples"][0]["remote"], "/cloud/Foo.mkv")
+            self.assertEqual(status["failedSamples"][0]["error"], "boom")
+        finally:
+            sync.mark_scan_finish()
+            sync.stop()
+
+    def test_bulk_upload_uses_aggregate_logging_mode(self):
+        from cloudstrmhelper import CloudStrmHelper
+
+        class _FakeCloudSync:
+            def __init__(self):
+                self.batch_label = ""
+                self.log_details = []
+                self.wait_kwargs = {}
+
+            def prepare_batch(self, label=""):
+                self.batch_label = label
+
+            def enqueue_file(self, local_path, remote_path, mediainfo=None, meta=None, log_detail=True):
+                self.log_details.append(log_detail)
+
+            def mark_scan_finish(self):
+                pass
+
+            def wait_for_batch(self, **kwargs):
+                self.wait_kwargs = kwargs
+                return []
+
+        plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+        plugin._cloud_sync = _FakeCloudSync()
+        plugin._upload_mappings = [("/media/movies", "/cloud")]
+        plugin._last_upload_batch = {}
+
+        media_items = [
+            (f"/media/movies/{idx}.mkv", f"/cloud/{idx}.mkv", None, None)
+            for idx in range(101)
+        ]
+
+        result = plugin._upload_media_items(
+            media_items,
+            incremental=False,
+            label="全量上传云端",
+        )
+
+        self.assertEqual(result, [])
+        self.assertEqual(plugin._cloud_sync.batch_label, "全量上传云端")
+        self.assertTrue(plugin._cloud_sync.log_details)
+        self.assertTrue(all(value is False for value in plugin._cloud_sync.log_details))
+        self.assertEqual(plugin._cloud_sync.wait_kwargs["progress_label"], "全量上传云端")
+
 
 class TestStrmUrlMode(unittest.TestCase):
     """v1.3.0: STRM URL 双模式。"""
@@ -1543,6 +1671,10 @@ class TestStatsMigration(unittest.TestCase):
         self.assertEqual(stats["last_strm_time"], "2026-01-01 00:00:00")
         # recent_files 迁移到 recent_strms
         self.assertEqual(stats["recent_strms"][0]["name"], "a.strm")
+        self.assertEqual(stats["last_full_upload_scan_epoch"], 0)
+        self.assertEqual(stats["last_full_upload_scan_time"], "")
+        self.assertEqual(stats["last_full_strm_scan_epoch"], 0)
+        self.assertEqual(stats["last_full_strm_scan_time"], "")
 
     def test_new_stats_kept(self):
         from cloudstrmhelper import CloudStrmHelper
@@ -1555,6 +1687,56 @@ class TestStatsMigration(unittest.TestCase):
         self.assertEqual(stats["upload_count"], 5)
         self.assertEqual(stats["strm_count"], 9)
         self.assertEqual(stats["recent_strms"][0]["name"], "b.strm")
+        self.assertIn("last_full_upload_scan_epoch", stats)
+        self.assertIn("last_full_strm_scan_epoch", stats)
+
+
+class TestIncrementalScanBaseline(unittest.TestCase):
+    """增量扫描基准：全量后只处理新增/修改文件。"""
+
+    def _make_plugin(self, media_root: str):
+        from cloudstrmhelper import CloudStrmHelper
+        plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+        plugin._local_media_roots = [media_root]
+        plugin._local_media_path = media_root
+        plugin._upload_mappings = [(media_root, "/cloud")]
+        plugin._upload_path_mappings = f"{media_root}#/cloud"
+        plugin._rmt_mediaext = ["mkv"]
+        plugin._exclude_spec = None
+        return plugin
+
+    def test_scan_modified_after_filters_old_media_files(self):
+        from cloudstrmhelper import CloudStrmHelper
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_file = Path(tmpdir) / "Old.mkv"
+            new_file = Path(tmpdir) / "New.mkv"
+            old_file.write_text("old", encoding="utf-8")
+            new_file.write_text("new", encoding="utf-8")
+            baseline = 1_800_000_000.0
+            os.utime(old_file, (baseline - 100, baseline - 100))
+            os.utime(new_file, (baseline + 10, baseline + 10))
+
+            plugin = self._make_plugin(tmpdir)
+            items, _ = plugin._scan_full_media_files(modified_after=baseline)
+
+        self.assertEqual([item[0] for item in items], [str(new_file)])
+        self.assertEqual(CloudStrmHelper._scan_mtime_threshold(0), None)
+
+    def test_mark_full_scan_baseline_persists_epoch_and_time(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin = self._make_plugin(tmpdir)
+            plugin._stats = {
+                "upload_count": 0, "last_upload_time": "", "recent_uploads": [],
+                "strm_count": 0, "last_strm_time": "", "recent_strms": [],
+            }
+            saved = {}
+            plugin._save_stats = lambda: saved.update(plugin._stats)
+
+            plugin._mark_full_scan_baseline("upload", 1_800_000_000.0)
+
+        self.assertEqual(saved["last_full_upload_scan_epoch"], 1_800_000_000.0)
+        self.assertTrue(saved["last_full_upload_scan_time"])
 
 
 class TestUploadStrmStats(unittest.TestCase):
@@ -1637,6 +1819,44 @@ class TestUploadStrmStats(unittest.TestCase):
         for i in range(25):
             plugin._record_strm_stat(Path(f"/strm/{i}.strm"), created=True, remote_path=f"/c/{i}.mkv")
         self.assertLessEqual(len(plugin._stats["recent_strms"]), 20)
+
+
+class TestBatchStrmRefresh(unittest.TestCase):
+    """批量 STRM 生成应先写完所有文件，再统一刷新媒体服务器。"""
+
+    def test_batch_refresh_runs_after_all_generate_calls(self):
+        from cloudstrmhelper import CloudStrmHelper
+        plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+        events = []
+
+        class _FakeStrmGen:
+            def generate(self, local_path, remote_path, mediainfo=None, meta=None, refresh=True):
+                self.assertFalse(refresh)
+                events.append(f"generate:{remote_path}")
+                return True, Path(f"/strm/{Path(remote_path).stem}.strm"), True
+
+            def refresh_emby_batch(self, targets):
+                events.append(f"refresh:{len(targets)}")
+
+        fake = _FakeStrmGen()
+        fake.assertFalse = self.assertFalse
+        plugin._strm_gen = fake
+        plugin._refresh_enabled = True
+        plugin._record_strm_stat = lambda *args, **kwargs: None
+        plugin._cleanup_local_after_move = lambda *args, **kwargs: None
+
+        result = plugin._generate_strm_for_media_items(
+            [
+                ("/media/A.mkv", "/cloud/A.mkv", None, None),
+                ("/media/B.mkv", "/cloud/B.mkv", None, None),
+            ],
+            incremental=False,
+            cleanup_after_move=False,
+            label="测试批量 STRM",
+        )
+
+        self.assertEqual(result, (2, 0, 0))
+        self.assertEqual(events, ["generate:/cloud/A.mkv", "generate:/cloud/B.mkv", "refresh:2"])
 
 
 class TestNewConfigPersistence(unittest.TestCase):

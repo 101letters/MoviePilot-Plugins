@@ -26,7 +26,9 @@ TASK_ERRORED = 5
 TASK_FAILING = 6
 TASK_FAILED = 7
 TASK_SKIPPED = 8
-TASK_TERMINAL = (TASK_SUCCEEDED, TASK_CANCELED, TASK_FAILED)
+TASK_SUCCESS_STATES = (TASK_SUCCEEDED, TASK_SKIPPED)
+TASK_FAILED_STATES = (TASK_CANCELED, TASK_ERRORED, TASK_FAILING, TASK_FAILED)
+TASK_TERMINAL = (TASK_SUCCEEDED, TASK_CANCELED, TASK_ERRORED, TASK_FAILING, TASK_FAILED)
 
 
 def _convert_bytes(val: float) -> str:
@@ -261,12 +263,14 @@ class _SyncItem:
     """单个待同步文件（照 taosync CopyItem 简化）。"""
 
     def __init__(self, local_path: str, remote_path: str, file_size: int,
-                 mediainfo: Any = None, meta: Any = None):
+                 mediainfo: Any = None, meta: Any = None,
+                 log_detail: bool = True):
         self.local_path = local_path
         self.remote_path = remote_path
         self.file_size = file_size
         self.mediainfo = mediainfo
         self.meta = meta
+        self.log_detail = log_detail
         # 运行态
         self.alist_task_id: Optional[str] = None
         self.status: int = 0  # 0-等待 1-进行中 2-成功 7-失败
@@ -306,6 +310,9 @@ class CloudSync:
         self.scan_finish = False
         self.first_sync: Optional[float] = None
         self.create_time = time.time()
+        self.batch_id = ""
+        self.batch_label = ""
+        self._failed_samples: List[Dict[str, Any]] = []
         self._last_watching = 0.0
         self._worker_thread: Optional[threading.Thread] = None
         self._started = False
@@ -324,14 +331,23 @@ class CloudSync:
         self._worker_thread = threading.Thread(target=self._dispatch, daemon=True, name="CloudSyncDispatch")
         self._worker_thread.start()
 
-    def prepare_batch(self) -> None:
+    def prepare_batch(self, label: str = "") -> None:
         """开始新批次前重置批次状态并确保分发线程运行。"""
         with self._cond:
             self.create_time = time.time()
+            self.batch_id = time.strftime("%Y%m%d-%H%M%S", time.localtime(self.create_time))
+            self.batch_label = label or "云同步"
             self.scan_finish = False
             self.finish = []
+            self._failed_samples = []
             self.break_flag = False
             self._cond.notify_all()
+        logger.info(
+            "【云同步】批次开始：id=%s，任务=%s，并发=%d",
+            self.batch_id,
+            self.batch_label,
+            self.concurrency,
+        )
         self.start()
 
     def stop(self) -> None:
@@ -352,17 +368,22 @@ class CloudSync:
 
     # ---- 入队 ----
     def enqueue_file(self, local_path: str, remote_path: str,
-                     mediainfo: Any = None, meta: Any = None) -> None:
+                     mediainfo: Any = None, meta: Any = None,
+                     log_detail: bool = True) -> None:
         """入队单个文件（增量判定在外层完成；这里只排队）。"""
         if not os.path.exists(local_path):
             logger.warning(f"【云同步】本地文件不存在，跳过: {local_path}")
             return
         size = os.path.getsize(local_path)
-        item = _SyncItem(local_path, remote_path, size, mediainfo, meta)
+        item = _SyncItem(local_path, remote_path, size, mediainfo, meta, log_detail=log_detail)
         with self._cond:
             self.waiting.append(item)
             self._cond.notify()
-        logger.info(f"【云同步】入队: {local_path} -> {remote_path} ({_convert_bytes(size)})")
+        message = f"【云同步】入队: {local_path} -> {remote_path} ({_convert_bytes(size)})"
+        if log_detail:
+            logger.info(message)
+        else:
+            logger.debug(message)
 
     def mark_scan_finish(self) -> None:
         with self._cond:
@@ -418,7 +439,10 @@ class CloudSync:
                 item.status = 4
             else:
                 size_mb = (item.file_size or 0) / 1024 / 1024
-                logger.info(f"【云同步】开始上传: {Path(item.local_path).name} ({size_mb:.1f} MB) -> {item.remote_path}")
+                self._log_item_info(
+                    item,
+                    f"【云同步】开始上传: {Path(item.local_path).name} ({size_mb:.1f} MB) -> {item.remote_path}",
+                )
                 self._do_upload(item)
         except Exception as e:
             item.status = 7
@@ -442,7 +466,7 @@ class CloudSync:
                 tid = self.alist.put_stream(item.local_path, item.remote_path, as_task=True)
                 break
             except AlistAlreadyExists:
-                logger.info(f"【云同步】远端已存在，跳过上传: {item.remote_path}")
+                self._log_item_info(item, f"【云同步】远端已存在，跳过上传: {item.remote_path}")
                 item.status = TASK_SKIPPED
                 return
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, AlistError) as e:
@@ -457,12 +481,20 @@ class CloudSync:
         # 3. 直接上传（无任务 id）即视为成功
         if tid is None:
             item.status = TASK_SUCCEEDED
-            logger.info(f"【云同步】上传完成: {Path(item.local_path).name} -> {item.remote_path}")
+            self._log_item_info(item, f"【云同步】上传完成: {Path(item.local_path).name} -> {item.remote_path}")
             return
         # 4. 轮询任务直到终态
         self._poll_task(item)
         if item.status == TASK_SUCCEEDED:
-            logger.info(f"【云同步】上传完成: {Path(item.local_path).name} -> {item.remote_path}")
+            self._log_item_info(item, f"【云同步】上传完成: {Path(item.local_path).name} -> {item.remote_path}")
+
+    @staticmethod
+    def _log_item_info(item: _SyncItem, message: str) -> None:
+        """批量模式下单文件明细降级为 debug，避免日志面板被刷屏。"""
+        if getattr(item, "log_detail", True):
+            logger.info(message)
+        else:
+            logger.debug(message)
 
     def _poll_task(self, item: _SyncItem) -> None:
         while not self.break_flag:
@@ -508,13 +540,20 @@ class CloudSync:
         with self._lock:
             self.doing.pop(getattr(item, "doing_key", -1), None)
             self.finish.append(item)
+            if item.status not in TASK_SUCCESS_STATES and len(self._failed_samples) < 10:
+                self._failed_samples.append({
+                    "local": item.local_path,
+                    "remote": item.remote_path,
+                    "status": item.status,
+                    "error": item.err_msg,
+                })
     # ---- 批次结束 ----
     def _on_batch_finish(self) -> None:
         if not self.plugin or not getattr(self.plugin, "_notify_enabled", False):
             return
         try:
-            success = [it for it in self.finish if it.status in (TASK_SUCCEEDED, TASK_SKIPPED)]
-            failed = [it for it in self.finish if it.status in (TASK_FAILED, TASK_CANCELED)]
+            success = [it for it in self.finish if it.status in TASK_SUCCESS_STATES]
+            failed = [it for it in self.finish if it.status in TASK_FAILED_STATES]
             total_size = sum(it.file_size for it in success if it.file_size)
             duration = time.time() - self.create_time
             hours, minutes, seconds = _convert_seconds(duration)
@@ -535,18 +574,60 @@ class CloudSync:
         except Exception as e:
             logger.debug(f"【云同步】批次结束通知异常: {e}")
 
-    def wait_for_batch(self, timeout: Optional[float] = None) -> List[_SyncItem]:
+    def wait_for_batch(self, timeout: Optional[float] = None,
+                       progress_label: str = "",
+                       progress_interval: float = 30.0) -> List[_SyncItem]:
         """等待当前批次完成并返回完成列表快照。"""
         start = time.time()
+        last_progress_log = 0.0
         while True:
             with self._lock:
                 done = self.scan_finish and not self.waiting and not self.doing
                 finish = list(self.finish)
+            now = time.time()
+            if progress_interval and (now - last_progress_log >= progress_interval or done):
+                self._log_batch_progress(progress_label=progress_label, finished=finish, done=done)
+                last_progress_log = now
             if done:
                 return finish
             if timeout is not None and time.time() - start >= timeout:
+                self._log_batch_progress(progress_label=progress_label, finished=finish, done=False)
                 return finish
             time.sleep(0.5)
+
+    def _log_batch_progress(self, progress_label: str = "",
+                            finished: Optional[List[_SyncItem]] = None,
+                            done: bool = False) -> None:
+        """输出批次级心跳，供手动大批量任务排查卡点。"""
+        with self._lock:
+            waiting = list(self.waiting)
+            doing = list(self.doing.values())
+            finish = list(finished if finished is not None else self.finish)
+        success = [it for it in finish if it.status in TASK_SUCCESS_STATES]
+        failed = [
+            it for it in finish
+            if it.status not in TASK_SUCCESS_STATES
+        ]
+        running_names = ", ".join(Path(it.local_path).name for it in doing[:3])
+        if len(doing) > 3:
+            running_names += f" 等 {len(doing)} 个"
+        label = progress_label or self.batch_label or "云同步"
+        stage = "完成" if done else "进度"
+        logger.info(
+            "【云同步】批次%s：id=%s，任务=%s，等待 %d，上传中 %d，成功/跳过 %d，失败 %d，"
+            "待传 %s，上传中 %s，已用 %ds%s",
+            stage,
+            self.batch_id or "-",
+            label,
+            len(waiting),
+            len(doing),
+            len(success),
+            len(failed),
+            _convert_bytes(sum(it.file_size for it in waiting if it.file_size)),
+            _convert_bytes(sum(it.file_size for it in doing if it.file_size)),
+            int(time.time() - self.create_time),
+            f"，当前: {running_names}" if running_names else "",
+        )
 
     # ---- 状态快照 ----
     def get_status(self) -> Dict[str, Any]:
@@ -563,6 +644,10 @@ class CloudSync:
             return [it for it in items if it.status == state]
 
         result = {
+            "batch": {
+                "id": self.batch_id,
+                "label": self.batch_label,
+            },
             "scanFinish": self.scan_finish,
             "createTime": int(self.create_time),
             "duration": int(time.time() - self.create_time),
@@ -571,17 +656,16 @@ class CloudSync:
                 "waiting": len(current["waiting"]),
                 "running": len(current["doing"]),
                 "success": len(_bucket(current["finish"], TASK_SUCCEEDED)) + len(_bucket(current["finish"], TASK_SKIPPED)),
-                "fail": len(_bucket(current["finish"], TASK_FAILED))
-                       + len(_bucket(current["finish"], TASK_CANCELED)),
+                "fail": sum(len(_bucket(current["finish"], state)) for state in TASK_FAILED_STATES),
             },
             "size": {
                 "waiting": sum(it.file_size for it in current["waiting"] if it.file_size),
                 "running": sum(it.file_size for it in current["doing"] if it.file_size),
                 "success": sum(
                     it.file_size for it in current["finish"]
-                    if it.status in (TASK_SUCCEEDED, TASK_SKIPPED) and it.file_size
+                    if it.status in TASK_SUCCESS_STATES and it.file_size
                 ),
-                "fail": sum(it.file_size for it in current["finish"] if it.status in (TASK_FAILED, TASK_CANCELED) and it.file_size),
+                "fail": sum(it.file_size for it in current["finish"] if it.status in TASK_FAILED_STATES and it.file_size),
             },
             "items": [
                 {
@@ -594,6 +678,7 @@ class CloudSync:
                 }
                 for it in (current["doing"] + current["waiting"])[-20:]
             ],
+            "failedSamples": list(self._failed_samples),
         }
         return result
 
@@ -631,29 +716,49 @@ class CloudSync:
         cache: Dict[str, Dict[str, Any]] = {}
         if not self.alist:
             return cache
+        stats = {"dirs": 0, "failed": 0, "last_log": time.time(), "start": time.time()}
         for root in remote_roots:
             root = (root or "").strip().rstrip("/")
             if not root:
                 continue
             # 递归预加载：root 及其一层子目录（媒体文件通常在 Season/剧集 子目录）
-            self._preload_one(cache, root)
+            self._preload_one(cache, root, stats)
+        logger.info(
+            "【云同步】远端目录预加载完成：目录 %d，失败 %d，用时 %ds",
+            stats["dirs"],
+            stats["failed"],
+            int(time.time() - stats["start"]),
+        )
         return cache
 
-    def _preload_one(self, cache: Dict[str, Dict[str, Any]], path: str) -> None:
+    def _preload_one(self, cache: Dict[str, Dict[str, Any]], path: str,
+                     stats: Optional[Dict[str, Any]] = None) -> None:
         if path in cache:
             return
         try:
             listing = self.alist.list_dir(path, refresh=False)
             cache[path] = listing
+            if stats is not None:
+                stats["dirs"] = int(stats.get("dirs") or 0) + 1
+                now = time.time()
+                if now - float(stats.get("last_log") or 0) >= 15:
+                    logger.info(
+                        "【云同步】远端目录预加载中：已缓存 %d 个目录，当前 %s",
+                        stats["dirs"],
+                        path,
+                    )
+                    stats["last_log"] = now
         except AlistError as e:
             logger.debug(f"【云同步】预加载远端目录失败: {path} ({e})")
             cache[path] = {}
+            if stats is not None:
+                stats["failed"] = int(stats.get("failed") or 0) + 1
             return
         # 递归一层子目录（影视库通常 根/类型/剧名/Season/文件）
         for name, val in list(listing.items()):
             if isinstance(val, dict) and name.endswith("/"):
                 child = f"{path}/{name.rstrip('/')}"
-                self._preload_one(cache, child)
+                self._preload_one(cache, child, stats)
 
     def need_upload_cached(self, remote_path: str, cache: Dict[str, Dict[str, Any]]) -> bool:
         """基于预加载缓存判定是否需要上传；缓存未命中时回退实时 list_dir。"""

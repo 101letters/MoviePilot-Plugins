@@ -5,6 +5,7 @@
 import json
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote_plus
@@ -23,7 +24,12 @@ from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import EventType
 
-from .cloud_sync import TASK_SKIPPED, TASK_SUCCEEDED, AlistClient, CloudSync
+from .cloud_sync import (
+    TASK_SKIPPED,
+    TASK_SUCCEEDED,
+    AlistClient,
+    CloudSync,
+)
 from .proxy_handler import DirectLink, ProxyHandler
 from .sse_listener import MoviePilotSseListener
 from .strm_generator import StrmGenerator
@@ -55,6 +61,8 @@ DEFAULT_EMBY_SERVER_URL = "http://192.168.31.6:8096"
 DEFAULT_EMBY_PROXY_HOST = "0.0.0.0"
 DEFAULT_EMBY_PROXY_PORT = 8095
 DEFAULT_STRM_URL_MODE = "alist_direct"
+BULK_DETAIL_LOG_THRESHOLD = 100
+BULK_PROGRESS_LOG_INTERVAL = 15.0
 
 
 class ManualActionParams(BaseModel):
@@ -172,6 +180,7 @@ class CloudStrmHelper(_PluginBase):
     _emby_proxy_thread: Optional[threading.Thread] = None
     _sync_lock = threading.Lock()
     _stats: Dict[str, Any] = {}
+    _last_upload_batch: Dict[str, int] = {}
 
     # 302 解析缓存：按 (path, ua-hash, mode) 缓存最终 URL；TTL 可配置，配置变更时重建
     _redirect_cache: TTLCache = TTLCache(maxsize=512, ttl=120)
@@ -1388,8 +1397,61 @@ class CloudStrmHelper(_PluginBase):
             media_items.extend(files)
         return media_items, skipped
 
-    def _scan_full_media_files(self) -> Tuple[List[Tuple[str, str, Any, Any]], int]:
-        """扫描所有本地媒体根，返回可处理媒体文件列表。"""
+    @staticmethod
+    def _format_epoch(epoch: Optional[float]) -> str:
+        """格式化本地时间戳。"""
+        if not epoch:
+            return ""
+        try:
+            from datetime import datetime
+            return datetime.fromtimestamp(float(epoch)).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _scan_mtime_threshold(modified_after: Optional[float]) -> Optional[float]:
+        """mtime 基准向前留 1 秒余量，兼容低精度文件系统时间戳。"""
+        if not modified_after:
+            return None
+        try:
+            value = float(modified_after)
+        except (TypeError, ValueError):
+            return None
+        if value <= 0:
+            return None
+        return max(0.0, value - 1.0)
+
+    def _incremental_baseline_epoch(self, kind: str) -> Optional[float]:
+        """读取上传/STRM 的增量扫描基准时间戳。"""
+        stats = getattr(self, "_stats", None) or self._load_stats()
+        key = f"last_full_{kind}_scan_epoch"
+        try:
+            value = float(stats.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        return value if value > 0 else None
+
+    def _mark_full_scan_baseline(self, kind: str, epoch: float) -> None:
+        """全量任务成功后更新后续增量扫描基准。"""
+        if not self._stats:
+            self._stats = self._load_stats()
+        time_key = f"last_full_{kind}_scan_time"
+        epoch_key = f"last_full_{kind}_scan_epoch"
+        label = "上传" if kind == "upload" else "STRM"
+        self._stats[epoch_key] = float(epoch)
+        self._stats[time_key] = self._format_epoch(epoch)
+        self._save_stats()
+        logger.info(f"【云端STRM】已更新{label}增量扫描基准: {self._stats[time_key]}")
+
+    def _scan_full_media_files(
+        self,
+        modified_after: Optional[float] = None,
+    ) -> Tuple[List[Tuple[str, str, Any, Any]], int]:
+        """扫描本地媒体根，返回可处理媒体文件列表。
+
+        modified_after 有值时只收集基准时间之后新增/修改的媒体文件，用于增量任务减少
+        后续候选判定、远端查询和 STRM 路径计算。
+        """
         local_roots = self._local_media_roots or self._parse_path_lines(self._local_media_path)
         if not local_roots:
             logger.warning("【云端STRM】未配置本地媒体路径，跳过全量扫描")
@@ -1399,18 +1461,37 @@ class CloudStrmHelper(_PluginBase):
         media_exts = set(self._rmt_mediaext)
         exclude_spec = self._exclude_spec
         skipped = 0
+        skipped_by_mtime = 0
+        mtime_threshold = self._scan_mtime_threshold(modified_after)
+        scan_checked = 0
+        last_scan_log = time.time()
 
         logger.info(f"【云端STRM】扫描根目录: {local_roots}")
         logger.info(f"【云端STRM】上传映射: {self._upload_mappings}")
+        if mtime_threshold is not None:
+            logger.info(
+                "【云端STRM】增量扫描基准: %s",
+                self._format_epoch(mtime_threshold),
+            )
         for local_root in local_roots:
             root_files = 0
-            for root, dirs, files in os.walk(local_root):
+            for root, _dirs, files in os.walk(local_root):
                 for name in files:
+                    scan_checked += 1
                     local_path = os.path.join(root, name)
                     ext = Path(name).suffix.lower().lstrip(".")
                     if ext not in media_exts:
                         skipped += 1
                         continue
+                    if mtime_threshold is not None:
+                        try:
+                            if os.path.getmtime(local_path) <= mtime_threshold:
+                                skipped_by_mtime += 1
+                                continue
+                        except OSError as e:
+                            logger.debug(f"【云端STRM】读取文件 mtime 失败，跳过: {local_path} ({e})")
+                            skipped += 1
+                            continue
                     if exclude_spec and self._is_excluded_path(local_path):
                         skipped += 1
                         continue
@@ -1420,8 +1501,26 @@ class CloudStrmHelper(_PluginBase):
                         continue
                     media_items.append((local_path, remote_path, None, None))
                     root_files += 1
+                    now = time.time()
+                    if now - last_scan_log >= BULK_PROGRESS_LOG_INTERVAL:
+                        logger.info(
+                            "【云端STRM】扫描中：根=%s，已检查 %d，候选 %d，mtime过滤 %d，其他跳过 %d，当前目录=%s",
+                            local_root,
+                            scan_checked,
+                            len(media_items),
+                            skipped_by_mtime,
+                            skipped,
+                            root,
+                        )
+                        last_scan_log = now
             logger.info(f"【云端STRM】已扫描根目录: {local_root}（候选媒体 {root_files}）")
-        logger.info(f"【云端STRM】全量扫描完成: 候选 {len(media_items)}，跳过 {skipped}")
+        if mtime_threshold is not None:
+            logger.info(
+                f"【云端STRM】增量扫描完成: 候选 {len(media_items)}，"
+                f"mtime 过滤 {skipped_by_mtime}，其他跳过 {skipped}"
+            )
+        else:
+            logger.info(f"【云端STRM】全量扫描完成: 候选 {len(media_items)}，跳过 {skipped}")
         return media_items, skipped
 
     def _upload_media_items(self, media_items: List[Tuple[str, str, Any, Any]],
@@ -1434,8 +1533,19 @@ class CloudStrmHelper(_PluginBase):
         ready_for_strm: List[Tuple[str, str, Any, Any]] = []
         queued = 0
         skipped = 0
+        checked = 0
+        failed_samples: List[str] = []
+        detail_logging = len(media_items) <= BULK_DETAIL_LOG_THRESHOLD or "事件" in label
+        last_decision_log = time.time()
         logger.info(f"【云端STRM】Phase 2 开始：{label}，候选 {len(media_items)} 个")
-        self._cloud_sync.prepare_batch()
+        if not detail_logging:
+            logger.info(
+                "【云端STRM】Phase 2 批量日志模式：候选超过 %d，单文件入队/跳过日志降级为 debug，"
+                "每 %.0fs 输出聚合进度",
+                BULK_DETAIL_LOG_THRESHOLD,
+                BULK_PROGRESS_LOG_INTERVAL,
+            )
+        self._cloud_sync.prepare_batch(label=label)
 
         remote_cache = {}
         if incremental and media_items:
@@ -1445,25 +1555,68 @@ class CloudStrmHelper(_PluginBase):
             logger.info(f"【云端STRM】预加载完成：缓存 {len(remote_cache)} 个远端目录")
 
         for local_path, remote_path, mediainfo, meta in media_items:
+            checked += 1
             if incremental:
                 try:
                     if not self._cloud_sync.need_upload_cached(remote_path, remote_cache):
-                        logger.info(f"【云端STRM】Phase 2 跳过：远端已存在 {remote_path}")
+                        message = f"【云端STRM】Phase 2 跳过：远端已存在 {remote_path}"
+                        if detail_logging:
+                            logger.info(message)
+                        else:
+                            logger.debug(message)
                         ready_for_strm.append((local_path, remote_path, mediainfo, meta))
                         skipped += 1
+                        now = time.time()
+                        if not detail_logging and (
+                            now - last_decision_log >= BULK_PROGRESS_LOG_INTERVAL
+                            or checked == len(media_items)
+                        ):
+                            logger.info(
+                                "【云端STRM】Phase 2 判定进度：%s，已处理 %d/%d，入队 %d，跳过 %d",
+                                label,
+                                checked,
+                                len(media_items),
+                                queued,
+                                skipped,
+                            )
+                            last_decision_log = now
                         continue
                 except Exception as e:
                     logger.warning(f"【云端STRM】Phase 2 增量判定异常，按需上传: {e}")
-            self._cloud_sync.enqueue_file(local_path, remote_path, mediainfo, meta)
+            self._cloud_sync.enqueue_file(
+                local_path,
+                remote_path,
+                mediainfo,
+                meta,
+                log_detail=detail_logging,
+            )
             queued += 1
+            now = time.time()
+            if not detail_logging and (
+                now - last_decision_log >= BULK_PROGRESS_LOG_INTERVAL
+                or checked == len(media_items)
+            ):
+                logger.info(
+                    "【云端STRM】Phase 2 判定进度：%s，已处理 %d/%d，入队 %d，跳过 %d",
+                    label,
+                    checked,
+                    len(media_items),
+                    queued,
+                    skipped,
+                )
+                last_decision_log = now
 
         self._cloud_sync.mark_scan_finish()
         logger.info(f"【云端STRM】Phase 2 扫描完成：入队 {queued}，跳过 {skipped}")
-        logger.info("【云端STRM】等待上传完成（逐条日志见上方【云同步】）...")
-        finished = self._cloud_sync.wait_for_batch()
+        logger.info("【云端STRM】等待上传完成（明细或聚合进度见上方【云同步】）...")
+        finished = self._cloud_sync.wait_for_batch(
+            progress_label=label,
+            progress_interval=BULK_PROGRESS_LOG_INTERVAL if not detail_logging else 30.0,
+        )
 
         upload_ok = 0
         upload_skip = 0
+        upload_fail = 0
         for item in finished:
             if item.status == TASK_SUCCEEDED:
                 upload_ok += 1
@@ -1472,11 +1625,26 @@ class CloudStrmHelper(_PluginBase):
             elif item.status == TASK_SKIPPED:
                 upload_skip += 1
                 ready_for_strm.append((item.local_path, item.remote_path, item.mediainfo, item.meta))
+            else:
+                upload_fail += 1
+                if len(failed_samples) < 10:
+                    failed_samples.append(
+                        f"{item.remote_path}: {item.err_msg or item.status or '未知错误'}"
+                    )
 
+        self._last_upload_batch = {
+            "success": upload_ok,
+            "skipped": upload_skip + skipped,
+            "failed": upload_fail,
+            "queued": queued,
+            "candidates": len(media_items),
+        }
         logger.info(
-            f"【云端STRM】上传阶段结束：成功 {upload_ok}，跳过 {upload_skip + skipped}，"
+            f"【云端STRM】上传阶段结束：成功 {upload_ok}，跳过 {upload_skip + skipped}，失败 {upload_fail}，"
             f"可生成 STRM {len(ready_for_strm)} 条"
         )
+        if failed_samples:
+            logger.warning("【云端STRM】上传失败样本（最多10条）：%s", "；".join(failed_samples))
         return ready_for_strm
 
     def _strm_exists_for_media_item(self, local_path: str, remote_path: str) -> bool:
@@ -1494,24 +1662,75 @@ class CloudStrmHelper(_PluginBase):
         strm_ok = 0
         strm_fail = 0
         strm_skip = 0
+        refresh_targets: List[Tuple[Path, Any]] = []
+        completed_names: List[str] = []
+        failed_samples: List[str] = []
+        detail_logging = len(media_items) <= BULK_DETAIL_LOG_THRESHOLD or "事件" in label
+        last_progress_log = time.time()
         logger.info(f"【云端STRM】Phase 3 开始：{label}，候选 {len(media_items)} 个")
-        for local_path, remote_path, mediainfo, meta in media_items:
+        if not detail_logging:
+            logger.info(
+                "【云端STRM】Phase 3 批量日志模式：候选超过 %d，单文件完成日志改为聚合进度",
+                BULK_DETAIL_LOG_THRESHOLD,
+            )
+        for idx, (local_path, remote_path, mediainfo, meta) in enumerate(media_items, start=1):
             if incremental and self._strm_exists_for_media_item(local_path, remote_path):
                 strm_skip += 1
                 logger.debug(f"【云端STRM】STRM 已存在，增量跳过: {remote_path}")
                 continue
-            ok = self._generate_one_strm(
+            ok, strm_path, created = self._strm_gen.generate(
                 local_path, remote_path, mediainfo, meta,
-                cleanup_after_move=cleanup_after_move,
+                refresh=False,
             )
             if ok:
                 strm_ok += 1
-                logger.info(f"【云端STRM】STRM 生成完成: {Path(remote_path).name}")
+                self._record_strm_stat(strm_path, created, remote_path, local_path=local_path)
+                if cleanup_after_move:
+                    self._cleanup_local_after_move(local_path)
+                if strm_path and self._refresh_enabled:
+                    refresh_targets.append((strm_path, mediainfo))
+                if detail_logging:
+                    completed_names.append(Path(remote_path).name)
             else:
                 strm_fail += 1
+                if len(failed_samples) < 10:
+                    failed_samples.append(remote_path)
                 logger.warning(f"【云端STRM】STRM 生成失败: {remote_path}")
+            now = time.time()
+            if not detail_logging and (
+                now - last_progress_log >= BULK_PROGRESS_LOG_INTERVAL
+                or idx == len(media_items)
+            ):
+                logger.info(
+                    "【云端STRM】Phase 3 生成进度：%s，已处理 %d/%d，成功 %d，失败 %d，跳过 %d",
+                    label,
+                    idx,
+                    len(media_items),
+                    strm_ok,
+                    strm_fail,
+                    strm_skip,
+                )
+                last_progress_log = now
+        self._refresh_generated_strms(refresh_targets, label)
+        for name in completed_names:
+            logger.info(f"【云端STRM】STRM 生成完成: {name}")
         logger.info(f"【云端STRM】Phase 3/4 完成：STRM 成功 {strm_ok}，失败 {strm_fail}，跳过 {strm_skip}")
+        if failed_samples:
+            logger.warning("【云端STRM】STRM 失败样本（最多10条）：%s", "；".join(failed_samples))
         return strm_ok, strm_fail, strm_skip
+
+    def _refresh_generated_strms(self, refresh_targets: List[Tuple[Path, Any]], label: str) -> None:
+        """Phase 4：批量 STRM 写完后统一刷新媒体服务器。"""
+        if not refresh_targets:
+            return
+        if not self._strm_gen or not self._refresh_enabled:
+            return
+        try:
+            logger.info(f"【云端STRM】Phase 4 开始：{label}，批量刷新 {len(refresh_targets)} 个 STRM")
+            self._strm_gen.refresh_emby_batch(refresh_targets)
+            logger.info(f"【云端STRM】Phase 4 完成：{label}")
+        except Exception as e:
+            logger.error(f"【云端STRM】批量媒体服务器刷新失败: {e}", exc_info=True)
 
     # ============================================================
     # 全量同步
@@ -1527,14 +1746,25 @@ class CloudStrmHelper(_PluginBase):
     def _run_once_locked(self) -> None:
         """已持有同步锁的全量同步实现。"""
         logger.info("【云端STRM】========== 开始全量同步 ==========")
+        scan_started = time.time()
         media_items, _ = self._scan_full_media_files()
         ready_for_strm = self._upload_media_items(media_items, incremental=True, label="全量扫描增量上传")
-        self._generate_strm_for_media_items(
+        _, strm_fail, _ = self._generate_strm_for_media_items(
             ready_for_strm,
             incremental=False,
             cleanup_after_move=True,
             label="全量同步 STRM",
         )
+        upload_batch = getattr(self, "_last_upload_batch", {}) or {}
+        upload_failed = int(upload_batch.get("failed") or 0)
+        if upload_failed == 0:
+            self._mark_full_scan_baseline("upload", scan_started)
+        else:
+            logger.warning("【云端STRM】全量同步上传存在失败，不更新上传增量扫描基准")
+        if upload_failed == 0 and strm_fail == 0:
+            self._mark_full_scan_baseline("strm", scan_started)
+        else:
+            logger.warning("【云端STRM】全量同步上传或 STRM 存在失败，不更新 STRM 增量扫描基准")
         logger.info("【云端STRM】========== 全量同步结束 ==========")
 
     def run_upload_full_once(self) -> None:
@@ -1559,8 +1789,18 @@ class CloudStrmHelper(_PluginBase):
             return
         with self._sync_lock:
             logger.info(f"【云端STRM】========== 开始{label} ==========")
-            media_items, _ = self._scan_full_media_files()
+            scan_started = time.time()
+            modified_after = self._incremental_baseline_epoch("upload") if incremental else None
+            if incremental and not modified_after:
+                logger.info("【云端STRM】未找到上传增量扫描基准，本次退回扫描全部候选")
+            media_items, _ = self._scan_full_media_files(modified_after=modified_after)
             self._upload_media_items(media_items, incremental=incremental, label=label)
+            if not incremental:
+                upload_batch = getattr(self, "_last_upload_batch", {}) or {}
+                if int(upload_batch.get("failed") or 0) == 0:
+                    self._mark_full_scan_baseline("upload", scan_started)
+                else:
+                    logger.warning("【云端STRM】全量上传存在失败，不更新上传增量扫描基准")
             logger.info(f"【云端STRM】========== {label}结束 ==========")
 
     def _run_strm_once(self, incremental: bool, label: str) -> None:
@@ -1569,13 +1809,22 @@ class CloudStrmHelper(_PluginBase):
             return
         with self._sync_lock:
             logger.info(f"【云端STRM】========== 开始{label} ==========")
-            media_items, _ = self._scan_full_media_files()
-            self._generate_strm_for_media_items(
+            scan_started = time.time()
+            modified_after = self._incremental_baseline_epoch("strm") if incremental else None
+            if incremental and not modified_after:
+                logger.info("【云端STRM】未找到 STRM 增量扫描基准，本次退回扫描全部候选")
+            media_items, _ = self._scan_full_media_files(modified_after=modified_after)
+            _, strm_fail, _ = self._generate_strm_for_media_items(
                 media_items,
                 incremental=incremental,
                 cleanup_after_move=False,
                 label=label,
             )
+            if not incremental:
+                if strm_fail == 0:
+                    self._mark_full_scan_baseline("strm", scan_started)
+                else:
+                    logger.warning("【云端STRM】全量生成 STRM 存在失败，不更新 STRM 增量扫描基准")
             logger.info(f"【云端STRM】========== {label}结束 ==========")
 
     # ============================================================
@@ -2038,7 +2287,8 @@ class CloudStrmHelper(_PluginBase):
 
         旧: {strm_count, last_strm_time, recent_files:[{name,time}]}
         新: {upload_count, last_upload_time, recent_uploads:[...],
-             strm_count, last_strm_time, recent_strms:[...]}
+             strm_count, last_strm_time, recent_strms:[...],
+             last_full_upload_scan_epoch/time, last_full_strm_scan_epoch/time}
         """
         try:
             data = self.get_data("stats")
@@ -2059,6 +2309,10 @@ class CloudStrmHelper(_PluginBase):
                 data.setdefault("strm_count", 0)
                 data.setdefault("last_strm_time", "")
                 data.setdefault("recent_strms", recent_strms)
+                data.setdefault("last_full_upload_scan_epoch", 0)
+                data.setdefault("last_full_upload_scan_time", "")
+                data.setdefault("last_full_strm_scan_epoch", 0)
+                data.setdefault("last_full_strm_scan_time", "")
                 # v1.5.6: 清理历史遗留的 skipped 记录（远端已存在不再入列表）
                 uploads = data.get("recent_uploads") or []
                 cleaned = [it for it in uploads if isinstance(it, dict) and it.get("status") != "skipped"]
@@ -2071,6 +2325,8 @@ class CloudStrmHelper(_PluginBase):
         return {
             "upload_count": 0, "last_upload_time": "", "recent_uploads": [],
             "strm_count": 0, "last_strm_time": "", "recent_strms": [],
+            "last_full_upload_scan_epoch": 0, "last_full_upload_scan_time": "",
+            "last_full_strm_scan_epoch": 0, "last_full_strm_scan_time": "",
         }
 
     def _save_stats(self) -> None:
@@ -2343,7 +2599,7 @@ class CloudStrmHelper(_PluginBase):
                                                      "component": "VCol", "props": {"cols": 12, "md": 3},
                                                      "content": [{"component": "VSwitch", "props": {
                                                          "model": "once_upload_incremental", "label": "增量上传云端",
-                                                         "hint": "扫描全部候选，只上传远端缺失文件",
+                                                         "hint": "有全量基准时只扫描新增/修改文件，否则扫描全部候选",
                                                          "persistent-hint": False,
                                                      }}],
                                                  },
@@ -2359,7 +2615,7 @@ class CloudStrmHelper(_PluginBase):
                                                      "component": "VCol", "props": {"cols": 12, "md": 3},
                                                      "content": [{"component": "VSwitch", "props": {
                                                          "model": "once_strm_incremental", "label": "增量生成 STRM",
-                                                         "hint": "扫描全部候选，只生成缺失的 STRM",
+                                                         "hint": "有全量基准时只扫描新增/修改文件，否则扫描全部候选",
                                                          "persistent-hint": False,
                                                      }}],
                                                  },
