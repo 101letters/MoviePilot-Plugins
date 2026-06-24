@@ -1317,7 +1317,7 @@ class CloudSyncHelper(_PluginBase):
         return result
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """配置页面（3 Tab：基础 / 云存储·路径 / 同步·过滤）。"""
+        """配置页面（3 Tab：基础 / 云端设置 / 同步与过滤）。"""
         return [
                     {
                         "component": "VTabs",
@@ -1326,8 +1326,8 @@ class CloudSyncHelper(_PluginBase):
                         },
                         "content": [
                             {"component": "VTab", "props": {"value": "base"}, "text": "基础设置"},
-                            {"component": "VTab", "props": {"value": "cloud"}, "text": "云存储设置"},
-                            {"component": "VTab", "props": {"value": "sync"}, "text": "同步设置"},
+                            {"component": "VTab", "props": {"value": "cloud"}, "text": "云端设置"},
+                            {"component": "VTab", "props": {"value": "sync"}, "text": "同步与过滤"},
                         ],
                     },
                     {
@@ -1407,46 +1407,48 @@ class CloudSyncHelper(_PluginBase):
                                      ]},
                                 ],
                             },
-                            # ---- Tab: 云存储 / 路径 ----
+                            # ---- Tab: 云端设置 ----
                             {
                                 "component": "VWindowItem",
                                 "props": {"value": "cloud"},
                                 "content": [
                                     {"component": "div", "props": {"class": "pa-5"},
                                      "content": [
-                                         {"component": "div", "props": {"class": "text-h6 mb-4"}, "text": "云端存储"},
+                                         {"component": "div", "props": {"class": "text-h6 mb-4"}, "text": "AList / OpenList 连接"},
                                          {
                                              "component": "VRow",
                                              "props": {"class": "mb-4"},
                                              "content": [
                                                  {
-                                                     "component": "VCol", "props": {"cols": 12, "md": 4},
-                                                     "content": [{"component": "VSelect", "props": {
-                                                         "model": "cloud_storage_type", "label": "云端存储类型",
-                                                         "items": [{"title": "AList / OpenList", "value": "alist"}],
-                                                         "disabled": True,
-                                                     }}],
-                                                 },
-                                                 {
-                                                     "component": "VCol", "props": {"cols": 12, "md": 4},
+                                                     "component": "VCol", "props": {"cols": 12, "md": 6},
                                                      "content": [{"component": "VTextField", "props": {
                                                          "model": "alist_url", "label": "AList/OpenList 地址",
                                                          "placeholder": DEFAULT_ALIST_URL,
-                                                         "hint": "服务地址",
+                                                         "hint": "http://ip:端口",
                                                          "persistent-hint": False,
                                                      }}],
                                                  },
                                                  {
-                                                     "component": "VCol", "props": {"cols": 12, "md": 4},
+                                                     "component": "VCol", "props": {"cols": 12, "md": 6},
                                                      "content": [{"component": "VTextField", "props": {
                                                          "model": "alist_token", "label": "AList/OpenList Token",
-                                                         "hint": "API Token",
+                                                         "hint": "管理后台的 Token",
                                                          "persistent-hint": False,
                                                      }}],
                                                  },
                                              ],
                                          },
-                                         {"component": "div", "props": {"class": "text-h6 mb-4 mt-6"}, "text": "上传路径映射"},
+                                     ]},
+                                ],
+                            },
+                            # ---- Tab: 同步与过滤 ----
+                            {
+                                "component": "VWindowItem",
+                                "props": {"value": "sync"},
+                                "content": [
+                                    {"component": "div", "props": {"class": "pa-5"},
+                                     "content": [
+                                         {"component": "div", "props": {"class": "text-h6 mb-4"}, "text": "路径映射"},
                                          {
                                              "component": "VRow",
                                              "props": {"class": "mb-3"},
@@ -1458,23 +1460,13 @@ class CloudSyncHelper(_PluginBase):
                                                          "label": "上传映射（本地路径#云端路径）",
                                                          "rows": 3,
                                                          "placeholder": DEFAULT_UPLOAD_PATH_MAPPINGS,
-                                                         "hint": "只处理这些本地根目录下的媒体文件",
+                                                         "hint": "每行一个：本地媒体目录#AList 云端目录",
                                                          "persistent-hint": False,
                                                      }}],
                                                  },
                                              ],
                                          },
-                                     ]},
-                                ],
-                            },
-                            # ---- Tab: 同步 / 过滤 ----
-                            {
-                                "component": "VWindowItem",
-                                "props": {"value": "sync"},
-                                "content": [
-                                    {"component": "div", "props": {"class": "pa-5"},
-                                     "content": [
-                                         {"component": "div", "props": {"class": "text-h6 mb-4"}, "text": "同步模式"},
+                                         {"component": "div", "props": {"class": "text-h6 mb-4 mt-6"}, "text": "同步模式"},
                                          {
                                              "component": "VRow",
                                              "props": {"class": "mb-4"},
