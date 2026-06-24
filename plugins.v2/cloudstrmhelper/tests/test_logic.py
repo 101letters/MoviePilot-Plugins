@@ -463,7 +463,7 @@ class TestPluginMetadata(unittest.TestCase):
     def test_metadata_present(self):
         from cloudstrmhelper import CloudStrmHelper
         self.assertEqual(CloudStrmHelper.plugin_name, "云端STRM整理助手")
-        self.assertEqual(CloudStrmHelper.plugin_version, "1.5.2")
+        self.assertEqual(CloudStrmHelper.plugin_version, "1.5.3")
         self.assertEqual(CloudStrmHelper.plugin_config_prefix, "cloudstrmhelper_")
         self.assertEqual(CloudStrmHelper.plugin_author, "101letters")
         self.assertEqual(CloudStrmHelper.auth_level, 1)
@@ -501,6 +501,28 @@ class TestPluginMetadata(unittest.TestCase):
         self.assertEqual(defaults["emby_proxy_port"], 8095)
         self.assertEqual(defaults["manual_upload_action"], "none")
         self.assertFalse(defaults["manual_execute"])
+        # v1.5.3: 配置页拆 4 Tab，_tabs 默认指向第一个 Tab；手动处理卡片已移除（字段保留兼容旧配置）
+        self.assertEqual(defaults["_tabs"], "base")
+        form_tree = form
+        self.assertEqual(form_tree[0]["component"], "VCard")
+        vwindow = next(c for c in form_tree[0]["content"] if c["component"] == "VWindow")
+        tab_values = [it["props"]["value"] for it in vwindow["content"]]
+        self.assertEqual(tab_values, ["base", "play", "cloud", "sync"])
+        # 确认手动处理卡片已从配置页移除
+        def _card_titles(node):
+            titles = []
+            for c in node.get("content", []):
+                if c.get("component") == "VCard":
+                    for sub in c.get("content", []):
+                        if sub.get("component") == "VCardTitle":
+                            txt = next((cc.get("text") for cc in sub.get("content", [])
+                                        if cc.get("component") == "span"), "")
+                            titles.append(txt)
+                else:
+                    titles.extend(_card_titles(c))
+            return titles
+        all_titles = [t for it in vwindow["content"] for t in _card_titles(it)]
+        self.assertNotIn("手动处理", all_titles)
 
     def test_api_endpoints(self):
         from cloudstrmhelper import CloudStrmHelper
@@ -510,6 +532,15 @@ class TestPluginMetadata(unittest.TestCase):
         self.assertIn("/status", paths)
         self.assertIn("/diagnose", paths)
         self.assertIn("/sync_now", paths)
+        self.assertIn("/manual_action", paths)
+
+    def test_manual_action_endpoint_registered_with_apikey(self):
+        from cloudstrmhelper import CloudStrmHelper
+        apis = CloudStrmHelper.get_api(CloudStrmHelper)
+        manual = next((a for a in apis if a["path"] == "/manual_action"), None)
+        self.assertIsNotNone(manual, "/manual_action 端点未注册")
+        self.assertEqual(manual["auth"], "apikey")
+        self.assertIn("POST", manual["methods"])
 
     def test_api_has_auth(self):
         """规范：不要默认匿名开放 API，每个端点须声明 auth。"""
@@ -754,6 +785,77 @@ class TestPathComputation(unittest.TestCase):
                 }),
                 require_local=True,
             )
+
+    def _manual_action_plugin(self):
+        from cloudstrmhelper import CloudStrmHelper
+        plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+        plugin._enabled = True
+        plugin._upload_mappings = [("/media/movies", "/cloud/movies")]
+        plugin._strm_mappings = []
+        plugin._local_strm_mappings = []
+        plugin._alist_target_path = "/cloud"
+        plugin._strm_gen = None
+        return plugin
+
+    def test_manual_action_rejects_unknown_action(self):
+        plugin = self._manual_action_plugin()
+        calls = []
+
+        def fake_json(body, **kw):
+            calls.append((body, kw.get("status_code", 200)))
+            return body
+
+        with patch("cloudstrmhelper.JSONResponse", fake_json):
+            resp = plugin.manual_action(action="bogus", remote="/cloud/movies/x.mkv")
+        body, status = calls[-1]
+        self.assertEqual(status, 400)
+        self.assertFalse(body["state"])
+
+    def test_manual_action_rejects_missing_remote(self):
+        plugin = self._manual_action_plugin()
+        calls = []
+        with patch("cloudstrmhelper.JSONResponse", lambda b, **kw: calls.append((b, kw.get("status_code", 200))) or b):
+            plugin.manual_action(action="delete_remote")
+        body, status = calls[-1]
+        self.assertEqual(status, 400)
+        self.assertFalse(body["state"])
+
+    def test_manual_action_rejects_remote_outside_known_roots(self):
+        plugin = self._manual_action_plugin()
+        calls = []
+        with patch("cloudstrmhelper.JSONResponse", lambda b, **kw: calls.append((b, kw.get("status_code", 200))) or b):
+            # remote 不在任何已配置云端根下 → 校验失败 400（不启动后台线程）
+            plugin.manual_action(action="delete_remote", remote="/other/x.mkv")
+        body, status = calls[-1]
+        self.assertEqual(status, 400)
+        self.assertFalse(body["state"])
+
+    def test_manual_action_accepts_valid_regenerate_strm(self):
+        """校验通过时返回 state=True 且启动后台线程（线程被 mock，不真跑 worker）。"""
+        plugin = self._manual_action_plugin()
+        plugin._strm_mappings = [("/cloud/movies", "/strm/movies")]
+        calls = []
+        started = {"called": False}
+
+        class _FakeThread:
+            def __init__(self, *a, **k): pass
+            def start(self): started["called"] = True
+
+        def fake_json(body, **kw):
+            calls.append((body, kw.get("status_code", 200)))
+            return body
+
+        with patch("cloudstrmhelper.JSONResponse", fake_json), \
+             patch("cloudstrmhelper.threading.Thread", _FakeThread):
+            resp = plugin.manual_action(
+                action="regenerate_strm",
+                strm="/strm/movies/Foo.strm",
+                remote="/cloud/movies/Foo.mkv",
+            )
+        body, status = calls[-1]
+        self.assertEqual(status, 200)
+        self.assertTrue(body["state"])
+        self.assertTrue(started["called"], "校验通过应启动后台线程")
 
 
 class TestEmby302Proxy(unittest.TestCase):

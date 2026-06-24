@@ -64,7 +64,7 @@ class CloudStrmHelper(_PluginBase):
     plugin_desc = "整理入库自动复制到AList并生成STRM，支持轻量/Emby前置302直链播放"
     # 图标：引用仓库 icons 目录下的图标文件（URL 形式，与官方插件一致）
     plugin_icon = "https://raw.githubusercontent.com/101letters/MoviePilot-Plugins/main/icons/cloudstrmhelper.png"
-    plugin_version = "1.5.2"
+    plugin_version = "1.5.3"
     plugin_author = "101letters"
     author_url = "https://github.com/101letters"
     plugin_config_prefix = "cloudstrmhelper_"
@@ -201,19 +201,15 @@ class CloudStrmHelper(_PluginBase):
                 self._emby_proxy_port = max(1, int(config.get("emby_proxy_port") or DEFAULT_EMBY_PROXY_PORT))
             except (TypeError, ValueError):
                 self._emby_proxy_port = DEFAULT_EMBY_PROXY_PORT
+            # 手动处理字段：UI 已改为首页列表内单条操作（/manual_action API），
+            # 这里仍读取旧配置字段以兼容历史持久化，但不再从配置保存派发任何动作。
             self._manual_upload_action = self._normalize_manual_upload_action(
                 config.get("manual_upload_action") or "none")
             self._manual_upload_target = config.get("manual_upload_target") or ""
             self._manual_strm_target = config.get("manual_strm_target") or ""
             self._manual_confirm = bool(config.get("manual_confirm", False))
             self._manual_execute = bool(config.get("manual_execute", False))
-            self._pending_manual_action = self._build_pending_manual_action()
-            if self._pending_manual_action:
-                self._manual_upload_action = "none"
-                self._manual_upload_target = ""
-                self._manual_strm_target = ""
-                self._manual_confirm = False
-                self._manual_execute = False
+            self._pending_manual_action = None
             self._update_config()
 
         # 配置变更后重建 302 缓存（TTL 可配置）
@@ -285,7 +281,6 @@ class CloudStrmHelper(_PluginBase):
                     "on" if self._sse_enabled else "off")
 
         self._start_emby_proxy_service()
-        self._dispatch_pending_manual_action()
 
         # 一次性全量同步
         if self._once_sync:
@@ -453,6 +448,57 @@ class CloudStrmHelper(_PluginBase):
                 v /= 1024
             return f"{v:.2f} PB"
 
+        manual_api = f"plugin/{self.__class__.__name__}/manual_action?apikey={settings.API_TOKEN}"
+
+        def _action_btn(text, icon, params, color="primary", variant="tonal"):
+            """首页列表行内操作按钮：点击直接 POST /manual_action。"""
+            return {
+                "component": "VBtn",
+                "props": {
+                    "size": "small", "variant": variant, "color": color,
+                    "prepend-icon": icon, "class": "mr-1",
+                },
+                "text": text,
+                "events": {"click": {"api": manual_api, "method": "post", "params": params}},
+            }
+
+        def _upload_action_cell(it):
+            """最近上传行：按记录字段渲染可用动作。"""
+            local = it.get("local") or ""
+            remote = it.get("remote") or ""
+            status = it.get("status") or ""
+            btns = []
+            # 重新上传：仅上传/跳过且有本地源文件路径
+            if local and remote and status in ("uploaded", "skipped"):
+                btns.append(_action_btn(
+                    "重新上传", "mdi-upload-refresh",
+                    {"action": "reupload", "local": local, "remote": remote}))
+            # 删除云端：有云端路径即可
+            if remote:
+                btns.append(_action_btn(
+                    "删除云端", "mdi-cloud-remove",
+                    {"action": "delete_remote", "local": "", "remote": remote},
+                    color="warning"))
+            # 删除云端+本地：需要本地路径（后端再校验是否在上传映射内）
+            if local and remote:
+                btns.append(_action_btn(
+                    "删云端和本地", "mdi-delete-forever",
+                    {"action": "delete_remote_and_local", "local": local, "remote": remote},
+                    color="error"))
+            if not btns:
+                return {"component": "td", "props": {"class": "text-grey"}, "text": "-"}
+            return {"component": "td", "content": btns}
+
+        def _strm_action_cell(it):
+            """最近 STRM 行：重新生成 STRM。"""
+            strm = it.get("path") or ""
+            remote = it.get("remote") or ""
+            if strm and remote:
+                return {"component": "td", "content": [_action_btn(
+                    "重新生成 STRM", "mdi-file-refresh",
+                    {"action": "regenerate_strm", "local": "", "remote": remote, "strm": strm})]}
+            return {"component": "td", "props": {"class": "text-grey"}, "text": "-"}
+
         # 最近上传表行
         upload_rows = [
             {"component": "tr", "content": [
@@ -461,12 +507,13 @@ class CloudStrmHelper(_PluginBase):
                 {"component": "td", "text": _fmt_size(it.get("size"))},
                 {"component": "td", "text": it.get("time") or "-"},
                 {"component": "td", "props": {"class": "text-caption text-grey"}, "text": it.get("remote") or "-"},
+                _upload_action_cell(it),
             ]}
             for it in recent_uploads[:10]
         ]
         if not upload_rows:
             upload_rows = [{"component": "tr", "content": [
-                {"component": "td", "props": {"colspan": 5, "class": "text-grey"}, "text": "暂无记录"},
+                {"component": "td", "props": {"colspan": 6, "class": "text-grey"}, "text": "暂无记录"},
             ]}]
 
         # 最近 STRM 表行
@@ -477,12 +524,13 @@ class CloudStrmHelper(_PluginBase):
                 {"component": "td", "text": it.get("time") or "-"},
                 {"component": "td", "props": {"class": "text-caption text-grey"}, "text": it.get("path") or "-"},
                 {"component": "td", "props": {"class": "text-caption text-grey"}, "text": it.get("remote") or "-"},
+                _strm_action_cell(it),
             ]}
             for it in recent_strms[:10]
         ]
         if not strm_rows:
             strm_rows = [{"component": "tr", "content": [
-                {"component": "td", "props": {"colspan": 5, "class": "text-grey"}, "text": "暂无记录"},
+                {"component": "td", "props": {"colspan": 6, "class": "text-grey"}, "text": "暂无记录"},
             ]}]
 
         def _stat_card(caption, value):
@@ -521,6 +569,7 @@ class CloudStrmHelper(_PluginBase):
                             {"component": "th", "text": "大小"},
                             {"component": "th", "text": "时间"},
                             {"component": "th", "text": "云端路径"},
+                            {"component": "th", "text": "操作"},
                         ]}]},
                         {"component": "tbody", "content": upload_rows},
                     ]},
@@ -539,6 +588,7 @@ class CloudStrmHelper(_PluginBase):
                             {"component": "th", "text": "时间"},
                             {"component": "th", "text": "STRM 路径"},
                             {"component": "th", "text": "云端路径"},
+                            {"component": "th", "text": "操作"},
                         ]}]},
                         {"component": "tbody", "content": strm_rows},
                     ]},
@@ -587,6 +637,14 @@ class CloudStrmHelper(_PluginBase):
                 "auth": "apikey",
                 "summary": "手动同步",
                 "description": "手动触发一次全量同步",
+            },
+            {
+                "path": "/manual_action",
+                "endpoint": self.manual_action,
+                "methods": ["POST"],
+                "auth": "apikey",
+                "summary": "单条手动处理",
+                "description": "对最近上传/STRM 记录执行单条操作：reupload/delete_remote/delete_remote_and_local/regenerate_strm",
             },
         ]
 
@@ -776,36 +834,65 @@ class CloudStrmHelper(_PluginBase):
         except Exception as e:
             logger.error(f"【云端STRM】手动同步异常: {e}", exc_info=True)
 
+    def manual_action(self, request: Request = None,
+                      action: str = "", local: str = "",
+                      remote: str = "", strm: str = ""):
+        """单条手动处理端点（首页列表内操作调用）。
+
+        action:
+          - reupload              : 先删云端再上传，并重新生成 STRM（需 local+remote）
+          - delete_remote         : 只删云端文件（需 remote）
+          - delete_remote_and_local: 删云端 + 删本地（需 local+remote，local 须在上传映射内）
+          - regenerate_strm       : 重新生成 STRM（需 strm+remote）
+
+        复用 _manual_action_worker 的分派与校验；校验失败返回 400。
+        """
+        if not self._enabled:
+            return JSONResponse({"state": False, "message": "插件未启用"}, status_code=400)
+        action = (action or "").strip().lower()
+        valid = {"reupload", "delete_remote", "delete_remote_and_local", "regenerate_strm"}
+        if action not in valid:
+            return JSONResponse({"state": False, "message": f"未知动作: {action}"}, status_code=400)
+
+        # 构造 action dict，复用 _manual_action_worker 的分派与校验
+        if action == "regenerate_strm":
+            if not (strm or "").strip() or not (remote or "").strip():
+                return JSONResponse({"state": False, "message": "缺少 strm 或 remote 参数"}, status_code=400)
+            payload = {"kind": "strm", "action": "regenerate_strm",
+                       "target": self._manual_entry_value(strm=strm, remote=remote)}
+        else:
+            if not (remote or "").strip():
+                return JSONResponse({"state": False, "message": "缺少 remote 参数"}, status_code=400)
+            if action in ("reupload", "delete_remote_and_local") and not (local or "").strip():
+                return JSONResponse({"state": False, "message": "缺少 local 参数"}, status_code=400)
+            payload = {"kind": "upload", "action": action,
+                       "target": self._manual_entry_value(local=local or "", remote=remote)}
+
+        # 校验在 worker 内同步执行前完成；先同步跑一次校验，失败立即返回 400
+        try:
+            if payload["kind"] == "strm":
+                self._decode_manual_strm_target(payload["target"])
+            elif action == "reupload":
+                self._decode_manual_upload_target(payload["target"])
+            else:  # delete_remote / delete_remote_and_local
+                self._decode_manual_delete_target(
+                    payload["target"], require_local=(action == "delete_remote_and_local"))
+        except Exception as e:
+            return JSONResponse({"state": False, "message": str(e)}, status_code=400)
+
+        threading.Thread(
+            target=self._manual_action_worker,
+            args=(payload,), daemon=True,
+            name="CloudStrmManualAction",
+        ).start()
+        return JSONResponse({"state": True, "message": f"已开始执行: {action}"})
+
     @staticmethod
     def _normalize_manual_upload_action(value: str) -> str:
         normalized = (value or "none").strip().lower()
         if normalized in {"reupload", "delete_remote", "delete_remote_and_local"}:
             return normalized
         return "none"
-
-    def _build_pending_manual_action(self) -> Optional[Dict[str, Any]]:
-        if not self._manual_execute or not self._manual_confirm:
-            return None
-        if self._manual_upload_action != "none":
-            if not self._manual_upload_target:
-                logger.warning("【手动处理】已勾选执行，但未选择上传记录")
-                return None
-            return {"kind": "upload", "action": self._manual_upload_action, "target": self._manual_upload_target}
-        if self._manual_strm_target:
-            return {"kind": "strm", "action": "regenerate_strm", "target": self._manual_strm_target}
-        return None
-
-    def _dispatch_pending_manual_action(self) -> None:
-        action = self._pending_manual_action
-        self._pending_manual_action = None
-        if not action:
-            return
-        threading.Thread(
-            target=self._manual_action_worker,
-            args=(action,),
-            daemon=True,
-            name="CloudStrmManualAction",
-        ).start()
 
     def _manual_action_worker(self, action: Dict[str, Any]) -> None:
         try:
@@ -1788,7 +1875,7 @@ class CloudStrmHelper(_PluginBase):
             return None
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """配置页面（6 卡片 Vuetify 组件树 + 默认值）。"""
+        """配置页面（4 Tab：基础 / 播放·302 / 云存储·路径 / 同步·刷新）。"""
         # 媒体服务器选项
         try:
             mediaserver_items = [
@@ -1799,35 +1886,36 @@ class CloudStrmHelper(_PluginBase):
         except Exception:
             mediaserver_items = []
 
-        stats = getattr(self, "_stats", None) or {}
-        if not stats and not isinstance(self, type):
-            stats = self._load_stats()
-        upload_items = [
-            {
-                "title": f"{item.get('name') or '-'} | {item.get('remote') or '-'}",
-                "value": self._manual_entry_value(
-                    local=item.get("local") or "",
-                    remote=item.get("remote") or "",
-                ),
-            }
-            for item in (stats.get("recent_uploads") or [])
-            if item.get("local") and item.get("remote")
-        ][:20]
-        strm_items = [
-            {
-                "title": f"{item.get('name') or '-'} | {item.get('remote') or '-'}",
-                "value": self._manual_entry_value(
-                    strm=item.get("path") or "",
-                    remote=item.get("remote") or "",
-                ),
-            }
-            for item in (stats.get("recent_strms") or [])
-            if item.get("path") and item.get("remote")
-        ][:20]
-
         return [
-            # 1. 基础设置
             {
+                "component": "VCard",
+                "props": {"variant": "outlined"},
+                "content": [
+                    {
+                        "component": "VTabs",
+                        "props": {
+                            "model": "_tabs",
+                            "color": "primary",
+                            "class": "mb-3",
+                        },
+                        "content": [
+                            {"component": "VTab", "props": {"value": "base"}, "text": "基础"},
+                            {"component": "VTab", "props": {"value": "play"}, "text": "播放 / 302"},
+                            {"component": "VTab", "props": {"value": "cloud"}, "text": "云存储 / 路径"},
+                            {"component": "VTab", "props": {"value": "sync"}, "text": "同步 / 刷新"},
+                        ],
+                    },
+                    {
+                        "component": "VWindow",
+                        "props": {"model": "_tabs"},
+                        "content": [
+                            # ---- Tab: 基础 ----
+                            {
+                                "component": "VWindowItem",
+                                "props": {"value": "base"},
+                                "content": [
+                                    # 1. 基础设置
+                                    {
                 "component": "VCard",
                 "props": {"variant": "outlined", "class": "mb-3"},
                 "content": [
@@ -1894,6 +1982,13 @@ class CloudStrmHelper(_PluginBase):
                     },
                 ],
             },
+                                ],
+                            },
+                            # ---- Tab: 播放 / 302 ----
+                            {
+                                "component": "VWindowItem",
+                                "props": {"value": "play"},
+                                "content": [
             # 2. 播放入口设置
             {
                 "component": "VCard",
@@ -2045,91 +2140,13 @@ class CloudStrmHelper(_PluginBase):
                     },
                 ],
             },
-            # 4. 手动处理
-            {
-                "component": "VCard",
-                "props": {"variant": "outlined", "class": "mb-3"},
-                "content": [
-                    {
-                        "component": "VCardTitle",
-                        "content": [
-                            {"component": "VIcon", "props": {"icon": "mdi-wrench", "color": "primary", "class": "mr-2"}},
-                            {"component": "span", "text": "手动处理"},
-                        ],
-                    },
-                    {"component": "VDivider"},
-                    {
-                        "component": "VCardText",
-                        "content": [
-                            {
-                                "component": "VRow",
-                                "content": [
-                                    {
-                                        "component": "VCol", "props": {"cols": 12, "md": 4},
-                                        "content": [{"component": "VSelect", "props": {
-                                            "model": "manual_upload_action", "label": "最近上传操作",
-                                            "items": [
-                                                {"title": "不处理", "value": "none"},
-                                                {"title": "重新上传（先删云端再上传）", "value": "reupload"},
-                                                {"title": "删除云端文件", "value": "delete_remote"},
-                                                {"title": "删除云端和本地文件", "value": "delete_remote_and_local"},
-                                            ],
-                                            "hint": "选择动作后，再选择下面的最近上传记录",
-                                            "persistent-hint": True,
-                                        }}],
-                                    },
-                                    {
-                                        "component": "VCol", "props": {"cols": 12, "md": 8},
-                                        "content": [{"component": "VSelect", "props": {
-                                            "model": "manual_upload_target", "label": "最近上传记录",
-                                            "items": upload_items,
-                                            "clearable": True,
-                                            "hint": "仅展示有本地路径和云端路径的最近记录",
-                                            "persistent-hint": True,
-                                        }}],
-                                    },
                                 ],
                             },
+                            # ---- Tab: 云存储 / 路径 ----
                             {
-                                "component": "VRow",
+                                "component": "VWindowItem",
+                                "props": {"value": "cloud"},
                                 "content": [
-                                    {
-                                        "component": "VCol", "props": {"cols": 12},
-                                        "content": [{"component": "VSelect", "props": {
-                                            "model": "manual_strm_target", "label": "重新生成 STRM",
-                                            "items": strm_items,
-                                            "clearable": True,
-                                            "hint": "选择最近 STRM 记录后，勾选确认和执行并保存配置",
-                                            "persistent-hint": True,
-                                        }}],
-                                    },
-                                ],
-                            },
-                            {
-                                "component": "VRow",
-                                "content": [
-                                    {
-                                        "component": "VCol", "props": {"cols": 12, "md": 6},
-                                        "content": [{"component": "VSwitch", "props": {
-                                            "model": "manual_confirm", "label": "确认执行所选手动处理",
-                                            "hint": "删除云端/本地文件属于破坏性操作，必须勾选确认",
-                                            "persistent-hint": True,
-                                        }}],
-                                    },
-                                    {
-                                        "component": "VCol", "props": {"cols": 12, "md": 6},
-                                        "content": [{"component": "VSwitch", "props": {
-                                            "model": "manual_execute", "label": "保存配置后立即执行",
-                                            "hint": "执行触发后会自动关闭本开关，避免重复执行",
-                                            "persistent-hint": True,
-                                        }}],
-                                    },
-                                ],
-                            },
-                        ],
-                    },
-                ],
-            },
             # 5. 云端存储设置
             {
                 "component": "VCard",
@@ -2230,6 +2247,13 @@ class CloudStrmHelper(_PluginBase):
                     },
                 ],
             },
+                                ],
+                            },
+                            # ---- Tab: 同步 / 刷新 ----
+                            {
+                                "component": "VWindowItem",
+                                "props": {"value": "sync"},
+                                "content": [
             # 7. 同步与过滤
             {
                 "component": "VCard",
@@ -2364,7 +2388,14 @@ class CloudStrmHelper(_PluginBase):
                     },
                 ],
             },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
         ], {
+            "_tabs": "base",
             "enabled": False,
             "once_sync": False,
             "notify_enabled": True,
