@@ -391,7 +391,7 @@ class CloudStrmHelper(_PluginBase):
         self._emby_proxy_thread = None
 
     def _schedule_once_sync(self) -> None:
-        """立刻全量同步：用 date 触发器 3s 后跑一次。"""
+        """立即全量上传并生成 STRM：用 date 触发器 3s 后跑一次。"""
         try:
             if self._scheduler and self._scheduler.running:
                 self._scheduler.shutdown(wait=False)
@@ -638,7 +638,6 @@ class CloudStrmHelper(_PluginBase):
                          }, "text": "清除上传历史",
                           "events": {"click": {"api": clear_upload_api, "method": "post"}}},
                      ]},
-                    {"component": "VDivider", "props": {"class": "mx-4"}},
                     {"component": "VTable", "content": [
                         {"component": "thead", "content": [{"component": "tr", "content": [
                             {"component": "th", "text": "文件名"},
@@ -666,7 +665,6 @@ class CloudStrmHelper(_PluginBase):
                          }, "text": "清除 STRM 历史",
                           "events": {"click": {"api": clear_strm_api, "method": "post"}}},
                      ]},
-                    {"component": "VDivider", "props": {"class": "mx-4"}},
                     {"component": "VTable", "content": [
                         {"component": "thead", "content": [{"component": "tr", "content": [
                             {"component": "th", "text": "文件名"},
@@ -1276,7 +1274,7 @@ class CloudStrmHelper(_PluginBase):
                     try:
                         if not self._cloud_sync.need_upload(local_path, remote_path):
                             logger.info(f"【云端STRM】Phase 2 跳过：远端已存在 {remote_path}")
-                            self._record_upload_stat(local_path, remote_path, 0, status="skipped")
+                            # 远端已存在不加入上传列表，但仍需生成 STRM
                             ready_for_strm.append((local_path, remote_path, mediainfo, meta))
                             skipped += 1
                             continue
@@ -1288,16 +1286,28 @@ class CloudStrmHelper(_PluginBase):
             logger.info(f"【云端STRM】Phase 2 扫描完成：入队 {queued}，跳过 {skipped}")
             finished = self._cloud_sync.wait_for_batch()
             for item in finished:
-                if item.status in (TASK_SUCCEEDED, TASK_SKIPPED):
-                    status = "skipped" if item.status == TASK_SKIPPED else "uploaded"
-                    self._record_upload_stat(item.local_path, item.remote_path, item.file_size or 0, status=status)
+                if item.status == TASK_SUCCEEDED:
+                    logger.info(f"【云端STRM】上传完成: {item.local_path} -> {item.remote_path} ({(item.file_size or 0)/1024/1024:.1f} MB)")
+                    self._record_upload_stat(item.local_path, item.remote_path, item.file_size or 0, status="uploaded")
+                    ready_for_strm.append((item.local_path, item.remote_path, item.mediainfo, item.meta))
+                elif item.status == TASK_SKIPPED:
+                    logger.info(f"【云端STRM】远端已存在，跳过上传: {item.remote_path}")
+                    # 不记入上传列表，但仍需生成 STRM
                     ready_for_strm.append((item.local_path, item.remote_path, item.mediainfo, item.meta))
             logger.info(f"【云端STRM】Phase 2 完成：可生成 STRM {len(ready_for_strm)} 条")
 
             logger.info("【云端STRM】Phase 3 开始：基于云端路径生成 STRM")
+            strm_ok = 0
+            strm_fail = 0
             for local_path, remote_path, mediainfo, meta in ready_for_strm:
-                self._on_file_synced(local_path, remote_path, mediainfo, meta)
-            logger.info("【云端STRM】Phase 3/4 完成：STRM 生成与媒体库刷新结束")
+                ok = self._on_file_synced(local_path, remote_path, mediainfo, meta)
+                if ok:
+                    strm_ok += 1
+                    logger.info(f"【云端STRM】STRM 生成完成: {Path(remote_path).name}")
+                else:
+                    strm_fail += 1
+                    logger.warning(f"【云端STRM】STRM 生成失败: {remote_path}")
+            logger.info(f"【云端STRM】Phase 3/4 完成：STRM 成功 {strm_ok}，失败 {strm_fail}")
 
     # ============================================================
     # Phase 3/4
@@ -2086,10 +2096,6 @@ class CloudStrmHelper(_PluginBase):
             mediaserver_items = []
 
         return [
-            {
-                "component": "VCard",
-                "props": {"variant": "outlined"},
-                "content": [
                     {
                         "component": "VTabs",
                         "props": {
@@ -2393,8 +2399,6 @@ class CloudStrmHelper(_PluginBase):
                             },
                         ],
                     },
-                ],
-            },
         ], {
             "_tabs": "base",
             "enabled": False,

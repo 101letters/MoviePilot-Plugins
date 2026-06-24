@@ -514,27 +514,42 @@ class TestPluginMetadata(unittest.TestCase):
         self.assertEqual(defaults["manual_upload_action"], "none")
         self.assertFalse(defaults["manual_execute"])
         # v1.5.3: 配置页拆 4 Tab，_tabs 默认指向第一个 Tab；手动处理卡片已移除（字段保留兼容旧配置）
+        # v1.5.6: 去掉外层 VCard，form[0]=VTabs, form[1]=VWindow
         self.assertEqual(defaults["_tabs"], "base")
-        form_tree = form
-        self.assertEqual(form_tree[0]["component"], "VCard")
-        vwindow = next(c for c in form_tree[0]["content"] if c["component"] == "VWindow")
+        self.assertEqual(form[0]["component"], "VTabs")
+        vwindow = next(c for c in form if c["component"] == "VWindow")
         tab_values = [it["props"]["value"] for it in vwindow["content"]]
         self.assertEqual(tab_values, ["base", "play", "cloud", "sync"])
-        # 确认手动处理卡片已从配置页移除
-        def _card_titles(node):
+        # 确认手动处理相关标题已从配置页移除（遍历所有 div.text-h6 标题）
+        def _section_titles(node):
             titles = []
-            for c in node.get("content", []):
-                if c.get("component") == "VCard":
-                    for sub in c.get("content", []):
-                        if sub.get("component") == "VCardTitle":
-                            txt = next((cc.get("text") for cc in sub.get("content", [])
-                                        if cc.get("component") == "span"), "")
-                            titles.append(txt)
-                else:
-                    titles.extend(_card_titles(c))
+            if isinstance(node, dict):
+                if node.get("component") == "div" and "text-h6" in str(node.get("props", {}).get("class", "")):
+                    titles.append(node.get("text", ""))
+                for v in node.values():
+                    if isinstance(v, (list, dict)):
+                        titles.extend(_section_titles(v))
+            elif isinstance(node, list):
+                for v in node:
+                    titles.extend(_section_titles(v))
             return titles
-        all_titles = [t for it in vwindow["content"] for t in _card_titles(it)]
+        all_titles = [t for it in vwindow["content"] for t in _section_titles(it)]
         self.assertNotIn("手动处理", all_titles)
+        # 配置页 Tab 内不应有 VCard 边框容器
+        def _has_vcard(node):
+            if isinstance(node, dict):
+                if node.get("component") == "VCard":
+                    return True
+                for v in node.values():
+                    if isinstance(v, (list, dict)) and _has_vcard(v):
+                        return True
+            elif isinstance(node, list):
+                for v in node:
+                    if _has_vcard(v):
+                        return True
+            return False
+        for it in vwindow["content"]:
+            self.assertFalse(_has_vcard(it), f"Tab {it['props']['value']} 内仍有 VCard")
 
     def test_api_endpoints(self):
         from cloudstrmhelper import CloudStrmHelper
