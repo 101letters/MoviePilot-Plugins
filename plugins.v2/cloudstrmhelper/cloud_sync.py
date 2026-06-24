@@ -164,6 +164,28 @@ class AlistClient:
         """获取单个文件/目录信息，含 raw_url / sign / size（用于构建直链）。"""
         return self.post("/api/fs/get", data={"path": path}) or {}
 
+    def remove_file(self, path: str) -> bool:
+        """删除远端单个文件。
+
+        AList/OpenList 删除接口需要 dir + names。目标不存在时视为已删除，返回 False。
+        """
+        remote = Path(path)
+        parent = str(remote.parent)
+        if parent == ".":
+            parent = "/"
+        name = remote.name
+        if not name:
+            raise AlistError("AList 删除路径无效")
+        try:
+            self.post("/api/fs/remove", data={"dir": parent, "names": [name]})
+            return True
+        except AlistError as e:
+            msg = str(e).lower()
+            if any(token in msg for token in ("not exist", "not found", "不存在", "404")):
+                logger.info(f"【云同步】远端文件不存在，视为已删除: {path}")
+                return False
+            raise
+
     # ---- 上传 ----
     def put_stream(self, local_path: str, remote_path: str, as_task: bool = True) -> Optional[str]:
         """流式上传本地文件到 AList 远端路径。

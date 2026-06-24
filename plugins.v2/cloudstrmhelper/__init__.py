@@ -6,6 +6,7 @@ import os
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode, unquote_plus
 
 import pathspec
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -61,7 +62,7 @@ class CloudStrmHelper(_PluginBase):
     plugin_desc = "整理入库自动复制到AList并生成STRM，支持轻量/Emby前置302直链播放"
     # 图标：引用仓库 icons 目录下的图标文件（URL 形式，与官方插件一致）
     plugin_icon = "https://raw.githubusercontent.com/101letters/MoviePilot-Plugins/main/icons/cloudstrmhelper.png"
-    plugin_version = "1.5.0"
+    plugin_version = "1.5.1"
     plugin_author = "101letters"
     author_url = "https://github.com/101letters"
     plugin_config_prefix = "cloudstrmhelper_"
@@ -389,6 +390,27 @@ class CloudStrmHelper(_PluginBase):
         """本插件无远程命令。"""
         return []
 
+    def _manual_action_url(self, action: str, **params) -> str:
+        """首页手动操作链接。"""
+        base = (self._moviepilot_address or "").strip()
+        if not base:
+            try:
+                base = settings.MP_DOMAIN("") if hasattr(settings, "MP_DOMAIN") else ""
+            except Exception:
+                base = ""
+        if not base:
+            base = "http://localhost:3000"
+        if not base.startswith(("http://", "https://")):
+            base = "http://" + base
+        query = {"apikey": settings.API_TOKEN or ""}
+        for key, value in params.items():
+            if value is not None and str(value) != "":
+                query[key] = str(value)
+        return (
+            f"{base.rstrip('/')}/api/v1/plugin/{type(self).__name__}/{action}"
+            f"?{urlencode(query)}"
+        )
+
     def get_page(self) -> List[dict]:
         """插件首页统计面板：4 统计卡片 + 最近上传表 + 最近 STRM 表。"""
         stats = self._stats or self._load_stats()
@@ -418,36 +440,68 @@ class CloudStrmHelper(_PluginBase):
                 v /= 1024
             return f"{v:.2f} PB"
 
+        def _action_button(text, url, icon, color="primary"):
+            if not url:
+                return {"component": "span", "props": {"class": "text-grey"}, "text": "-"}
+            return {
+                "component": "VBtn",
+                "props": {
+                    "size": "small",
+                    "variant": "tonal",
+                    "color": color,
+                    "prepend-icon": icon,
+                    "href": url,
+                    "target": "_blank",
+                },
+                "text": text,
+            }
+
         # 最近上传表行
-        upload_rows = [
-            {"component": "tr", "content": [
+        upload_rows = []
+        for it in recent_uploads[:10]:
+            local_path = it.get("local") or ""
+            remote_path = it.get("remote") or ""
+            upload_rows.append({"component": "tr", "content": [
                 {"component": "td", "text": it.get("name") or "-"},
                 {"component": "td", "text": _status_text(it.get("status"))},
                 {"component": "td", "text": _fmt_size(it.get("size"))},
                 {"component": "td", "text": it.get("time") or "-"},
-                {"component": "td", "props": {"class": "text-caption text-grey"}, "text": it.get("remote") or "-"},
-            ]}
-            for it in recent_uploads[:10]
-        ]
+                {"component": "td", "props": {"class": "text-caption text-grey"}, "text": remote_path or "-"},
+                {"component": "td", "content": [_action_button(
+                    "重新上传",
+                    self._manual_action_url("reupload", local=local_path, remote=remote_path)
+                    if local_path and remote_path else "",
+                    "mdi-cloud-upload",
+                    "warning",
+                )]},
+            ]})
         if not upload_rows:
             upload_rows = [{"component": "tr", "content": [
-                {"component": "td", "props": {"colspan": 5, "class": "text-grey"}, "text": "暂无记录"},
+                {"component": "td", "props": {"colspan": 6, "class": "text-grey"}, "text": "暂无记录"},
             ]}]
 
         # 最近 STRM 表行
-        strm_rows = [
-            {"component": "tr", "content": [
+        strm_rows = []
+        for it in recent_strms[:10]:
+            strm_path = it.get("path") or ""
+            remote_path = it.get("remote") or ""
+            strm_rows.append({"component": "tr", "content": [
                 {"component": "td", "text": it.get("name") or "-"},
                 {"component": "td", "text": _strm_status_text(it.get("created"))},
                 {"component": "td", "text": it.get("time") or "-"},
-                {"component": "td", "props": {"class": "text-caption text-grey"}, "text": it.get("path") or "-"},
-                {"component": "td", "props": {"class": "text-caption text-grey"}, "text": it.get("remote") or "-"},
-            ]}
-            for it in recent_strms[:10]
-        ]
+                {"component": "td", "props": {"class": "text-caption text-grey"}, "text": strm_path or "-"},
+                {"component": "td", "props": {"class": "text-caption text-grey"}, "text": remote_path or "-"},
+                {"component": "td", "content": [_action_button(
+                    "重新生成",
+                    self._manual_action_url("regenerate_strm", strm=strm_path, remote=remote_path)
+                    if strm_path and remote_path else "",
+                    "mdi-file-refresh",
+                    "primary",
+                )]},
+            ]})
         if not strm_rows:
             strm_rows = [{"component": "tr", "content": [
-                {"component": "td", "props": {"colspan": 5, "class": "text-grey"}, "text": "暂无记录"},
+                {"component": "td", "props": {"colspan": 6, "class": "text-grey"}, "text": "暂无记录"},
             ]}]
 
         def _stat_card(caption, value):
@@ -486,6 +540,7 @@ class CloudStrmHelper(_PluginBase):
                             {"component": "th", "text": "大小"},
                             {"component": "th", "text": "时间"},
                             {"component": "th", "text": "云端路径"},
+                            {"component": "th", "text": "操作"},
                         ]}]},
                         {"component": "tbody", "content": upload_rows},
                     ]},
@@ -504,6 +559,7 @@ class CloudStrmHelper(_PluginBase):
                             {"component": "th", "text": "时间"},
                             {"component": "th", "text": "STRM 路径"},
                             {"component": "th", "text": "云端路径"},
+                            {"component": "th", "text": "操作"},
                         ]}]},
                         {"component": "tbody", "content": strm_rows},
                     ]},
@@ -553,6 +609,22 @@ class CloudStrmHelper(_PluginBase):
                 "summary": "手动同步",
                 "description": "手动触发一次全量同步",
             },
+            {
+                "path": "/reupload",
+                "endpoint": self.reupload,
+                "methods": ["GET", "POST"],
+                "auth": "apikey",
+                "summary": "重新上传",
+                "description": "删除云端文件后重新上传，并重新生成对应 STRM",
+            },
+            {
+                "path": "/regenerate_strm",
+                "endpoint": self.regenerate_strm,
+                "methods": ["GET", "POST"],
+                "auth": "apikey",
+                "summary": "重新生成STRM",
+                "description": "按指定云端路径重新写入 STRM 文件内容",
+            },
         ]
 
     def redirect(self, request: Request, apikey: str = "", path: str = ""):
@@ -570,6 +642,7 @@ class CloudStrmHelper(_PluginBase):
             return JSONResponse({"state": False, "message": "鉴权失败"}, status_code=401)
         if not path:
             return JSONResponse({"state": False, "message": "缺少 path 参数"}, status_code=400)
+        path = self._normalize_remote_path_arg(path)
 
         ua = request.headers.get("User-Agent", "")
 
@@ -600,6 +673,19 @@ class CloudStrmHelper(_PluginBase):
         resp = RedirectResponse(url=link.url, status_code=302)
         self._set_redirect_headers(resp, link)
         return resp
+
+    @staticmethod
+    def _normalize_remote_path_arg(path: str) -> str:
+        """规范化 URL query 传入的云端路径，兼容插件网关未解码的情况。"""
+        value = str(path or "").strip()
+        for _ in range(2):
+            decoded = unquote_plus(value)
+            if decoded == value:
+                break
+            value = decoded
+        if value and not value.startswith("/") and not value.startswith(("http://", "https://")):
+            value = "/" + value
+        return value
 
     def _handle_head(self, ua: str, path: str):
         """HEAD 请求按 head_probe_mode 处理。
@@ -721,11 +807,145 @@ class CloudStrmHelper(_PluginBase):
         threading.Thread(target=self._safe_run_once, daemon=True).start()
         return JSONResponse({"state": True, "message": "已触发全量同步"})
 
+    def reupload(self, request: Request = None, apikey: str = "",
+                 local: str = "", remote: str = ""):
+        """手动重新上传：删除远端文件后上传本地文件，并重写 STRM。"""
+        if not apikey or apikey != (settings.API_TOKEN or ""):
+            return JSONResponse({"state": False, "message": "鉴权失败"}, status_code=401)
+        try:
+            local_path, remote_path = self._validate_reupload_paths(local, remote)
+        except Exception as e:
+            return JSONResponse({"state": False, "message": str(e)}, status_code=400)
+
+        threading.Thread(
+            target=self._manual_reupload_worker,
+            args=(local_path, remote_path),
+            daemon=True,
+            name="CloudStrmManualReupload",
+        ).start()
+        return JSONResponse({
+            "state": True,
+            "message": "已开始重新上传，完成后会重新生成 STRM",
+            "data": {"local": local_path, "remote": remote_path},
+        })
+
+    def regenerate_strm(self, request: Request = None, apikey: str = "",
+                        local: str = "", remote: str = "", strm: str = ""):
+        """手动重新生成 STRM。"""
+        if not apikey or apikey != (settings.API_TOKEN or ""):
+            return JSONResponse({"state": False, "message": "鉴权失败"}, status_code=401)
+        try:
+            remote_path = self._validate_remote_path(remote)
+            strm_path = self._validate_strm_path(strm) if strm else ""
+            if strm_path:
+                ok, path = self._regenerate_strm_file(strm_path, remote_path)
+            else:
+                local_path, remote_path = self._validate_reupload_paths(local, remote_path)
+                ok, path = self._regenerate_strm_for_pair(local_path, remote_path)
+        except Exception as e:
+            return JSONResponse({"state": False, "message": str(e)}, status_code=400)
+        return JSONResponse({
+            "state": bool(ok),
+            "message": "STRM 已重新生成" if ok else "STRM 重新生成失败",
+            "data": {"strm": str(path or ""), "remote": remote_path},
+        }, status_code=200 if ok else 500)
+
     def _safe_run_once(self) -> None:
         try:
             self.run_once()
         except Exception as e:
             logger.error(f"【云端STRM】手动同步异常: {e}", exc_info=True)
+
+    def _manual_reupload_worker(self, local_path: str, remote_path: str) -> None:
+        try:
+            if not self._alist_client:
+                raise Exception("AList/OpenList 客户端未初始化")
+            try:
+                self._alist_client.remove_file(remote_path)
+            except Exception as e:
+                logger.warning(f"【手动处理】删除云端文件失败，继续尝试上传: {remote_path} ({e})")
+            parent = str(Path(remote_path).parent)
+            if parent and parent not in (".", "/"):
+                self._alist_client.mkdir(parent)
+            self._alist_client.put_stream(local_path, remote_path, as_task=False)
+            size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+            self._record_upload_stat(local_path, remote_path, size, status="uploaded")
+            self._regenerate_strm_for_pair(local_path, remote_path)
+            logger.info(f"【手动处理】重新上传完成: {local_path} -> {remote_path}")
+        except Exception as e:
+            logger.error(f"【手动处理】重新上传失败: {local_path} -> {remote_path}: {e}", exc_info=True)
+
+    def _validate_reupload_paths(self, local_path: str, remote_path: str = "") -> Tuple[str, str]:
+        local_path = unquote_plus(str(local_path or "").strip())
+        remote_path = self._normalize_remote_path_arg(remote_path)
+        if not local_path:
+            raise Exception("缺少 local 参数")
+        if not os.path.isfile(local_path):
+            raise Exception(f"本地文件不存在: {local_path}")
+        expected_remote = self._build_remote_path(local_path)
+        if not expected_remote:
+            raise Exception("local 不在上传映射范围内")
+        if not remote_path:
+            remote_path = expected_remote
+        if remote_path != expected_remote:
+            raise Exception("remote 与上传映射计算结果不一致，已拒绝")
+        return local_path, remote_path
+
+    def _validate_remote_path(self, remote_path: str) -> str:
+        value = self._normalize_remote_path_arg(remote_path)
+        if not value:
+            raise Exception("缺少 remote 参数")
+        if self._is_known_remote_path(value):
+            return value
+        raise Exception("remote 不在已配置的云端路径范围内")
+
+    def _validate_strm_path(self, strm_path: str) -> str:
+        value = unquote_plus(str(strm_path or "").strip())
+        if not value:
+            raise Exception("缺少 strm 参数")
+        if self._is_known_strm_path(value):
+            return value
+        raise Exception("strm 不在已配置的 STRM 输出路径范围内")
+
+    def _is_known_remote_path(self, remote_path: str) -> bool:
+        roots = [cloud for _, cloud in self._upload_mappings or []]
+        roots.extend([cloud for cloud, _ in self._strm_mappings or []])
+        if self._alist_target_path:
+            roots.append(self._alist_target_path)
+        return any(self._has_path_prefix(Path(remote_path), Path(root)) for root in roots if root)
+
+    def _is_known_strm_path(self, strm_path: str) -> bool:
+        roots = [strm for _, strm in self._strm_mappings or []]
+        roots.extend([strm for _, strm in self._local_strm_mappings or []])
+        for root in roots:
+            if root and self._has_path_prefix(Path(strm_path), Path(root)):
+                return True
+        return False
+
+    def _regenerate_strm_for_pair(self, local_path: str, remote_path: str) -> Tuple[bool, Optional[Path]]:
+        if not self._strm_gen:
+            raise Exception("STRM 生成器未初始化")
+        old_mode = self._overwrite_mode
+        try:
+            self._overwrite_mode = "always"
+            ok, strm_path, _ = self._strm_gen.generate(local_path, remote_path)
+            if ok:
+                self._record_strm_stat(strm_path, created=False, remote_path=remote_path, local_path=local_path)
+            return ok, strm_path
+        finally:
+            self._overwrite_mode = old_mode
+
+    def _regenerate_strm_file(self, strm_path: str, remote_path: str) -> Tuple[bool, Optional[Path]]:
+        if not self._strm_gen:
+            raise Exception("STRM 生成器未初始化")
+        path = Path(strm_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        strm_url = self._strm_gen._build_strm_url(remote_path)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(strm_url)
+        self._record_strm_stat(path, created=False, remote_path=remote_path)
+        logger.info(f"【手动处理】STRM 已重新生成: {path} -> {remote_path}")
+        return True, path
 
     # ============================================================
     # 事件处理（核心触发）
@@ -808,7 +1028,7 @@ class CloudStrmHelper(_PluginBase):
             return False
         ok, strm_path, created = self._strm_gen.generate(local_path, remote_path, mediainfo, meta)
         if ok:
-            self._record_strm_stat(strm_path, created, remote_path)
+            self._record_strm_stat(strm_path, created, remote_path, local_path=local_path)
             self._cleanup_local_after_move(local_path)
         return ok
 
@@ -1411,7 +1631,7 @@ class CloudStrmHelper(_PluginBase):
         self._save_stats()
 
     def _record_strm_stat(self, strm_path: Optional[Path], created: bool,
-                          remote_path: str = "") -> None:
+                          remote_path: str = "", local_path: str = "") -> None:
         """记录 STRM 生成统计。
 
         - created=True 时 strm_count += 1
@@ -1432,6 +1652,7 @@ class CloudStrmHelper(_PluginBase):
         recent.insert(0, {
             "name": strm_path.name,
             "path": str(strm_path),
+            "local": local_path,
             "remote": remote_path,
             "time": now,
             "created": bool(created),

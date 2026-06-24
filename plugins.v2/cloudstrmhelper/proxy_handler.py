@@ -198,7 +198,20 @@ class ProxyHandler:
             raise Exception("AList/OpenList 客户端未初始化")
 
         # 1. FsGet 取文件信息（含 raw_url / sign / size）
-        info = self.alist.fs_get(remote_path)
+        try:
+            info = self.alist.fs_get(remote_path)
+        except Exception as e:
+            if self.direct_link_mode == "raw_url_only":
+                raise
+            # AList/OpenList 的 /d 路由有时能直接命中文件，但 /api/fs/get 会因路径编码、
+            # 缓存或驱动差异失败。兼容模式下回退无 sign /d，避免 /redirect 直接 502。
+            logger.warning(f"【302跳转】FsGet 失败，回退 /d 下载地址: {remote_path} ({e})")
+            link = DirectLink(
+                url=self._build_alist_download_url({}, remote_path),
+                source="alist_download_fallback",
+                expires_at=None,
+            )
+            return self._resolve_or_return(link, ua, resolve_final_url)
         if not info:
             raise Exception(f"AList/OpenList FsGet 无响应: {remote_path}")
         if info.get("is_dir"):
@@ -210,7 +223,11 @@ class ProxyHandler:
             f"(source={link.source})"
         )
 
-        # 2. 可选：跟随重定向取最终 URL
+        return self._resolve_or_return(link, ua, resolve_final_url)
+
+    def _resolve_or_return(self, link: DirectLink, ua: str,
+                           resolve_final_url: Optional[bool] = None) -> DirectLink:
+        """可选预解析最终 URL，并保留 DirectLink 元数据。"""
         do_resolve = self.resolve_final_url if resolve_final_url is None else resolve_final_url
         if do_resolve:
             final = self._resolve_final_url(link.url, ua)

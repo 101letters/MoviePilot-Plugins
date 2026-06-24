@@ -463,7 +463,7 @@ class TestPluginMetadata(unittest.TestCase):
     def test_metadata_present(self):
         from cloudstrmhelper import CloudStrmHelper
         self.assertEqual(CloudStrmHelper.plugin_name, "云端STRM整理助手")
-        self.assertEqual(CloudStrmHelper.plugin_version, "1.5.0")
+        self.assertEqual(CloudStrmHelper.plugin_version, "1.5.1")
         self.assertEqual(CloudStrmHelper.plugin_config_prefix, "cloudstrmhelper_")
         self.assertEqual(CloudStrmHelper.plugin_author, "101letters")
         self.assertEqual(CloudStrmHelper.auth_level, 1)
@@ -506,6 +506,8 @@ class TestPluginMetadata(unittest.TestCase):
         self.assertIn("/status", paths)
         self.assertIn("/diagnose", paths)
         self.assertIn("/sync_now", paths)
+        self.assertIn("/reupload", paths)
+        self.assertIn("/regenerate_strm", paths)
 
     def test_api_has_auth(self):
         """规范：不要默认匿名开放 API，每个端点须声明 auth。"""
@@ -706,6 +708,25 @@ class TestPathComputation(unittest.TestCase):
             plugin._cleanup_local_after_move(str(media_file))
             self.assertTrue(media_file.exists())
 
+    def test_manual_reupload_validation_uses_upload_mapping(self):
+        from cloudstrmhelper import CloudStrmHelper
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+            root = Path(tmp) / "media"
+            root.mkdir()
+            media_file = root / "Foo Bar.mkv"
+            media_file.write_bytes(b"movie")
+
+            plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+            plugin._upload_mappings = [(str(root), "/cloud/movies")]
+            plugin._upload_path_mappings = f"{root}#/cloud/movies"
+            local_path, remote_path = plugin._validate_reupload_paths(
+                str(media_file),
+                "/cloud/movies/Foo+Bar.mkv",
+            )
+
+        self.assertEqual(local_path, str(media_file))
+        self.assertEqual(remote_path, "/cloud/movies/Foo Bar.mkv")
+
 
 class TestEmby302Proxy(unittest.TestCase):
     def _make_plugin(self):
@@ -824,6 +845,17 @@ class TestCloudSyncPolicy(unittest.TestCase):
             client.put_stream("/local/Foo.mkv", "/cloud/Foo.mkv", as_task=False)
         headers = put.call_args.kwargs["headers"]
         self.assertEqual(headers["Overwrite"], "false")
+
+    def test_alist_remove_file_uses_dir_and_name(self):
+        from cloudstrmhelper.cloud_sync import AlistClient
+        client = AlistClient.__new__(AlistClient)
+        client.post = MagicMock(return_value={})
+        ok = client.remove_file("/cloud/Foo Bar.mkv")
+        self.assertTrue(ok)
+        client.post.assert_called_once_with(
+            "/api/fs/remove",
+            data={"dir": "/cloud", "names": ["Foo Bar.mkv"]},
+        )
 
     def test_alist_put_stream_existing_raises_specific_error(self):
         from unittest.mock import mock_open, patch
@@ -1014,6 +1046,25 @@ class TestProxyHandlerResolve(unittest.TestCase):
         url = ph.resolve("/媒体库/Foo.mkv", resolve_final_url=False)
         self.assertEqual(url, "http://192.168.31.6:5244/d/%E5%AA%92%E4%BD%93%E5%BA%93/Foo.mkv?sign=mysign")
 
+    def test_fs_get_failure_falls_back_to_d_in_compat_mode(self):
+        ph = self._make_ph()
+        ph.alist.fs_get.side_effect = Exception("api path failed")
+        url = ph.resolve("/123云盘/影视/外语电影/阿甘正传 (1994)/阿甘正传 (1994) - 4k.mkv",
+                         resolve_final_url=False)
+        self.assertEqual(
+            url,
+            "http://192.168.31.6:5244/d/123%E4%BA%91%E7%9B%98/%E5%BD%B1%E8%A7%86/%E5%A4%96%E8%AF%AD%E7%94%B5%E5%BD%B1/%E9%98%BF%E7%94%98%E6%AD%A3%E4%BC%A0%20%281994%29/%E9%98%BF%E7%94%98%E6%AD%A3%E4%BC%A0%20%281994%29%20-%204k.mkv",
+        )
+
+    def test_fs_get_failure_still_raises_in_raw_only_mode(self):
+        from cloudstrmhelper.proxy_handler import ProxyHandler
+        alist = MagicMock()
+        alist.url = "http://192.168.31.6:5244"
+        alist.fs_get.side_effect = Exception("api path failed")
+        ph = ProxyHandler(alist, resolve_final_url=False, direct_link_mode="raw_url_only")
+        with self.assertRaises(Exception):
+            ph.resolve("/cloud/Foo.mkv", resolve_final_url=False)
+
     def test_resolve_final_url_failure_falls_back_to_origin(self):
         """resolve_final_url=True 但预解析失败时，回退 _build_url 的原始 URL，不抛异常。"""
         ph = self._make_ph(resolve_final_url=True)
@@ -1101,6 +1152,18 @@ class TestRedirectEndpointCaching(unittest.TestCase):
         self.assertEqual(k1[0], "/p")
         self.assertEqual(k1[2], "origin")  # resolve_final_url=False
         self.assertEqual(k1[3], "prefer_raw_url")
+
+    def test_normalize_remote_path_arg_decodes_chinese_url_path(self):
+        from cloudstrmhelper import CloudStrmHelper
+        encoded = (
+            "/123%E4%BA%91%E7%9B%98/%E5%BD%B1%E8%A7%86/%E5%A4%96%E8%AF%AD%E7%94%B5%E5%BD%B1/"
+            "%E9%98%BF%E7%94%98%E6%AD%A3%E4%BC%A0+%281994%29/"
+            "%E9%98%BF%E7%94%98%E6%AD%A3%E4%BC%A0+%281994%29+-+4k.mkv"
+        )
+        self.assertEqual(
+            CloudStrmHelper._normalize_remote_path_arg(encoded),
+            "/123云盘/影视/外语电影/阿甘正传 (1994)/阿甘正传 (1994) - 4k.mkv",
+        )
 
     def test_cached_resolve_hits_cache(self):
         from cloudstrmhelper.proxy_handler import DirectLink
@@ -1243,9 +1306,15 @@ class TestUploadStrmStats(unittest.TestCase):
         plugin, _ = self._make_plugin()
         plugin._stats = plugin._load_stats()
         plugin._save_stats = lambda: None
-        plugin._record_strm_stat(Path("/strm/Foo.strm"), created=True, remote_path="/c/Foo.mkv")
+        plugin._record_strm_stat(
+            Path("/strm/Foo.strm"),
+            created=True,
+            remote_path="/c/Foo.mkv",
+            local_path="/l/Foo.mkv",
+        )
         self.assertEqual(plugin._stats["strm_count"], 1)
         self.assertTrue(plugin._stats["recent_strms"][0]["created"])
+        self.assertEqual(plugin._stats["recent_strms"][0]["local"], "/l/Foo.mkv")
 
     def test_strm_not_created_does_not_increment(self):
         from cloudstrmhelper import CloudStrmHelper

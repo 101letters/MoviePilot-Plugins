@@ -2,7 +2,7 @@
 
 MoviePilot V2 插件：监听 MoviePilot 整理完成/入库完成消息，按顺序上传到 AList/OpenList，基于云端路径生成 STRM，并刷新 Emby/Jellyfin 入库。
 
-> 版本：1.5.0
+> 版本：1.5.1
 
 ## 执行链路
 
@@ -180,6 +180,8 @@ Emby 原始地址: http://192.168.31.6:8096
   - `redirect`（严格）：HEAD 同 GET 返回 302。
   - `resolve`（诊断）：HEAD 解析目标 URL 但返回 200，header 附带脱敏 `X-Resolved-Url`（仅 host）。
 - **最终 URL 解析**（`resolve_final_url`）：HEAD 跟随上游重定向取最终 URL（≤10 跳，循环检测，多策略超时重试，HEAD 失败回退 GET Range `bytes=0-0`），最终失败回退原始 URL 不中断播放。
+- **中文/空格路径兼容**：`/redirect` 会对 `path` 参数做 URL 解码，避免插件网关未解码时把 `%E4...` 当成字面云端路径。
+- **/d 兜底**：兼容模式下如果 AList/OpenList `/api/fs/get` 失败，会回退生成 `/d/<path>` 下载地址；`raw_url_only` 严格模式仍会失败返回，避免走服务器下载端点。
 - **日志脱敏**：日志不打印带 `sign`/`token` 的完整 URL，只保留 `scheme://host/path` 与 query key。
 - **响应头**：302 时加 `Cache-Control: no-store`、`X-CloudStrm-Mode`、`X-CloudStrm-Link-Source`、`X-CloudStrm-Direct-Link`，不泄露真实 Token。
 
@@ -216,10 +218,15 @@ STRM 覆盖模式：
 
 以及两个列表：
 
-- 最近上传列表（文件名 | 状态 | 大小 | 时间 | 云端路径）
-- 最近生成 STRM 列表（文件名 | 状态 | 时间 | STRM 路径 | 云端路径）
+- 最近上传列表（文件名 | 状态 | 大小 | 时间 | 云端路径 | 操作）
+- 最近生成 STRM 列表（文件名 | 状态 | 时间 | STRM 路径 | 云端路径 | 操作）
 
 状态：上传 `已上传`/`远端已存在`；STRM `新生成`/`已存在/已跳过`。统计通过插件数据持久化，重启后保留，并兼容旧 `recent_files` 结构迁移到 `recent_strms`。
+
+首页操作：
+
+- `重新上传`：删除对应云端文件后，从本地路径重新上传，并重新生成对应 STRM。
+- `重新生成`：按现有 STRM 路径和云端路径重新写入 STRM 文件内容，不重新上传媒体文件。
 
 ## 安装
 
@@ -261,6 +268,8 @@ uvicorn
 | `/diagnose` | `GET` | 查看脱敏配置、模块状态、302 状态、路径映射和统计 |
 | `/diagnose?probe=true` | `GET` | 在诊断基础上只读探测 AList/OpenList Token/地址/fs_get（不输出 raw_url/sign 完整内容） |
 | `/sync_now` | `GET/POST` | 手动触发一次全量同步 |
+| `/reupload` | `GET/POST` | 删除云端文件后重新上传，并重新生成 STRM |
+| `/regenerate_strm` | `GET/POST` | 按指定 STRM 路径和云端路径重新写入 STRM |
 
 `/diagnose` 输出的 302 相关字段：`strm_url_mode`、`resolve_final_url`、`direct_link_mode`、`redirect_cache_ttl`、`head_probe_mode`、`redirect_cache_size`、`redirect_error_cache_size`、`emby_proxy_enabled`、`emby_proxy_running`、`emby_proxy_listen`。
 
