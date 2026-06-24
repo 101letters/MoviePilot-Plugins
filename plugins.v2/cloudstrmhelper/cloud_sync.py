@@ -417,6 +417,8 @@ class CloudSync:
             if self.break_flag:
                 item.status = 4
             else:
+                size_mb = (item.file_size or 0) / 1024 / 1024
+                logger.info(f"【云同步】开始上传: {Path(item.local_path).name} ({size_mb:.1f} MB) -> {item.remote_path}")
                 self._do_upload(item)
         except Exception as e:
             item.status = 7
@@ -440,7 +442,7 @@ class CloudSync:
                 tid = self.alist.put_stream(item.local_path, item.remote_path, as_task=True)
                 break
             except AlistAlreadyExists:
-                logger.info(f"【云同步】远端已存在，视为同步完成: {item.remote_path}")
+                logger.info(f"【云同步】远端已存在，跳过上传: {item.remote_path}")
                 item.status = TASK_SKIPPED
                 return
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, AlistError) as e:
@@ -455,9 +457,12 @@ class CloudSync:
         # 3. 直接上传（无任务 id）即视为成功
         if tid is None:
             item.status = TASK_SUCCEEDED
+            logger.info(f"【云同步】上传完成: {Path(item.local_path).name} -> {item.remote_path}")
             return
         # 4. 轮询任务直到终态
         self._poll_task(item)
+        if item.status == TASK_SUCCEEDED:
+            logger.info(f"【云同步】上传完成: {Path(item.local_path).name} -> {item.remote_path}")
 
     def _poll_task(self, item: _SyncItem) -> None:
         while not self.break_flag:

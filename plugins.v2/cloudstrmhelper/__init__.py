@@ -1284,17 +1284,20 @@ class CloudStrmHelper(_PluginBase):
                     queued += 1
             self._cloud_sync.mark_scan_finish()
             logger.info(f"【云端STRM】Phase 2 扫描完成：入队 {queued}，跳过 {skipped}")
+            logger.info(f"【云端STRM】等待上传完成（逐条日志见上方【云同步】）...")
             finished = self._cloud_sync.wait_for_batch()
+            upload_ok = 0
+            upload_skip = 0
             for item in finished:
                 if item.status == TASK_SUCCEEDED:
-                    logger.info(f"【云端STRM】上传完成: {item.local_path} -> {item.remote_path} ({(item.file_size or 0)/1024/1024:.1f} MB)")
+                    upload_ok += 1
                     self._record_upload_stat(item.local_path, item.remote_path, item.file_size or 0, status="uploaded")
                     ready_for_strm.append((item.local_path, item.remote_path, item.mediainfo, item.meta))
                 elif item.status == TASK_SKIPPED:
-                    logger.info(f"【云端STRM】远端已存在，跳过上传: {item.remote_path}")
+                    upload_skip += 1
                     # 不记入上传列表，但仍需生成 STRM
                     ready_for_strm.append((item.local_path, item.remote_path, item.mediainfo, item.meta))
-            logger.info(f"【云端STRM】Phase 2 完成：可生成 STRM {len(ready_for_strm)} 条")
+            logger.info(f"【云端STRM】上传阶段结束：成功 {upload_ok}，跳过 {upload_skip}，可生成 STRM {len(ready_for_strm)} 条")
 
             logger.info("【云端STRM】Phase 3 开始：基于云端路径生成 STRM")
             strm_ok = 0
@@ -1392,17 +1395,20 @@ class CloudStrmHelper(_PluginBase):
 
         self._cloud_sync.mark_scan_finish()
         logger.info(f"【云端STRM】全量扫描完成: 入队 {queued}，跳过 {skipped}")
+        logger.info(f"【云端STRM】等待上传完成（逐条日志见上方【云同步】）...")
         finished = self._cloud_sync.wait_for_batch()
+        upload_ok = 0
+        upload_skip = 0
         for item in finished:
             if item.status == TASK_SUCCEEDED:
-                logger.info(f"【云端STRM】上传完成: {item.local_path} -> {item.remote_path} ({(item.file_size or 0)/1024/1024:.1f} MB)")
+                upload_ok += 1
                 self._record_upload_stat(item.local_path, item.remote_path, item.file_size or 0, status="uploaded")
                 ready_for_strm.append((item.local_path, item.remote_path, item.mediainfo, item.meta))
             elif item.status == TASK_SKIPPED:
-                logger.info(f"【云端STRM】远端已存在，跳过上传: {item.remote_path}")
+                upload_skip += 1
                 # 不记入上传列表，但仍需生成 STRM
                 ready_for_strm.append((item.local_path, item.remote_path, item.mediainfo, item.meta))
-        logger.info(f"【云端STRM】全量 Phase 2 完成：可生成 STRM {len(ready_for_strm)} 条")
+        logger.info(f"【云端STRM】上传阶段结束：成功 {upload_ok}，跳过 {upload_skip}，可生成 STRM {len(ready_for_strm)} 条")
         strm_ok = 0
         strm_fail = 0
         for local_path, remote_path, mediainfo, meta in ready_for_strm:
