@@ -1,7 +1,6 @@
 """transfer_listener.py — Phase 1 整理完成事件记录。
 
-Phase 1 只做事件识别、路径过滤与记录构造，不做本地文件检查、不访问 AList、
-不生成 STRM。真正的文件扫描/上传在插件主类进入 Phase 2 后执行。
+只做事件识别、路径过滤与记录构造，不做本地文件检查、不访问 AList。
 """
 import os
 from dataclasses import dataclass
@@ -38,7 +37,6 @@ class TransferListener:
                 logger.debug("【整理监听】事件无 transferinfo，跳过")
                 return []
 
-            # 整理成功才处理
             success = getattr(transferinfo, "success", None)
             if success is False:
                 logger.debug("【整理监听】整理未成功，跳过")
@@ -47,7 +45,6 @@ class TransferListener:
             mediainfo = data.get("mediainfo")
             meta = data.get("meta")
 
-            # 目标目录 FileItem（整理后文件所在目录）
             target_diritem = getattr(transferinfo, "target_diritem", None)
             if target_diritem is None:
                 target_item = getattr(transferinfo, "target_item", None)
@@ -62,7 +59,6 @@ class TransferListener:
                 logger.warning("【整理监听】目标目录 path 为空，跳过")
                 return []
 
-            # 整理后新文件相对路径列表
             file_list = getattr(transferinfo, "file_list_new", None)
             if not file_list:
                 file_list = getattr(transferinfo, "file_list", None)
@@ -105,7 +101,6 @@ class TransferListener:
 
     def _records_from_file_list(self, source: str, target_dir: str, file_list: list,
                                 mediainfo, meta) -> List[TransferRecord]:
-        """把事件内文件列表转换成记录；不触碰文件系统。"""
         records: List[TransferRecord] = []
         for item in file_list:
             local_path = self._resolve_file_item_path(target_dir, item)
@@ -118,7 +113,6 @@ class TransferListener:
 
     @staticmethod
     def _resolve_file_item_path(target_dir: str, item) -> str:
-        """从 MoviePilot file_list 条目解析本地路径，兼容相对路径、绝对路径和 FileItem。"""
         raw_path = getattr(item, "path", None) or getattr(item, "file_path", None) or str(item)
         path = str(raw_path).strip().replace("\\", "/")
         if not path:
@@ -129,11 +123,9 @@ class TransferListener:
 
     def _build_record(self, source: str, local_path: str, mediainfo, meta,
                       event_text: str = "") -> Optional[TransferRecord]:
-        """构造单条 Phase 1 记录；只做字符串级过滤。"""
         local_root = self.plugin._local_media_path
-        cloud_root = self.plugin._alist_target_path
-        if not local_root or not cloud_root:
-            logger.warning("【整理监听】未配置本地路径映射或 AList 上传目标根目录，跳过")
+        if not local_root:
+            logger.warning("【整理监听】未配置本地路径映射，跳过")
             return None
 
         exclude_spec = self.plugin._exclude_spec
@@ -167,7 +159,6 @@ class TransferListener:
 
     @staticmethod
     def _is_excluded(local_path: str, root: str, spec) -> bool:
-        """pathspec gitignore 匹配，路径相对 root。"""
         roots = [line.strip() for line in str(root or "").splitlines() if line.strip()]
         if not roots:
             roots = [root]

@@ -1,10 +1,10 @@
 {
-  "CloudStrmHelper": {
-    "name": "云端STRM整理助手",
-    "description": "整理入库自动复制到AList并生成STRM，支持轻量/Emby前置302直链播放。",
-    "labels": "STRM,AList,云盘,302",
-    "version": "1.5.7",
-    "icon": "cloudstrmhelper.png",
+  "CloudSyncHelper": {
+    "name": "云盘上传助手",
+    "description": "监听 MP 整理完成事件，自动上传媒体文件到 AList/OpenList 云盘，支持全量/增量扫描。",
+    "labels": "AList,云盘,上传,同步",
+    "version": "1.0.0",
+    "icon": "cloudsynchelper.png",
     "author": "101letters",
     "system_version": ">=2.0.0",
     "level": 1

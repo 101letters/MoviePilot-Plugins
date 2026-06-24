@@ -1,6 +1,6 @@
 """sse_listener.py — MoviePilot system/message SSE 监听。
 
-该模块只负责监听与解析事件消息，不做媒体文件读写、不访问 AList。
+只负责监听与解析事件消息，不做媒体文件读写、不访问 AList。
 """
 import json
 import re
@@ -41,9 +41,7 @@ class MoviePilotSseListener:
             return
         self._stop_event.clear()
         self._thread = threading.Thread(
-            target=self._run,
-            daemon=True,
-            name="CloudStrmSseListener",
+            target=self._run, daemon=True, name="CloudSyncSseListener",
         )
         self._thread.start()
 
@@ -61,8 +59,7 @@ class MoviePilotSseListener:
                 backoff = 3
             except MoviePilotSseAuthError as e:
                 logger.info(
-                    "【SSE监听】鉴权失败，已停止 SSE 监听，仅保留内部 TransferComplete 事件兜底: %s",
-                    e,
+                    "【SSE监听】鉴权失败，已停止 SSE 监听，仅保留内部 TransferComplete 事件兜底: %s", e,
                 )
                 return
             except Exception as e:
@@ -79,11 +76,8 @@ class MoviePilotSseListener:
         auth_failed_status = None
         for label, params, headers in self._auth_candidates(token):
             with requests.get(
-                endpoint,
-                params=params,
-                headers=headers,
-                stream=True,
-                timeout=(10, 90),
+                endpoint, params=params, headers=headers,
+                stream=True, timeout=(10, 90),
             ) as resp:
                 if resp.status_code == 200:
                     self._consume_lines(resp.iter_lines(decode_unicode=True))
