@@ -343,6 +343,7 @@ class CloudSync:
             logger.info(message)
         else:
             logger.debug(message)
+        self.start()  # 无论是否已启动，确保分发线程存活
 
     def mark_scan_finish(self) -> None:
         with self._cond:
@@ -351,31 +352,32 @@ class CloudSync:
 
     # ---- 分发循环 ----
     def _dispatch(self) -> None:
+        """分发循环：持续运行直到 break_flag=True（stop() 时设置）。
+
+        不按 scan_finish 退出，避免跨批次时 waiting 队列有文件但线程已死。
+        """
         while not self.break_flag:
             time.sleep(0.5)
             with self._lock:
                 doing_nums = len(self.doing)
                 waiting_nums = len(self.waiting)
-            if not self.scan_finish or doing_nums != 0 or waiting_nums != 0:
-                while doing_nums < self.concurrency:
-                    if self.break_flag:
-                        break
-                    with self._cond:
-                        if not self.waiting:
-                            break
-                        self._queue_num += 1
-                        key = self._queue_num
-                        item = self.waiting.pop(0)
-                        item.doing_key = key
-                        self.doing[key] = item
-                    t = threading.Thread(target=self._process_item, args=(item,), daemon=True)
-                    t.start()
-                    with self._lock:
-                        doing_nums = len(self.doing)
-                        waiting_nums = len(self.waiting)
-            else:
-                break
 
+            while doing_nums < self.concurrency and not self.break_flag:
+                with self._cond:
+                    if not self.waiting:
+                        break
+                    self._queue_num += 1
+                    key = self._queue_num
+                    item = self.waiting.pop(0)
+                    item.doing_key = key
+                    self.doing[key] = item
+                t = threading.Thread(target=self._process_item, args=(item,), daemon=True)
+                t.start()
+                with self._lock:
+                    doing_nums = len(self.doing)
+                    waiting_nums = len(self.waiting)
+
+        # break_flag 时排水：等进行中任务完成（最多 6s）
         drain_tries = 0
         while True:
             with self._lock:
