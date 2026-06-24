@@ -1323,6 +1323,12 @@ class TestCloudSyncPolicy(unittest.TestCase):
                 self.wait_kwargs = kwargs
                 return []
 
+            def preload_remote_dirs(self, remote_roots):
+                return {}
+
+            def need_upload_cached(self, remote_path, cache):
+                return True
+
         plugin = CloudStrmHelper.__new__(CloudStrmHelper)
         plugin._cloud_sync = _FakeCloudSync()
         plugin._upload_mappings = [("/media/movies", "/cloud")]
@@ -1344,6 +1350,46 @@ class TestCloudSyncPolicy(unittest.TestCase):
         self.assertTrue(plugin._cloud_sync.log_details)
         self.assertTrue(all(value is False for value in plugin._cloud_sync.log_details))
         self.assertEqual(plugin._cloud_sync.wait_kwargs["progress_label"], "全量上传云端")
+
+    def test_full_upload_skips_when_remote_same_name_exists(self):
+        from cloudstrmhelper import CloudStrmHelper
+
+        class _FakeCloudSync:
+            def __init__(self):
+                self.enqueued = []
+                self.marked_finished = False
+
+            def prepare_batch(self, label=""):
+                pass
+
+            def preload_remote_dirs(self, remote_roots):
+                return {"/cloud": {"Foo.mkv": 100}}
+
+            def need_upload_cached(self, remote_path, cache):
+                return False
+
+            def enqueue_file(self, local_path, remote_path, mediainfo=None, meta=None, log_detail=True):
+                self.enqueued.append((local_path, remote_path))
+
+            def mark_scan_finish(self):
+                self.marked_finished = True
+
+            def wait_for_batch(self, **kwargs):
+                return []
+
+        plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+        plugin._cloud_sync = _FakeCloudSync()
+        plugin._upload_mappings = [("/media/movies", "/cloud")]
+        plugin._last_upload_batch = {}
+
+        media_items = [("/media/movies/Foo.mkv", "/cloud/Foo.mkv", None, None)]
+        result = plugin._upload_media_items(media_items, incremental=False, label="全量上传云端")
+
+        self.assertEqual(result, media_items)
+        self.assertEqual(plugin._cloud_sync.enqueued, [])
+        self.assertTrue(plugin._cloud_sync.marked_finished)
+        self.assertEqual(plugin._last_upload_batch["skipped"], 1)
+        self.assertEqual(plugin._last_upload_batch["queued"], 0)
 
 
 class TestStrmUrlMode(unittest.TestCase):
@@ -1857,6 +1903,39 @@ class TestBatchStrmRefresh(unittest.TestCase):
 
         self.assertEqual(result, (2, 0, 0))
         self.assertEqual(events, ["generate:/cloud/A.mkv", "generate:/cloud/B.mkv", "refresh:2"])
+
+    def test_duplicate_strm_targets_are_skipped_within_batch(self):
+        from cloudstrmhelper import CloudStrmHelper
+        plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+        events = []
+
+        class _FakeStrmGen:
+            def generate(self, local_path, remote_path, mediainfo=None, meta=None, refresh=True):
+                events.append(f"generate:{remote_path}")
+                return True, Path("/strm/A.strm"), True
+
+            def refresh_emby_batch(self, targets):
+                events.append(f"refresh:{len(targets)}")
+
+        plugin._strm_gen = _FakeStrmGen()
+        plugin._refresh_enabled = True
+        plugin._record_strm_stat = lambda *args, **kwargs: None
+        plugin._cleanup_local_after_move = lambda *args, **kwargs: None
+        plugin._strm_output_path_for = lambda local, remote: Path("/strm/A.strm")
+
+        result = plugin._generate_strm_for_media_items(
+            [
+                ("/media/A.mkv", "/cloud/A.mkv", None, None),
+                ("/media/A-copy.mkv", "/cloud/A.mkv", None, None),
+                ("/media/A-again.mkv", "/cloud/A.mkv", None, None),
+            ],
+            incremental=False,
+            cleanup_after_move=False,
+            label="测试重复 STRM",
+        )
+
+        self.assertEqual(result, (1, 0, 2))
+        self.assertEqual(events, ["generate:/cloud/A.mkv", "refresh:1"])
 
 
 class TestNewConfigPersistence(unittest.TestCase):

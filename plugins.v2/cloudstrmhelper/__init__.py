@@ -1548,7 +1548,7 @@ class CloudStrmHelper(_PluginBase):
         self._cloud_sync.prepare_batch(label=label)
 
         remote_cache = {}
-        if incremental and media_items:
+        if media_items:
             remote_roots = [cloud for _, cloud in self._upload_mappings if cloud]
             logger.info(f"【云端STRM】预加载云端目录列表: {remote_roots}")
             remote_cache = self._cloud_sync.preload_remote_dirs(remote_roots)
@@ -1556,33 +1556,32 @@ class CloudStrmHelper(_PluginBase):
 
         for local_path, remote_path, mediainfo, meta in media_items:
             checked += 1
-            if incremental:
-                try:
-                    if not self._cloud_sync.need_upload_cached(remote_path, remote_cache):
-                        message = f"【云端STRM】Phase 2 跳过：远端已存在 {remote_path}"
-                        if detail_logging:
-                            logger.info(message)
-                        else:
-                            logger.debug(message)
-                        ready_for_strm.append((local_path, remote_path, mediainfo, meta))
-                        skipped += 1
-                        now = time.time()
-                        if not detail_logging and (
-                            now - last_decision_log >= BULK_PROGRESS_LOG_INTERVAL
-                            or checked == len(media_items)
-                        ):
-                            logger.info(
-                                "【云端STRM】Phase 2 判定进度：%s，已处理 %d/%d，入队 %d，跳过 %d",
-                                label,
-                                checked,
-                                len(media_items),
-                                queued,
-                                skipped,
-                            )
-                            last_decision_log = now
-                        continue
-                except Exception as e:
-                    logger.warning(f"【云端STRM】Phase 2 增量判定异常，按需上传: {e}")
+            try:
+                if not self._cloud_sync.need_upload_cached(remote_path, remote_cache):
+                    message = f"【云端STRM】Phase 2 跳过：云端已存在同名文件 {remote_path}"
+                    if detail_logging:
+                        logger.info(message)
+                    else:
+                        logger.debug(message)
+                    ready_for_strm.append((local_path, remote_path, mediainfo, meta))
+                    skipped += 1
+                    now = time.time()
+                    if not detail_logging and (
+                        now - last_decision_log >= BULK_PROGRESS_LOG_INTERVAL
+                        or checked == len(media_items)
+                    ):
+                        logger.info(
+                            "【云端STRM】Phase 2 判定进度：%s，已处理 %d/%d，入队 %d，跳过 %d",
+                            label,
+                            checked,
+                            len(media_items),
+                            queued,
+                            skipped,
+                        )
+                        last_decision_log = now
+                    continue
+            except Exception as e:
+                logger.warning(f"【云端STRM】Phase 2 云端同名判定异常，按需上传: {e}")
             self._cloud_sync.enqueue_file(
                 local_path,
                 remote_path,
@@ -1667,6 +1666,7 @@ class CloudStrmHelper(_PluginBase):
         failed_samples: List[str] = []
         detail_logging = len(media_items) <= BULK_DETAIL_LOG_THRESHOLD or "事件" in label
         last_progress_log = time.time()
+        seen_strm_targets = set()
         logger.info(f"【云端STRM】Phase 3 开始：{label}，候选 {len(media_items)} 个")
         if not detail_logging:
             logger.info(
@@ -1674,6 +1674,13 @@ class CloudStrmHelper(_PluginBase):
                 BULK_DETAIL_LOG_THRESHOLD,
             )
         for idx, (local_path, remote_path, mediainfo, meta) in enumerate(media_items, start=1):
+            target_path = self._strm_output_path_for(local_path, remote_path)
+            target_key = str(target_path) if target_path else remote_path
+            if target_key in seen_strm_targets:
+                strm_skip += 1
+                logger.debug(f"【云端STRM】批次内重复 STRM，跳过: {target_key}")
+                continue
+            seen_strm_targets.add(target_key)
             if incremental and self._strm_exists_for_media_item(local_path, remote_path):
                 strm_skip += 1
                 logger.debug(f"【云端STRM】STRM 已存在，增量跳过: {remote_path}")
@@ -1768,7 +1775,7 @@ class CloudStrmHelper(_PluginBase):
         logger.info("【云端STRM】========== 全量同步结束 ==========")
 
     def run_upload_full_once(self) -> None:
-        """立即全量同步上传云端：扫描全部候选并尝试上传，远端已存在由上传阶段跳过。"""
+        """立即全量同步上传云端：扫描全部候选，云端同名文件直接跳过。"""
         self._run_upload_once(incremental=False, label="全量上传云端")
 
     def run_upload_incremental_once(self) -> None:
@@ -2591,7 +2598,7 @@ class CloudStrmHelper(_PluginBase):
                                                      "component": "VCol", "props": {"cols": 12, "md": 3},
                                                      "content": [{"component": "VSwitch", "props": {
                                                          "model": "once_upload_full", "label": "全量上传云端",
-                                                         "hint": "扫描全部候选并尝试上传，远端已存在由上传阶段跳过",
+                                                         "hint": "扫描全部候选，云端同名文件直接跳过",
                                                          "persistent-hint": False,
                                                      }}],
                                                  },

@@ -762,6 +762,8 @@ class CloudSync:
 
     def need_upload_cached(self, remote_path: str, cache: Dict[str, Dict[str, Any]]) -> bool:
         """基于预加载缓存判定是否需要上传；缓存未命中时回退实时 list_dir。"""
+        if not self.alist:
+            return True
         remote_name = Path(remote_path).name
         remote_parent = str(Path(remote_path).parent)
         if remote_parent in ("", ".", "/"):
