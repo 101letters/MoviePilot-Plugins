@@ -102,7 +102,7 @@ class CloudStrmHelper(_PluginBase):
     plugin_desc = "整理入库自动复制到AList并生成STRM，支持轻量/Emby前置302直链播放"
     # 图标：引用仓库 icons 目录下的图标文件（URL 形式，与官方插件一致）
     plugin_icon = "https://raw.githubusercontent.com/101letters/MoviePilot-Plugins/main/icons/cloudstrmhelper.png"
-    plugin_version = "1.5.5"
+    plugin_version = "1.5.6"
     plugin_author = "101letters"
     author_url = "https://github.com/101letters"
     plugin_config_prefix = "cloudstrmhelper_"
@@ -139,6 +139,10 @@ class CloudStrmHelper(_PluginBase):
     _rmt_mediaext: List[str] = []
     _upload_concurrency = 3
     _once_sync = False
+    _once_upload_full = False
+    _once_upload_incremental = False
+    _once_strm_full = False
+    _once_strm_incremental = False
     # 播放入口 / 302 可靠性配置
     _strm_url_mode = DEFAULT_STRM_URL_MODE
     _resolve_final_url = True
@@ -217,6 +221,10 @@ class CloudStrmHelper(_PluginBase):
             except (TypeError, ValueError):
                 self._upload_concurrency = 3
             self._once_sync = bool(config.get("once_sync", False))
+            self._once_upload_full = bool(config.get("once_upload_full", False))
+            self._once_upload_incremental = bool(config.get("once_upload_incremental", False))
+            self._once_strm_full = bool(config.get("once_strm_full", False))
+            self._once_strm_incremental = bool(config.get("once_strm_incremental", False))
             # 播放入口 / 302 可靠性
             self._strm_url_mode = self._normalize_strm_url_mode(
                 config.get("strm_url_mode") or DEFAULT_STRM_URL_MODE)
@@ -320,11 +328,11 @@ class CloudStrmHelper(_PluginBase):
 
         self._start_emby_proxy_service()
 
-        # 一次性全量同步
-        if self._once_sync:
-            self._once_sync = False
+        once_actions = self._collect_once_actions()
+        if once_actions:
+            self._reset_once_flags()
             self._update_config()
-            self._schedule_once_sync()
+            self._schedule_once_actions(once_actions)
 
     def _build_cloud_client(self):
         """根据 cloud_storage_type 构建云端客户端。"""
@@ -390,21 +398,58 @@ class CloudStrmHelper(_PluginBase):
         self._emby_proxy_server = None
         self._emby_proxy_thread = None
 
-    def _schedule_once_sync(self) -> None:
-        """立即全量上传并生成 STRM：用 date 触发器 3s 后跑一次。"""
+    def _collect_once_actions(self) -> List[Tuple[str, str, Any]]:
+        """收集配置页保存后需要立即执行的一次性任务。"""
+        actions: List[Tuple[str, str, Any]] = []
+        if self._once_sync:
+            actions.append(("legacy_sync", "立即全量同步上传并生成 STRM", self.run_once))
+        if self._once_upload_full:
+            actions.append(("upload_full", "立即全量同步上传云端", self.run_upload_full_once))
+        if self._once_upload_incremental:
+            actions.append(("upload_incremental", "立即增量同步上传云端", self.run_upload_incremental_once))
+        if self._once_strm_full:
+            actions.append(("strm_full", "立即全量同步生成 STRM", self.run_strm_full_once))
+        if self._once_strm_incremental:
+            actions.append(("strm_incremental", "立即增量同步生成 STRM", self.run_strm_incremental_once))
+        return actions
+
+    def _reset_once_flags(self) -> None:
+        """一次性任务触发后清零配置开关，避免重启重复执行。"""
+        self._once_sync = False
+        self._once_upload_full = False
+        self._once_upload_incremental = False
+        self._once_strm_full = False
+        self._once_strm_incremental = False
+
+    def _schedule_once_actions(self, actions: List[Tuple[str, str, Any]]) -> None:
+        """保存配置后 3 秒执行一次性任务，允许一次保存触发多个分离任务。"""
+        if not actions:
+            return
         try:
             if self._scheduler and self._scheduler.running:
                 self._scheduler.shutdown(wait=False)
             self._scheduler = BackgroundScheduler()
-            # 3 秒后执行一次性任务
             run_time = self._now_plus_seconds(3)
-            self._scheduler.add_job(
-                self.run_once, "date", run_date=run_time, id="cloudstrm_once_sync",
-            )
+            for key, label, func in actions:
+                self._scheduler.add_job(
+                    self._safe_run_named,
+                    "date",
+                    run_date=run_time,
+                    id=f"cloudstrm_once_{key}",
+                    args=[label, func],
+                )
             self._scheduler.start()
-            logger.info("【云端STRM】已排定 3s 后执行一次全量同步")
+            logger.info("【云端STRM】已排定 3s 后执行一次性任务: %s",
+                        ", ".join(label for _, label, _ in actions))
         except Exception as e:
-            logger.error(f"【云端STRM】排定一次性同步失败: {e}", exc_info=True)
+            logger.error(f"【云端STRM】排定一次性任务失败: {e}", exc_info=True)
+
+    def _safe_run_named(self, label: str, func) -> None:
+        try:
+            logger.info(f"【云端STRM】开始执行: {label}")
+            func()
+        except Exception as e:
+            logger.error(f"【云端STRM】{label} 异常: {e}", exc_info=True)
 
     @staticmethod
     def _now_plus_seconds(seconds: int):
@@ -719,7 +764,7 @@ class CloudStrmHelper(_PluginBase):
                 "methods": ["GET", "POST"],
                 "auth": "apikey",
                 "summary": "手动同步",
-                "description": "手动触发一次全量同步",
+                "description": "手动触发同步；action 可选 upload_full/upload_incremental/strm_full/strm_incremental",
             },
             {
                 "path": "/clear_upload_history",
@@ -918,14 +963,25 @@ class CloudStrmHelper(_PluginBase):
         """返回运行诊断信息；probe=true 时做 AList 只读连通性探测。"""
         return JSONResponse({"state": True, "data": self._diagnostic_snapshot(probe=probe)})
 
-    def sync_now(self, request: Request = None):
-        """手动触发一次全量同步（异步，立即返回）。"""
+    def sync_now(self, request: Request = None, action: str = ""):
+        """手动触发同步（异步，立即返回）。
+
+        action 为空时保持旧行为：全量扫描 → 增量上传 → 生成 STRM。
+        """
         if not self._enabled:
             return JSONResponse({"state": False, "message": "插件未启用"}, status_code=400)
         if not self._local_media_path:
             return JSONResponse({"state": False, "message": "未配置本地媒体路径"}, status_code=400)
-        threading.Thread(target=self._safe_run_once, daemon=True).start()
-        return JSONResponse({"state": True, "message": "已触发全量同步"})
+        action_key, label, func = self._resolve_sync_action(action)
+        if not func:
+            return JSONResponse({"state": False, "message": f"未知同步动作: {action}"}, status_code=400)
+        threading.Thread(
+            target=self._safe_run_named,
+            args=(label, func),
+            daemon=True,
+            name=f"CloudStrmSyncNow-{action_key}",
+        ).start()
+        return JSONResponse({"state": True, "message": f"已触发: {label}"})
 
     def clear_upload_history(self, request: Request = None):
         """清除最近上传历史（仅记录，不删除云端/本地文件）。"""
@@ -966,6 +1022,23 @@ class CloudStrmHelper(_PluginBase):
             self.run_once()
         except Exception as e:
             logger.error(f"【云端STRM】手动同步异常: {e}", exc_info=True)
+
+    def _resolve_sync_action(self, action: str) -> Tuple[str, str, Any]:
+        normalized = (action or "").strip().lower()
+        mapping = {
+            "": ("legacy_sync", "立即全量同步上传并生成 STRM", self.run_once),
+            "sync": ("legacy_sync", "立即全量同步上传并生成 STRM", self.run_once),
+            "all": ("legacy_sync", "立即全量同步上传并生成 STRM", self.run_once),
+            "upload_full": ("upload_full", "立即全量同步上传云端", self.run_upload_full_once),
+            "full_upload": ("upload_full", "立即全量同步上传云端", self.run_upload_full_once),
+            "upload_incremental": ("upload_incremental", "立即增量同步上传云端", self.run_upload_incremental_once),
+            "incremental_upload": ("upload_incremental", "立即增量同步上传云端", self.run_upload_incremental_once),
+            "strm_full": ("strm_full", "立即全量同步生成 STRM", self.run_strm_full_once),
+            "full_strm": ("strm_full", "立即全量同步生成 STRM", self.run_strm_full_once),
+            "strm_incremental": ("strm_incremental", "立即增量同步生成 STRM", self.run_strm_incremental_once),
+            "incremental_strm": ("strm_incremental", "立即增量同步生成 STRM", self.run_strm_incremental_once),
+        }
+        return mapping.get(normalized, (normalized, "", None))
 
     def manual_action(self, params: ManualActionParams):
         """单条手动处理端点（首页列表内操作调用，POST body = ManualActionParams）。
@@ -1257,60 +1330,16 @@ class CloudStrmHelper(_PluginBase):
             logger.warning("【云端STRM】Phase 2 取消：云同步未初始化")
             return
         with self._sync_lock:
-            queued = 0
-            skipped = 0
-            ready_for_strm: List[Tuple[str, str, Any, Any]] = []
             logger.info("【云端STRM】========== 开始同步（事件触发）==========")
-            logger.info(f"【云端STRM】Phase 2 开始：AList 仅新增同步 {len(records)} 条")
-            self._cloud_sync.prepare_batch()
-            for record in records:
-                files = self._expand_record_media_files(record)
-                if not files:
-                    if not os.path.exists(record.local_path):
-                        logger.warning(f"【云端STRM】Phase 2 跳过：本地路径不存在 {record.local_path}")
-                    skipped += 1
-                    continue
-                for local_path, remote_path, mediainfo, meta in files:
-                    try:
-                        if not self._cloud_sync.need_upload(local_path, remote_path):
-                            logger.info(f"【云端STRM】Phase 2 跳过：远端已存在 {remote_path}")
-                            # 远端已存在不加入上传列表，但仍需生成 STRM
-                            ready_for_strm.append((local_path, remote_path, mediainfo, meta))
-                            skipped += 1
-                            continue
-                    except Exception as e:
-                        logger.warning(f"【云端STRM】Phase 2 增量判定异常，按需上传: {e}")
-                    self._cloud_sync.enqueue_file(local_path, remote_path, mediainfo, meta)
-                    queued += 1
-            self._cloud_sync.mark_scan_finish()
-            logger.info(f"【云端STRM】Phase 2 扫描完成：入队 {queued}，跳过 {skipped}")
-            logger.info(f"【云端STRM】等待上传完成（逐条日志见上方【云同步】）...")
-            finished = self._cloud_sync.wait_for_batch()
-            upload_ok = 0
-            upload_skip = 0
-            for item in finished:
-                if item.status == TASK_SUCCEEDED:
-                    upload_ok += 1
-                    self._record_upload_stat(item.local_path, item.remote_path, item.file_size or 0, status="uploaded")
-                    ready_for_strm.append((item.local_path, item.remote_path, item.mediainfo, item.meta))
-                elif item.status == TASK_SKIPPED:
-                    upload_skip += 1
-                    # 不记入上传列表，但仍需生成 STRM
-                    ready_for_strm.append((item.local_path, item.remote_path, item.mediainfo, item.meta))
-            logger.info(f"【云端STRM】上传阶段结束：成功 {upload_ok}，跳过 {upload_skip}，可生成 STRM {len(ready_for_strm)} 条")
-
-            logger.info("【云端STRM】Phase 3 开始：基于云端路径生成 STRM")
-            strm_ok = 0
-            strm_fail = 0
-            for local_path, remote_path, mediainfo, meta in ready_for_strm:
-                ok = self._on_file_synced(local_path, remote_path, mediainfo, meta)
-                if ok:
-                    strm_ok += 1
-                    logger.info(f"【云端STRM】STRM 生成完成: {Path(remote_path).name}")
-                else:
-                    strm_fail += 1
-                    logger.warning(f"【云端STRM】STRM 生成失败: {remote_path}")
-            logger.info(f"【云端STRM】Phase 3/4 完成：STRM 成功 {strm_ok}，失败 {strm_fail}")
+            media_items, skipped = self._media_items_from_records(records)
+            logger.info(f"【云端STRM】Phase 2 准备完成：事件记录 {len(records)} 条，媒体文件 {len(media_items)} 个，跳过 {skipped}")
+            ready_for_strm = self._upload_media_items(media_items, incremental=True, label="事件增量上传")
+            self._generate_strm_for_media_items(
+                ready_for_strm,
+                incremental=False,
+                cleanup_after_move=True,
+                label="事件触发 STRM",
+            )
             logger.info("【云端STRM】========== 同步结束（事件触发）==========")
 
     # ============================================================
@@ -1319,12 +1348,19 @@ class CloudStrmHelper(_PluginBase):
     def _on_file_synced(self, local_path: str, remote_path: str,
                         mediainfo: Any = None, meta: Any = None) -> bool:
         """Phase 2 单文件完成后执行 Phase 3/4。"""
+        return self._generate_one_strm(local_path, remote_path, mediainfo, meta, cleanup_after_move=True)
+
+    def _generate_one_strm(self, local_path: str, remote_path: str,
+                           mediainfo: Any = None, meta: Any = None,
+                           cleanup_after_move: bool = False) -> bool:
+        """生成单个 STRM；cleanup_after_move 仅用于上传成功后的移动模式。"""
         if self._strm_gen is None:
             return False
         ok, strm_path, created = self._strm_gen.generate(local_path, remote_path, mediainfo, meta)
         if ok:
             self._record_strm_stat(strm_path, created, remote_path, local_path=local_path)
-            self._cleanup_local_after_move(local_path)
+            if cleanup_after_move:
+                self._cleanup_local_after_move(local_path)
         return ok
 
     def _cleanup_local_after_move(self, local_path: str) -> None:
@@ -1338,41 +1374,34 @@ class CloudStrmHelper(_PluginBase):
         except Exception as e:
             logger.error(f"【云端STRM】移动模式删除本地源文件失败: {local_path}: {e}", exc_info=True)
 
-    # ============================================================
-    # 全量同步
-    # ============================================================
-    def run_once(self) -> None:
-        """全量同步：遍历 local_media_path 下所有媒体文件，增量上传 + 生成 STRM。"""
-        if not self._enabled or not self._cloud_sync:
-            logger.warning("【云端STRM】未启用或云同步未就绪，跳过全量同步")
-            return
-        with self._sync_lock:
-            self._run_once_locked()
+    def _media_items_from_records(self, records: List[TransferRecord]) -> Tuple[List[Tuple[str, str, Any, Any]], int]:
+        """把 Phase 1 记录展开为媒体文件列表。"""
+        media_items: List[Tuple[str, str, Any, Any]] = []
+        skipped = 0
+        for record in records or []:
+            files = self._expand_record_media_files(record)
+            if not files:
+                if not os.path.exists(record.local_path):
+                    logger.warning(f"【云端STRM】Phase 2 跳过：本地路径不存在 {record.local_path}")
+                skipped += 1
+                continue
+            media_items.extend(files)
+        return media_items, skipped
 
-    def _run_once_locked(self) -> None:
-        """已持有同步锁的全量同步实现。"""
+    def _scan_full_media_files(self) -> Tuple[List[Tuple[str, str, Any, Any]], int]:
+        """扫描所有本地媒体根，返回可处理媒体文件列表。"""
         local_roots = self._local_media_roots or self._parse_path_lines(self._local_media_path)
         if not local_roots:
-            logger.warning("【云端STRM】未配置本地媒体路径，跳过全量同步")
-            return
+            logger.warning("【云端STRM】未配置本地媒体路径，跳过全量扫描")
+            return [], 0
 
+        media_items: List[Tuple[str, str, Any, Any]] = []
         media_exts = set(self._rmt_mediaext)
         exclude_spec = self._exclude_spec
-        queued = 0
         skipped = 0
-        ready_for_strm: List[Tuple[str, str, Any, Any]] = []
 
-        logger.info("【云端STRM】========== 开始全量同步 ==========")
         logger.info(f"【云端STRM】扫描根目录: {local_roots}")
         logger.info(f"【云端STRM】上传映射: {self._upload_mappings}")
-        self._cloud_sync.prepare_batch()
-
-        # 预加载云端目录列表，避免逐文件 list_dir 导致扫描阶段极慢
-        remote_roots = [cloud for _, cloud in self._upload_mappings if cloud]
-        logger.info(f"【云端STRM】预加载云端目录列表: {remote_roots}")
-        remote_cache = self._cloud_sync.preload_remote_dirs(remote_roots)
-        logger.info(f"【云端STRM】预加载完成：缓存 {len(remote_cache)} 个远端目录")
-
         for local_root in local_roots:
             root_files = 0
             for root, dirs, files in os.walk(local_root):
@@ -1389,23 +1418,50 @@ class CloudStrmHelper(_PluginBase):
                     if not remote_path:
                         skipped += 1
                         continue
-                    try:
-                        if not self._cloud_sync.need_upload_cached(remote_path, remote_cache):
-                            # 远端已存在不加入上传列表，但仍需生成 STRM
-                            ready_for_strm.append((local_path, remote_path, None, None))
-                            skipped += 1
-                            continue
-                    except Exception as e:
-                        logger.warning(f"【云端STRM】增量判定异常，按需上传: {e}")
-                    self._cloud_sync.enqueue_file(local_path, remote_path, None, None)
-                    queued += 1
+                    media_items.append((local_path, remote_path, None, None))
                     root_files += 1
-            logger.info(f"【云端STRM】已扫描根目录: {local_root}（待上传 {root_files}）")
+            logger.info(f"【云端STRM】已扫描根目录: {local_root}（候选媒体 {root_files}）")
+        logger.info(f"【云端STRM】全量扫描完成: 候选 {len(media_items)}，跳过 {skipped}")
+        return media_items, skipped
+
+    def _upload_media_items(self, media_items: List[Tuple[str, str, Any, Any]],
+                            incremental: bool, label: str) -> List[Tuple[str, str, Any, Any]]:
+        """执行上传阶段，返回可用于生成 STRM 的媒体文件列表。"""
+        if not self._cloud_sync:
+            logger.warning(f"【云端STRM】{label} 取消：云同步未初始化")
+            return []
+
+        ready_for_strm: List[Tuple[str, str, Any, Any]] = []
+        queued = 0
+        skipped = 0
+        logger.info(f"【云端STRM】Phase 2 开始：{label}，候选 {len(media_items)} 个")
+        self._cloud_sync.prepare_batch()
+
+        remote_cache = {}
+        if incremental and media_items:
+            remote_roots = [cloud for _, cloud in self._upload_mappings if cloud]
+            logger.info(f"【云端STRM】预加载云端目录列表: {remote_roots}")
+            remote_cache = self._cloud_sync.preload_remote_dirs(remote_roots)
+            logger.info(f"【云端STRM】预加载完成：缓存 {len(remote_cache)} 个远端目录")
+
+        for local_path, remote_path, mediainfo, meta in media_items:
+            if incremental:
+                try:
+                    if not self._cloud_sync.need_upload_cached(remote_path, remote_cache):
+                        logger.info(f"【云端STRM】Phase 2 跳过：远端已存在 {remote_path}")
+                        ready_for_strm.append((local_path, remote_path, mediainfo, meta))
+                        skipped += 1
+                        continue
+                except Exception as e:
+                    logger.warning(f"【云端STRM】Phase 2 增量判定异常，按需上传: {e}")
+            self._cloud_sync.enqueue_file(local_path, remote_path, mediainfo, meta)
+            queued += 1
 
         self._cloud_sync.mark_scan_finish()
-        logger.info(f"【云端STRM】全量扫描完成: 入队 {queued}，跳过 {skipped}")
-        logger.info(f"【云端STRM】等待上传完成（逐条日志见上方【云同步】）...")
+        logger.info(f"【云端STRM】Phase 2 扫描完成：入队 {queued}，跳过 {skipped}")
+        logger.info("【云端STRM】等待上传完成（逐条日志见上方【云同步】）...")
         finished = self._cloud_sync.wait_for_batch()
+
         upload_ok = 0
         upload_skip = 0
         for item in finished:
@@ -1415,21 +1471,112 @@ class CloudStrmHelper(_PluginBase):
                 ready_for_strm.append((item.local_path, item.remote_path, item.mediainfo, item.meta))
             elif item.status == TASK_SKIPPED:
                 upload_skip += 1
-                # 不记入上传列表，但仍需生成 STRM
                 ready_for_strm.append((item.local_path, item.remote_path, item.mediainfo, item.meta))
-        logger.info(f"【云端STRM】上传阶段结束：成功 {upload_ok}，跳过 {upload_skip}，可生成 STRM {len(ready_for_strm)} 条")
+
+        logger.info(
+            f"【云端STRM】上传阶段结束：成功 {upload_ok}，跳过 {upload_skip + skipped}，"
+            f"可生成 STRM {len(ready_for_strm)} 条"
+        )
+        return ready_for_strm
+
+    def _strm_exists_for_media_item(self, local_path: str, remote_path: str) -> bool:
+        path = self._strm_output_path_for(local_path, remote_path)
+        return bool(path and path.exists())
+
+    def _generate_strm_for_media_items(self, media_items: List[Tuple[str, str, Any, Any]],
+                                       incremental: bool, cleanup_after_move: bool,
+                                       label: str) -> Tuple[int, int, int]:
+        """执行 STRM 生成阶段，返回 (成功, 失败, 跳过)。"""
+        if not self._strm_gen:
+            logger.warning(f"【云端STRM】{label} 取消：STRM 生成器未初始化")
+            return 0, 0, 0
+
         strm_ok = 0
         strm_fail = 0
-        for local_path, remote_path, mediainfo, meta in ready_for_strm:
-            ok = self._on_file_synced(local_path, remote_path, mediainfo, meta)
+        strm_skip = 0
+        logger.info(f"【云端STRM】Phase 3 开始：{label}，候选 {len(media_items)} 个")
+        for local_path, remote_path, mediainfo, meta in media_items:
+            if incremental and self._strm_exists_for_media_item(local_path, remote_path):
+                strm_skip += 1
+                logger.debug(f"【云端STRM】STRM 已存在，增量跳过: {remote_path}")
+                continue
+            ok = self._generate_one_strm(
+                local_path, remote_path, mediainfo, meta,
+                cleanup_after_move=cleanup_after_move,
+            )
             if ok:
                 strm_ok += 1
                 logger.info(f"【云端STRM】STRM 生成完成: {Path(remote_path).name}")
             else:
                 strm_fail += 1
                 logger.warning(f"【云端STRM】STRM 生成失败: {remote_path}")
-        logger.info(f"【云端STRM】全量 Phase 3/4 完成：STRM 成功 {strm_ok}，失败 {strm_fail}")
+        logger.info(f"【云端STRM】Phase 3/4 完成：STRM 成功 {strm_ok}，失败 {strm_fail}，跳过 {strm_skip}")
+        return strm_ok, strm_fail, strm_skip
+
+    # ============================================================
+    # 全量同步
+    # ============================================================
+    def run_once(self) -> None:
+        """全量同步：遍历 local_media_path 下所有媒体文件，增量上传 + 生成 STRM。"""
+        if not self._enabled or not self._cloud_sync:
+            logger.warning("【云端STRM】未启用或云同步未就绪，跳过全量同步")
+            return
+        with self._sync_lock:
+            self._run_once_locked()
+
+    def _run_once_locked(self) -> None:
+        """已持有同步锁的全量同步实现。"""
+        logger.info("【云端STRM】========== 开始全量同步 ==========")
+        media_items, _ = self._scan_full_media_files()
+        ready_for_strm = self._upload_media_items(media_items, incremental=True, label="全量扫描增量上传")
+        self._generate_strm_for_media_items(
+            ready_for_strm,
+            incremental=False,
+            cleanup_after_move=True,
+            label="全量同步 STRM",
+        )
         logger.info("【云端STRM】========== 全量同步结束 ==========")
+
+    def run_upload_full_once(self) -> None:
+        """立即全量同步上传云端：扫描全部候选并尝试上传，远端已存在由上传阶段跳过。"""
+        self._run_upload_once(incremental=False, label="全量上传云端")
+
+    def run_upload_incremental_once(self) -> None:
+        """立即增量同步上传云端：扫描全部候选，仅上传远端缺失文件。"""
+        self._run_upload_once(incremental=True, label="增量上传云端")
+
+    def run_strm_full_once(self) -> None:
+        """立即全量同步生成 STRM：扫描全部候选，按当前覆盖模式写入 STRM。"""
+        self._run_strm_once(incremental=False, label="全量生成 STRM")
+
+    def run_strm_incremental_once(self) -> None:
+        """立即增量同步生成 STRM：扫描全部候选，只生成本地缺失的 STRM。"""
+        self._run_strm_once(incremental=True, label="增量生成 STRM")
+
+    def _run_upload_once(self, incremental: bool, label: str) -> None:
+        if not self._enabled or not self._cloud_sync:
+            logger.warning(f"【云端STRM】未启用或云同步未就绪，跳过{label}")
+            return
+        with self._sync_lock:
+            logger.info(f"【云端STRM】========== 开始{label} ==========")
+            media_items, _ = self._scan_full_media_files()
+            self._upload_media_items(media_items, incremental=incremental, label=label)
+            logger.info(f"【云端STRM】========== {label}结束 ==========")
+
+    def _run_strm_once(self, incremental: bool, label: str) -> None:
+        if not self._enabled or not self._strm_gen:
+            logger.warning(f"【云端STRM】未启用或 STRM 生成器未就绪，跳过{label}")
+            return
+        with self._sync_lock:
+            logger.info(f"【云端STRM】========== 开始{label} ==========")
+            media_items, _ = self._scan_full_media_files()
+            self._generate_strm_for_media_items(
+                media_items,
+                incremental=incremental,
+                cleanup_after_move=False,
+                label=label,
+            )
+            logger.info(f"【云端STRM】========== {label}结束 ==========")
 
     # ============================================================
     # 路径映射与统计
@@ -2079,6 +2226,10 @@ class CloudStrmHelper(_PluginBase):
             "rmt_mediaext": ",".join(self._rmt_mediaext) if self._rmt_mediaext else DEFAULT_MEDIA_EXTS,
             "upload_concurrency": self._upload_concurrency,
             "once_sync": self._once_sync,
+            "once_upload_full": self._once_upload_full,
+            "once_upload_incremental": self._once_upload_incremental,
+            "once_strm_full": self._once_strm_full,
+            "once_strm_incremental": self._once_strm_incremental,
             "strm_url_mode": self._strm_url_mode,
             "resolve_final_url": self._resolve_final_url,
             "direct_link_mode": self._direct_link_mode,
@@ -2161,14 +2312,6 @@ class CloudStrmHelper(_PluginBase):
                                                  {
                                                      "component": "VCol", "props": {"cols": 12, "md": 3},
                                                      "content": [{"component": "VSwitch", "props": {
-                                                         "model": "once_sync", "label": "立即全量上传并生成 STRM",
-                                                         "hint": "保存后触发一次全量扫描→上传→STRM",
-                                                         "persistent-hint": False,
-                                                     }}],
-                                                 },
-                                                 {
-                                                     "component": "VCol", "props": {"cols": 12, "md": 3},
-                                                     "content": [{"component": "VSwitch", "props": {
                                                          "model": "notify_enabled", "label": "任务完成通知",
                                                          "hint": "通过 MP 通知同步结果", "persistent-hint": False,
                                                      }}],
@@ -2179,6 +2322,45 @@ class CloudStrmHelper(_PluginBase):
                                                          "model": "upload_concurrency", "label": "上传并发数",
                                                          "placeholder": "3", "type": "number",
                                                          "hint": "并发上传文件数", "persistent-hint": False,
+                                                     }}],
+                                                 },
+                                             ],
+                                         },
+                                         {"component": "div", "props": {"class": "text-h6 mb-4 mt-6"}, "text": "立即同步"},
+                                         {
+                                             "component": "VRow",
+                                             "props": {"class": "mb-4"},
+                                             "content": [
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 3},
+                                                     "content": [{"component": "VSwitch", "props": {
+                                                         "model": "once_upload_full", "label": "全量上传云端",
+                                                         "hint": "扫描全部候选并尝试上传，远端已存在由上传阶段跳过",
+                                                         "persistent-hint": False,
+                                                     }}],
+                                                 },
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 3},
+                                                     "content": [{"component": "VSwitch", "props": {
+                                                         "model": "once_upload_incremental", "label": "增量上传云端",
+                                                         "hint": "扫描全部候选，只上传远端缺失文件",
+                                                         "persistent-hint": False,
+                                                     }}],
+                                                 },
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 3},
+                                                     "content": [{"component": "VSwitch", "props": {
+                                                         "model": "once_strm_full", "label": "全量生成 STRM",
+                                                         "hint": "扫描全部候选，按覆盖模式生成 STRM",
+                                                         "persistent-hint": False,
+                                                     }}],
+                                                 },
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 3},
+                                                     "content": [{"component": "VSwitch", "props": {
+                                                         "model": "once_strm_incremental", "label": "增量生成 STRM",
+                                                         "hint": "扫描全部候选，只生成缺失的 STRM",
+                                                         "persistent-hint": False,
                                                      }}],
                                                  },
                                              ],
@@ -2428,6 +2610,10 @@ class CloudStrmHelper(_PluginBase):
             "_tabs": "base",
             "enabled": False,
             "once_sync": False,
+            "once_upload_full": False,
+            "once_upload_incremental": False,
+            "once_strm_full": False,
+            "once_strm_incremental": False,
             "notify_enabled": True,
             "upload_concurrency": 3,
             "moviepilot_address": DEFAULT_MOVIEPILOT_ADDRESS,

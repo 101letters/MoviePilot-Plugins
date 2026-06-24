@@ -475,7 +475,7 @@ class TestPluginMetadata(unittest.TestCase):
     def test_metadata_present(self):
         from cloudstrmhelper import CloudStrmHelper
         self.assertEqual(CloudStrmHelper.plugin_name, "云端STRM整理助手")
-        self.assertEqual(CloudStrmHelper.plugin_version, "1.5.5")
+        self.assertEqual(CloudStrmHelper.plugin_version, "1.5.6")
         self.assertEqual(CloudStrmHelper.plugin_config_prefix, "cloudstrmhelper_")
         self.assertEqual(CloudStrmHelper.plugin_author, "101letters")
         self.assertEqual(CloudStrmHelper.auth_level, 1)
@@ -513,6 +513,10 @@ class TestPluginMetadata(unittest.TestCase):
         self.assertEqual(defaults["emby_proxy_port"], 8095)
         self.assertEqual(defaults["manual_upload_action"], "none")
         self.assertFalse(defaults["manual_execute"])
+        self.assertFalse(defaults["once_upload_full"])
+        self.assertFalse(defaults["once_upload_incremental"])
+        self.assertFalse(defaults["once_strm_full"])
+        self.assertFalse(defaults["once_strm_incremental"])
         # v1.5.3: 配置页拆 4 Tab，_tabs 默认指向第一个 Tab；手动处理卡片已移除（字段保留兼容旧配置）
         # v1.5.6: 去掉外层 VCard，form[0]=VTabs, form[1]=VWindow
         self.assertEqual(defaults["_tabs"], "base")
@@ -535,6 +539,23 @@ class TestPluginMetadata(unittest.TestCase):
             return titles
         all_titles = [t for it in vwindow["content"] for t in _section_titles(it)]
         self.assertNotIn("手动处理", all_titles)
+        self.assertIn("立即同步", all_titles)
+        def _labels(node):
+            labels = []
+            if isinstance(node, dict):
+                props = node.get("props") or {}
+                if "label" in props:
+                    labels.append(props["label"])
+                for v in node.values():
+                    if isinstance(v, (list, dict)):
+                        labels.extend(_labels(v))
+            elif isinstance(node, list):
+                for v in node:
+                    labels.extend(_labels(v))
+            return labels
+        all_labels = _labels(vwindow)
+        for label in ("全量上传云端", "增量上传云端", "全量生成 STRM", "增量生成 STRM"):
+            self.assertIn(label, all_labels)
         # 配置页 Tab 内不应有 VCard 边框容器
         def _has_vcard(node):
             if isinstance(node, dict):
@@ -560,6 +581,16 @@ class TestPluginMetadata(unittest.TestCase):
         self.assertIn("/diagnose", paths)
         self.assertIn("/sync_now", paths)
         self.assertIn("/manual_action", paths)
+
+    def test_sync_now_action_mapping(self):
+        from cloudstrmhelper import CloudStrmHelper
+        plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+        self.assertEqual(plugin._resolve_sync_action("")[0], "legacy_sync")
+        self.assertEqual(plugin._resolve_sync_action("upload_full")[0], "upload_full")
+        self.assertEqual(plugin._resolve_sync_action("upload_incremental")[0], "upload_incremental")
+        self.assertEqual(plugin._resolve_sync_action("strm_full")[0], "strm_full")
+        self.assertEqual(plugin._resolve_sync_action("strm_incremental")[0], "strm_incremental")
+        self.assertIsNone(plugin._resolve_sync_action("bad_action")[2])
 
     def test_manual_action_endpoint_registered_with_apikey(self):
         from cloudstrmhelper import CloudStrmHelper
@@ -786,6 +817,37 @@ class TestPathComputation(unittest.TestCase):
             plugin._strm_output_path_from_remote("/123云盘/影视/华语电影/Show/S01E01.mkv"),
             Path("/strm/movies/Show/S01E01.strm"),
         )
+
+    def test_incremental_strm_generation_skips_existing(self):
+        from cloudstrmhelper import CloudStrmHelper
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+            root = Path(tmp) / "media"
+            strm_root = Path(tmp) / "strm"
+            media_dir = root / "Foo"
+            strm_dir = strm_root / "Foo"
+            media_dir.mkdir(parents=True)
+            strm_dir.mkdir(parents=True)
+            media_file = media_dir / "Foo.mkv"
+            media_file.write_bytes(b"movie")
+            strm_file = strm_dir / "Foo.strm"
+            strm_file.write_text("old", encoding="utf-8")
+
+            plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+            plugin._strm_gen = object()
+            plugin._strm_path_mappings_explicit = False
+            plugin._local_strm_mappings = [(str(root), str(strm_root))]
+            plugin._strm_mappings = []
+            plugin._overwrite_mode = "always"
+            plugin._generate_one_strm = MagicMock(side_effect=AssertionError("should not rewrite existing STRM"))
+
+            ok, fail, skipped = plugin._generate_strm_for_media_items(
+                [(str(media_file), "/cloud/Foo/Foo.mkv", None, None)],
+                incremental=True,
+                cleanup_after_move=False,
+                label="增量生成 STRM",
+            )
+
+        self.assertEqual((ok, fail, skipped), (0, 0, 1))
 
     def test_strm_path_uses_matching_local_mapping(self):
         plugin = self._make_plugin()
@@ -1605,6 +1667,10 @@ class TestNewConfigPersistence(unittest.TestCase):
         plugin._rmt_mediaext = ["mkv"]
         plugin._upload_concurrency = 3
         plugin._once_sync = False
+        plugin._once_upload_full = False
+        plugin._once_upload_incremental = False
+        plugin._once_strm_full = False
+        plugin._once_strm_incremental = False
         plugin._strm_url_mode = "moviepilot_redirect"
         plugin._resolve_final_url = True
         plugin._direct_link_mode = "prefer_raw_url"
@@ -1628,6 +1694,8 @@ class TestNewConfigPersistence(unittest.TestCase):
             "strm_url_mode", "resolve_final_url", "direct_link_mode",
             "redirect_cache_ttl", "head_probe_mode", "sse_enabled",
             "manual_upload_action", "manual_execute",
+            "once_upload_full", "once_upload_incremental",
+            "once_strm_full", "once_strm_incremental",
         ):
             self.assertIn(key, captured, f"{key} 未持久化")
 

@@ -2,7 +2,7 @@
 
 MoviePilot V2 插件：监听 MoviePilot 整理完成/入库完成消息，按顺序上传到 AList/OpenList，基于云端路径生成 STRM，并刷新 Emby/Jellyfin 入库。
 
-> 版本：1.5.5
+> 版本：1.5.6
 
 ## 执行链路
 
@@ -196,7 +196,7 @@ Emby 原始地址: http://192.168.31.6:8096
 
 配置页按功能拆分为 4 个 Tab，每 Tab 一屏，避免长页面滚动查找：
 
-1. **基础设置**：启用、立刻全量同步、任务完成通知、上传并发数
+1. **基础设置**：启用、任务完成通知、上传并发数、四个立即同步动作
 2. **播放设置**：Emby 302 前置代理（启用开关、Emby 原始地址、代理监听地址、代理监听端口）
 3. **路径设置**：云端存储设置（云存储类型、AList/OpenList 地址、Token）+ 上传与 STRM 路径映射（上传映射、STRM 映射）
 4. **同步设置**：同步与过滤（同步模式、STRM 覆盖模式、媒体扩展名、排除规则、事件路径过滤）+ 媒体服务器刷新（刷新开关、媒体服务器选择、路径映射）
@@ -212,6 +212,13 @@ STRM 覆盖模式：
 
 - `从不`：已有 STRM 直接跳过。
 - `总是`：重新写入已有 STRM。
+
+立即同步动作：
+
+- `全量上传云端`：扫描全部候选媒体并尝试上传；远端已存在时由上传阶段跳过，不覆盖云端文件。
+- `增量上传云端`：扫描全部候选媒体，先按远端目录缓存判断，只上传云端缺失文件。
+- `全量生成 STRM`：扫描全部候选媒体，按当前 STRM 覆盖模式生成 `.strm`。
+- `增量生成 STRM`：扫描全部候选媒体，只生成本地缺失的 `.strm`，不会因同步模式为“移动”而删除本地媒体文件。
 
 ## 首页统计面板
 
@@ -279,7 +286,7 @@ uvicorn
 7. 旧 `/redirect` STRM 或 Infuse/Fileball 的 HEAD 探测应按 `head_probe_mode` 返回（默认 200），GET 才 302。
 8. 如启用 Emby 302 前置代理，把客户端服务器地址改为代理端口，访问 `/System/Info/Public` 应能正常回源，播放时代理日志应出现 `【Emby302代理】` 相关解析记录。
 
-也可以在配置中勾选「立刻全量同步」，或调用 `/api/v1/plugin/CloudStrmHelper/sync_now` 触发一次全量同步。
+也可以在配置中勾选对应的立即同步动作；旧调用 `/api/v1/plugin/CloudStrmHelper/sync_now` 仍触发一次“全量扫描→增量上传→生成 STRM”的兼容同步。需要分离执行时可传 `action`：`upload_full`、`upload_incremental`、`strm_full`、`strm_incremental`。
 
 ## API
 
@@ -289,7 +296,7 @@ uvicorn
 | `/status` | `GET` | 查看同步队列状态 |
 | `/diagnose` | `GET` | 查看脱敏配置、模块状态、302 状态、路径映射和统计 |
 | `/diagnose?probe=true` | `GET` | 在诊断基础上只读探测 AList/OpenList Token/地址/fs_get（不输出 raw_url/sign 完整内容） |
-| `/sync_now` | `GET/POST` | 手动触发一次全量同步 |
+| `/sync_now` | `GET/POST` | 手动触发同步；不带 `action` 为兼容全量扫描同步，`action` 支持 `upload_full`、`upload_incremental`、`strm_full`、`strm_incremental` |
 | `/manual_action` | `POST` | 首页列表内单条操作，请求 body 为 JSON：`action`（`reupload`/`delete_remote`/`delete_remote_and_local`/`regenerate_strm`/`delete_strm`）、`local`、`remote`、`strm`；后台线程执行真实任务并返回 `{state, message}` |
 | `/clear_upload_history` | `POST` | 清除最近上传历史记录（仅清除记录，不删除云端/本地文件） |
 | `/clear_strm_history` | `POST` | 清除最近 STRM 生成历史记录（仅清除记录，不删除 .strm 文件） |
