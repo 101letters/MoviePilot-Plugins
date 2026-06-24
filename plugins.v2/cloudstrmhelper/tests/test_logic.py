@@ -1119,6 +1119,7 @@ class TestEmby302Proxy(unittest.TestCase):
                 "Path": "/media/movies/Foo.mkv",
                 "SupportsTranscoding": True,
                 "TranscodingUrl": "/videos/123/master.m3u8",
+                "MediaStreams": [{"Type": "Video"}, {"Type": "Audio"}],
             }]
         }
 
@@ -1129,11 +1130,65 @@ class TestEmby302Proxy(unittest.TestCase):
         self.assertTrue(source["SupportsDirectPlay"])
         self.assertTrue(source["SupportsDirectStream"])
         self.assertFalse(source["SupportsTranscoding"])
+        self.assertEqual(source["Protocol"], "Http")
+        self.assertEqual(source["Container"], "mkv")
+        self.assertTrue(source["SupportsExternalStream"])
+        self.assertTrue(source["MediaStreams"][0]["SupportsExternalStream"])
         self.assertEqual(
             source["DirectStreamUrl"],
-            "/videos/123/stream?MediaSourceId=ms1&Static=true&api_key=token",
+            "/videos/123/stream.mkv?MediaSourceId=ms1&Static=true&api_key=token",
         )
         self.assertNotIn("TranscodingUrl", source)
+
+    def test_patch_playback_info_uses_strm_target_container(self):
+        from cloudstrmhelper.emby_proxy import Emby302Proxy
+        plugin = self._make_plugin()
+        proxy = Emby302Proxy(plugin, "http://emby:8096")
+
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+            strm = Path(tmp) / "Foo.strm"
+            strm.write_text("/cloud/movies/Foo.mp4\n", encoding="utf-8")
+            data = {
+                "MediaSources": [{
+                    "Id": "ms1",
+                    "Path": str(strm),
+                    "Container": "strm",
+                    "SupportsTranscoding": True,
+                }]
+            }
+
+            patched, count = proxy.patch_playback_info(data, item_id="123", api_key="")
+
+        source = patched["MediaSources"][0]
+        self.assertEqual(count, 1)
+        self.assertEqual(source["Container"], "mp4")
+        self.assertEqual(source["Protocol"], "Http")
+        self.assertEqual(
+            source["DirectStreamUrl"],
+            "/videos/123/stream.mp4?MediaSourceId=ms1&Static=true",
+        )
+
+    def test_patch_playback_info_infers_container_from_redirect_path_query(self):
+        from cloudstrmhelper.emby_proxy import Emby302Proxy
+        plugin = self._make_plugin()
+        proxy = Emby302Proxy(plugin, "http://emby:8096")
+        data = {
+            "MediaSources": [{
+                "Id": "ms1",
+                "Path": "http://mp:3000/api/v1/plugin/CloudStrmHelper/redirect?path=/cloud/movies/Foo.mkv",
+                "Container": "strm",
+            }]
+        }
+
+        patched, count = proxy.patch_playback_info(data, item_id="123", api_key="")
+
+        source = patched["MediaSources"][0]
+        self.assertEqual(count, 1)
+        self.assertEqual(source["Container"], "mkv")
+        self.assertEqual(
+            source["DirectStreamUrl"],
+            "/videos/123/stream.mkv?MediaSourceId=ms1&Static=true",
+        )
 
     def test_resolve_local_strm_cloud_path_to_direct_link(self):
         from cloudstrmhelper.emby_proxy import Emby302Proxy
