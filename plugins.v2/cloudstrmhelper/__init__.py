@@ -48,6 +48,9 @@ DEFAULT_STRM_PATH_MAPPINGS = (
 DEFAULT_EXCLUDE_PATTERNS = "*.tmp\n**/.DS_Store\n/sample/**"
 DEFAULT_EVENT_FILTERS = "/media/movies\n/media/tv"
 DEFAULT_PATH_MAPPING = "/media#/data"
+DEFAULT_EMBY_SERVER_URL = "http://192.168.31.6:8096"
+DEFAULT_EMBY_PROXY_HOST = "0.0.0.0"
+DEFAULT_EMBY_PROXY_PORT = 8095
 
 
 class CloudStrmHelper(_PluginBase):
@@ -55,10 +58,10 @@ class CloudStrmHelper(_PluginBase):
 
     # ---- 插件元数据（类属性；V2 索引同时写入仓库根 package.v2.json，version 须一致）----
     plugin_name = "云端STRM整理助手"
-    plugin_desc = "整理入库自动复制到AList并生成STRM，Emby 302直链播放"
+    plugin_desc = "整理入库自动复制到AList并生成STRM，支持轻量/Emby前置302直链播放"
     # 图标：引用仓库 icons 目录下的图标文件（URL 形式，与官方插件一致）
     plugin_icon = "https://raw.githubusercontent.com/101letters/MoviePilot-Plugins/main/icons/cloudstrmhelper.png"
-    plugin_version = "1.4.0"
+    plugin_version = "1.5.0"
     plugin_author = "101letters"
     author_url = "https://github.com/101letters"
     plugin_config_prefix = "cloudstrmhelper_"
@@ -101,6 +104,10 @@ class CloudStrmHelper(_PluginBase):
     _direct_link_mode = "prefer_raw_url"
     _redirect_cache_ttl = 120
     _head_probe_mode = "ok"
+    _emby_proxy_enabled = False
+    _emby_server_url = ""
+    _emby_proxy_host = DEFAULT_EMBY_PROXY_HOST
+    _emby_proxy_port = DEFAULT_EMBY_PROXY_PORT
 
     _scheduler: Optional[BackgroundScheduler] = None
     _alist_client = None
@@ -109,6 +116,8 @@ class CloudStrmHelper(_PluginBase):
     _proxy: Optional[ProxyHandler] = None
     _listener: Optional[TransferListener] = None
     _sse_listener: Optional[MoviePilotSseListener] = None
+    _emby_proxy_server = None
+    _emby_proxy_thread: Optional[threading.Thread] = None
     _sync_lock = threading.Lock()
     _stats: Dict[str, Any] = {}
 
@@ -172,6 +181,15 @@ class CloudStrmHelper(_PluginBase):
                 self._redirect_cache_ttl = 120
             self._head_probe_mode = self._normalize_head_probe_mode(
                 config.get("head_probe_mode") or "ok")
+            self._emby_proxy_enabled = bool(config.get("emby_proxy_enabled", False))
+            self._emby_server_url = (config.get("emby_server_url") or "").strip().rstrip("/")
+            self._emby_proxy_host = (
+                config.get("emby_proxy_host") or DEFAULT_EMBY_PROXY_HOST
+            ).strip()
+            try:
+                self._emby_proxy_port = max(1, int(config.get("emby_proxy_port") or DEFAULT_EMBY_PROXY_PORT))
+            except (TypeError, ValueError):
+                self._emby_proxy_port = DEFAULT_EMBY_PROXY_PORT
             self._update_config()
 
         # 配置变更后重建 302 缓存（TTL 可配置）
@@ -205,10 +223,11 @@ class CloudStrmHelper(_PluginBase):
             return
 
         # 校验必填
-        if not self._upload_mappings:
+        proxy_only = bool(self._emby_proxy_enabled and self._emby_server_url)
+        if not self._upload_mappings and not proxy_only:
             logger.warning("【云端STRM】未配置上传路径映射，插件不启动")
             return
-        if not self._strm_mappings and not self._local_strm_mappings:
+        if not self._strm_mappings and not self._local_strm_mappings and not proxy_only:
             logger.warning("【云端STRM】未配置 STRM 路径映射，插件不启动")
             return
 
@@ -238,6 +257,8 @@ class CloudStrmHelper(_PluginBase):
         logger.info("【云端STRM】插件已启动：storage=%s, sync=%s, 并发=%d, SSE=on",
                     self._cloud_storage_type, self._sync_mode, self._upload_concurrency)
 
+        self._start_emby_proxy_service()
+
         # 一次性全量同步
         if self._once_sync:
             self._once_sync = False
@@ -253,6 +274,60 @@ class CloudStrmHelper(_PluginBase):
             return AlistClient(self._alist_url, self._alist_token)
         else:
             raise Exception(f"未知云端存储类型: {st}")
+
+    def _start_emby_proxy_service(self) -> None:
+        """启动 qmediasync 风格的 Emby 302 前置代理。"""
+        if not self._emby_proxy_enabled:
+            return
+        if not self._emby_server_url:
+            logger.warning("【Emby302代理】未配置 Emby 原始地址，代理不启动")
+            return
+        try:
+            import uvicorn
+            from .emby_proxy import create_emby_proxy_app
+
+            app = create_emby_proxy_app(self, self._emby_server_url)
+            config = uvicorn.Config(
+                app=app,
+                host=self._emby_proxy_host,
+                port=self._emby_proxy_port,
+                log_config=None,
+                access_log=False,
+            )
+            self._emby_proxy_server = uvicorn.Server(config)
+            self._emby_proxy_thread = threading.Thread(
+                target=self._emby_proxy_server.run,
+                daemon=True,
+                name="CloudStrmEmbyProxy",
+            )
+            self._emby_proxy_thread.start()
+            logger.info(
+                "【Emby302代理】已启动: listen=%s:%s, origin=%s",
+                self._emby_proxy_host,
+                self._emby_proxy_port,
+                self._emby_server_url,
+            )
+        except Exception as e:
+            self._emby_proxy_server = None
+            self._emby_proxy_thread = None
+            logger.error(f"【Emby302代理】启动失败: {e}", exc_info=True)
+
+    def _stop_emby_proxy_service(self) -> None:
+        """停止 Emby 302 前置代理。"""
+        server = self._emby_proxy_server
+        thread = self._emby_proxy_thread
+        if server:
+            try:
+                server.should_exit = True
+            except Exception:
+                pass
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            try:
+                thread.join(timeout=5)
+            except Exception:
+                pass
+        self._emby_proxy_server = None
+        self._emby_proxy_thread = None
 
     def _schedule_once_sync(self) -> None:
         """立刻全量同步：用 date 触发器 3s 后跑一次。"""
@@ -278,6 +353,10 @@ class CloudStrmHelper(_PluginBase):
 
     def stop_service(self) -> None:
         """停止所有服务：scheduler + cloud_sync 队列。"""
+        try:
+            self._stop_emby_proxy_service()
+        except Exception as e:
+            logger.error(f"【云端STRM】停止 Emby 302 代理失败: {e}")
         try:
             if self._sse_listener:
                 self._sse_listener.stop()
@@ -1161,6 +1240,10 @@ class CloudStrmHelper(_PluginBase):
                 "direct_link_mode": self._direct_link_mode,
                 "redirect_cache_ttl": self._redirect_cache_ttl,
                 "head_probe_mode": self._head_probe_mode,
+                "emby_proxy_enabled": self._emby_proxy_enabled,
+                "emby_server_url": self._emby_server_url,
+                "emby_proxy_host": self._emby_proxy_host,
+                "emby_proxy_port": self._emby_proxy_port,
             },
             "modules": {
                 "sse_listener": bool(self._sse_listener),
@@ -1168,6 +1251,7 @@ class CloudStrmHelper(_PluginBase):
                 "cloud_sync": bool(self._cloud_sync),
                 "strm_generator": bool(self._strm_gen),
                 "proxy": bool(self._proxy),
+                "emby_proxy": bool(self._emby_proxy_server),
             },
             "redirect": {
                 "strm_url_mode": self._strm_url_mode,
@@ -1177,6 +1261,12 @@ class CloudStrmHelper(_PluginBase):
                 "head_probe_mode": self._head_probe_mode,
                 "redirect_cache_size": len(self._redirect_cache),
                 "redirect_error_cache_size": len(self._redirect_error_cache),
+                "emby_proxy_enabled": self._emby_proxy_enabled,
+                "emby_proxy_running": bool(self._emby_proxy_server),
+                "emby_proxy_listen": (
+                    f"{self._emby_proxy_host}:{self._emby_proxy_port}"
+                    if self._emby_proxy_enabled else ""
+                ),
             },
             "local_roots": [
                 {"path": root, "exists": os.path.exists(root), "is_dir": os.path.isdir(root)}
@@ -1399,6 +1489,10 @@ class CloudStrmHelper(_PluginBase):
             "direct_link_mode": self._direct_link_mode,
             "redirect_cache_ttl": self._redirect_cache_ttl,
             "head_probe_mode": self._head_probe_mode,
+            "emby_proxy_enabled": self._emby_proxy_enabled,
+            "emby_server_url": self._emby_server_url,
+            "emby_proxy_host": self._emby_proxy_host,
+            "emby_proxy_port": self._emby_proxy_port,
         })
 
     @staticmethod
@@ -1573,7 +1667,67 @@ class CloudStrmHelper(_PluginBase):
                     },
                 ],
             },
-            # 3. 云端存储设置
+            # 3. Emby 302 前置代理
+            {
+                "component": "VCard",
+                "props": {"variant": "outlined", "class": "mb-3"},
+                "content": [
+                    {
+                        "component": "VCardTitle",
+                        "content": [
+                            {"component": "VIcon", "props": {"icon": "mdi-swap-horizontal", "color": "primary", "class": "mr-2"}},
+                            {"component": "span", "text": "Emby 302 前置代理"},
+                        ],
+                    },
+                    {"component": "VDivider"},
+                    {
+                        "component": "VCardText",
+                        "content": [
+                            {
+                                "component": "VRow",
+                                "content": [
+                                    {
+                                        "component": "VCol", "props": {"cols": 12, "md": 3},
+                                        "content": [{"component": "VSwitch", "props": {
+                                            "model": "emby_proxy_enabled", "label": "启用 Emby 302 代理",
+                                            "hint": "按 qmediasync 方式代理 Emby 请求，拦截 PlaybackInfo 与播放流请求",
+                                            "persistent-hint": True,
+                                        }}],
+                                    },
+                                    {
+                                        "component": "VCol", "props": {"cols": 12, "md": 3},
+                                        "content": [{"component": "VTextField", "props": {
+                                            "model": "emby_server_url", "label": "Emby 原始地址",
+                                            "placeholder": DEFAULT_EMBY_SERVER_URL,
+                                            "hint": "真实 Emby 服务地址，客户端改连下面的代理端口",
+                                            "persistent-hint": True,
+                                        }}],
+                                    },
+                                    {
+                                        "component": "VCol", "props": {"cols": 12, "md": 3},
+                                        "content": [{"component": "VTextField", "props": {
+                                            "model": "emby_proxy_host", "label": "代理监听地址",
+                                            "placeholder": DEFAULT_EMBY_PROXY_HOST,
+                                            "hint": "通常保持 0.0.0.0",
+                                            "persistent-hint": True,
+                                        }}],
+                                    },
+                                    {
+                                        "component": "VCol", "props": {"cols": 12, "md": 3},
+                                        "content": [{"component": "VTextField", "props": {
+                                            "model": "emby_proxy_port", "label": "代理监听端口",
+                                            "placeholder": str(DEFAULT_EMBY_PROXY_PORT), "type": "number",
+                                            "hint": "客户端访问该端口，例如 http://主机:8095",
+                                            "persistent-hint": True,
+                                        }}],
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+            # 4. 云端存储设置
             {
                 "component": "VCard",
                 "props": {"variant": "outlined", "class": "mb-3"},
@@ -1621,7 +1775,7 @@ class CloudStrmHelper(_PluginBase):
                     },
                 ],
             },
-            # 4. 上传与 STRM 路径映射
+            # 5. 上传与 STRM 路径映射
             {
                 "component": "VCard",
                 "props": {"variant": "outlined", "class": "mb-3"},
@@ -1673,7 +1827,7 @@ class CloudStrmHelper(_PluginBase):
                     },
                 ],
             },
-            # 5. 同步与过滤
+            # 6. 同步与过滤
             {
                 "component": "VCard",
                 "props": {"variant": "outlined", "class": "mb-3"},
@@ -1753,7 +1907,7 @@ class CloudStrmHelper(_PluginBase):
                     },
                 ],
             },
-            # 6. 媒体服务器刷新
+            # 7. 媒体服务器刷新
             {
                 "component": "VCard",
                 "props": {"variant": "outlined"},
@@ -1818,6 +1972,10 @@ class CloudStrmHelper(_PluginBase):
             "direct_link_mode": "prefer_raw_url",
             "redirect_cache_ttl": 120,
             "head_probe_mode": "ok",
+            "emby_proxy_enabled": False,
+            "emby_server_url": DEFAULT_EMBY_SERVER_URL,
+            "emby_proxy_host": DEFAULT_EMBY_PROXY_HOST,
+            "emby_proxy_port": DEFAULT_EMBY_PROXY_PORT,
             "cloud_storage_type": "alist",
             "alist_url": DEFAULT_ALIST_URL,
             "alist_token": "",

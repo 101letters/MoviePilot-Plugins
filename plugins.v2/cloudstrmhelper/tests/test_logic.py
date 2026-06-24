@@ -35,11 +35,12 @@ def _stub_app_modules():
     _stub("apscheduler.triggers.cron", {"CronTrigger": MagicMock})
 
     # fastapi
-    fastapi = _stub("fastapi", {"Request": MagicMock})
+    fastapi = _stub("fastapi", {"FastAPI": MagicMock, "Request": MagicMock})
     _stub("fastapi.responses", {
         "RedirectResponse": MagicMock,
         "JSONResponse": MagicMock,
         "Response": MagicMock,
+        "StreamingResponse": MagicMock,
     })
     # pydantic（fastapi 间接依赖，本机若有则不覆盖）
     try:
@@ -462,7 +463,7 @@ class TestPluginMetadata(unittest.TestCase):
     def test_metadata_present(self):
         from cloudstrmhelper import CloudStrmHelper
         self.assertEqual(CloudStrmHelper.plugin_name, "云端STRM整理助手")
-        self.assertEqual(CloudStrmHelper.plugin_version, "1.4.0")
+        self.assertEqual(CloudStrmHelper.plugin_version, "1.5.0")
         self.assertEqual(CloudStrmHelper.plugin_config_prefix, "cloudstrmhelper_")
         self.assertEqual(CloudStrmHelper.plugin_author, "101letters")
         self.assertEqual(CloudStrmHelper.auth_level, 1)
@@ -492,6 +493,10 @@ class TestPluginMetadata(unittest.TestCase):
         self.assertEqual(defaults["strm_output_path"], "/strm/test/华语电影")
         self.assertEqual(defaults["sync_mode"], "copy")
         self.assertEqual(defaults["direct_link_mode"], "prefer_raw_url")
+        self.assertFalse(defaults["emby_proxy_enabled"])
+        self.assertEqual(defaults["emby_server_url"], "http://192.168.31.6:8096")
+        self.assertEqual(defaults["emby_proxy_host"], "0.0.0.0")
+        self.assertEqual(defaults["emby_proxy_port"], 8095)
 
     def test_api_endpoints(self):
         from cloudstrmhelper import CloudStrmHelper
@@ -552,6 +557,11 @@ class TestPluginMetadata(unittest.TestCase):
         plugin._direct_link_mode = "prefer_raw_url"
         plugin._redirect_cache_ttl = 120
         plugin._head_probe_mode = "ok"
+        plugin._emby_proxy_enabled = True
+        plugin._emby_server_url = "http://emby:8096"
+        plugin._emby_proxy_host = "0.0.0.0"
+        plugin._emby_proxy_port = 8095
+        plugin._emby_proxy_server = object()
         plugin._stats = {"strm_count": 2, "last_strm_time": "2026-01-01 00:00:00", "recent_files": []}
 
         data = plugin._diagnostic_snapshot(probe=False)
@@ -561,6 +571,9 @@ class TestPluginMetadata(unittest.TestCase):
         self.assertEqual(data["mapping_sample"]["remote"], "/cloud/example.mkv")
         self.assertEqual(data["mapping_sample"]["strm"], "/strm/movies/example.strm")
         self.assertEqual(data["redirect"]["direct_link_mode"], "prefer_raw_url")
+        self.assertTrue(data["redirect"]["emby_proxy_enabled"])
+        self.assertTrue(data["redirect"]["emby_proxy_running"])
+        self.assertEqual(data["redirect"]["emby_proxy_listen"], "0.0.0.0:8095")
         self.assertEqual(data["phase_order"], ["listen", "sync", "strm", "refresh"])
 
 
@@ -692,6 +705,92 @@ class TestPathComputation(unittest.TestCase):
             plugin._sync_mode = "copy"
             plugin._cleanup_local_after_move(str(media_file))
             self.assertTrue(media_file.exists())
+
+
+class TestEmby302Proxy(unittest.TestCase):
+    def _make_plugin(self):
+        from cloudstrmhelper import CloudStrmHelper
+        plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+        plugin._upload_path_mappings = "/media/movies#/cloud/movies"
+        plugin._upload_mappings = [("/media/movies", "/cloud/movies")]
+        plugin._strm_path_mappings = "/cloud/movies#/strm/movies"
+        plugin._strm_mappings = [("/cloud/movies", "/strm/movies")]
+        plugin._alist_target_path = "/cloud"
+        return plugin
+
+    def test_qmediasync_route_patterns(self):
+        from cloudstrmhelper.emby_proxy import Emby302Proxy
+        self.assertTrue(Emby302Proxy.is_playback_info_request("/emby/Items/123/PlaybackInfo"))
+        self.assertTrue(Emby302Proxy.is_openlist_redirect_request("/emby/videos/123/stream.mkv"))
+        self.assertTrue(Emby302Proxy.is_openlist_redirect_request("/emby/audio/abc/universal"))
+        self.assertFalse(Emby302Proxy.is_openlist_redirect_request("/emby/videos/123/subtitles/1/stream.vtt"))
+        self.assertEqual(Emby302Proxy.item_id_from_path("/emby/videos/123/main.m3u8"), "123")
+        self.assertEqual(Emby302Proxy.item_id_from_path("/emby/items/456/download"), "456")
+
+    def test_local_media_path_maps_to_cloud_path(self):
+        from cloudstrmhelper.emby_proxy import Emby302Proxy
+        plugin = self._make_plugin()
+        proxy = Emby302Proxy(plugin, "http://emby:8096")
+        self.assertEqual(
+            proxy.remote_path_from_media_path("/media/movies/Foo/Foo.mkv"),
+            "/cloud/movies/Foo/Foo.mkv",
+        )
+        self.assertEqual(
+            proxy.remote_path_from_media_path("/cloud/movies/Foo/Foo.mkv"),
+            "/cloud/movies/Foo/Foo.mkv",
+        )
+
+    def test_patch_playback_info_to_direct_stream(self):
+        from cloudstrmhelper.emby_proxy import Emby302Proxy
+        plugin = self._make_plugin()
+        proxy = Emby302Proxy(plugin, "http://emby:8096")
+        data = {
+            "MediaSources": [{
+                "Id": "ms1",
+                "Path": "/media/movies/Foo.mkv",
+                "SupportsTranscoding": True,
+                "TranscodingUrl": "/videos/123/master.m3u8",
+            }]
+        }
+
+        patched, count = proxy.patch_playback_info(data, item_id="123", api_key="token")
+
+        source = patched["MediaSources"][0]
+        self.assertEqual(count, 1)
+        self.assertTrue(source["SupportsDirectPlay"])
+        self.assertTrue(source["SupportsDirectStream"])
+        self.assertFalse(source["SupportsTranscoding"])
+        self.assertEqual(
+            source["DirectStreamUrl"],
+            "/videos/123/stream?MediaSourceId=ms1&Static=true&api_key=token",
+        )
+        self.assertNotIn("TranscodingUrl", source)
+
+    def test_resolve_local_strm_cloud_path_to_direct_link(self):
+        from cloudstrmhelper.emby_proxy import Emby302Proxy
+        from cloudstrmhelper.proxy_handler import DirectLink
+
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+            strm = Path(tmp) / "Foo.strm"
+            strm.write_text("/cloud/movies/Foo.mkv\n", encoding="utf-8")
+
+            plugin = types.SimpleNamespace()
+            plugin._upload_mappings = []
+            plugin._strm_mappings = [("/cloud/movies", "/strm/movies")]
+            plugin._alist_target_path = "/cloud"
+            plugin._resolve_final_url = True
+            plugin._proxy = MagicMock()
+            plugin._proxy.resolve_link.return_value = DirectLink(
+                url="http://cdn.example.com/Foo.mkv?sig=1",
+                source="raw_url",
+            )
+
+            proxy = Emby302Proxy(plugin, "http://emby:8096")
+            link = proxy.resolve_media_path(str(strm), ua="Player")
+
+        self.assertEqual(link.url, "http://cdn.example.com/Foo.mkv?sig=1")
+        self.assertEqual(link.source, "raw_url")
+        plugin._proxy.resolve_link.assert_called_once_with("/cloud/movies/Foo.mkv", "Player")
 
 
 class TestCloudSyncPolicy(unittest.TestCase):
