@@ -14,6 +14,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from cachetools import TTLCache
 from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
+from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.core.event import Event, eventmanager
@@ -56,6 +57,43 @@ DEFAULT_EMBY_PROXY_PORT = 8095
 DEFAULT_STRM_URL_MODE = "alist_direct"
 
 
+class ManualActionParams(BaseModel):
+    """首页列表内单条操作的 POST body 参数。
+
+    前端 PageRender 对 POST 请求会把 events.click.params 作为请求 body 发送
+    (api.post(api_path, params))，端点必须用 Pydantic model 接收；
+    散落的 query 参数收不到 body —— 这是 v1.5.3 操作按钮“能点不执行”的根因。
+    """
+    action: str = Field("", description="reupload/delete_remote/delete_remote_and_local/regenerate_strm")
+    local: str = Field("", description="本地源文件路径（reupload/delete_remote_and_local 需要）")
+    remote: str = Field("", description="云端路径（所有动作都需要）")
+    strm: str = Field("", description="STRM 文件路径（regenerate_strm 需要）")
+
+    def to_payload(self) -> Dict[str, Any]:
+        """转换为 _manual_action_worker 期望的 action dict。"""
+        action = (self.action or "").strip().lower()
+        if action == "regenerate_strm":
+            return {"kind": "strm", "action": "regenerate_strm",
+                    "target": CloudStrmHelper._manual_entry_value(strm=self.strm or "", remote=self.remote or "")}
+        return {"kind": "upload", "action": action,
+                "target": CloudStrmHelper._manual_entry_value(local=self.local or "", remote=self.remote or "")}
+
+    def validate_action(self) -> Optional[str]:
+        """返回错误信息（None 表示通过）。"""
+        action = (self.action or "").strip().lower()
+        if action not in {"reupload", "delete_remote", "delete_remote_and_local", "regenerate_strm"}:
+            return f"未知动作: {action}"
+        if not (self.remote or "").strip():
+            return "缺少 remote 参数"
+        if action == "regenerate_strm":
+            if not (self.strm or "").strip():
+                return "缺少 strm 参数"
+        elif action in ("reupload", "delete_remote_and_local"):
+            if not (self.local or "").strip():
+                return "缺少 local 参数"
+        return None
+
+
 class CloudStrmHelper(_PluginBase):
     """云端STRM整理助手。"""
 
@@ -64,7 +102,7 @@ class CloudStrmHelper(_PluginBase):
     plugin_desc = "整理入库自动复制到AList并生成STRM，支持轻量/Emby前置302直链播放"
     # 图标：引用仓库 icons 目录下的图标文件（URL 形式，与官方插件一致）
     plugin_icon = "https://raw.githubusercontent.com/101letters/MoviePilot-Plugins/main/icons/cloudstrmhelper.png"
-    plugin_version = "1.5.3"
+    plugin_version = "1.5.4"
     plugin_author = "101letters"
     author_url = "https://github.com/101letters"
     plugin_config_prefix = "cloudstrmhelper_"
@@ -450,54 +488,76 @@ class CloudStrmHelper(_PluginBase):
 
         manual_api = f"plugin/{self.__class__.__name__}/manual_action?apikey={settings.API_TOKEN}"
 
-        def _action_btn(text, icon, params, color="primary", variant="tonal"):
-            """首页列表行内操作按钮：点击直接 POST /manual_action。"""
+        def _menu_item(text, icon, params, color="primary"):
+            """操作菜单项：VListItem，点击 POST /manual_action。"""
             return {
-                "component": "VBtn",
+                "component": "VListItem",
                 "props": {
-                    "size": "small", "variant": variant, "color": color,
-                    "prepend-icon": icon, "class": "mr-1",
+                    "base-color": color,
+                    "prepend-icon": icon,
+                    "title": text,
                 },
-                "text": text,
                 "events": {"click": {"api": manual_api, "method": "post", "params": params}},
             }
 
+        def _action_menu_cell(items):
+            """一个“操作”按钮，点击展开 VMenu 下拉显示 items。"""
+            if not items:
+                return {"component": "td", "props": {"class": "text-grey"}, "text": "-"}
+            return {
+                "component": "td",
+                "content": [{
+                    "component": "VBtn",
+                    "props": {
+                        "size": "small", "variant": "tonal", "color": "primary",
+                        "icon": "mdi-dots-horizontal", "density": "compact",
+                    },
+                    "content": [{
+                        "component": "VMenu",
+                        "props": {"activator": "parent", "close-on-content-click": True},
+                        "content": [{
+                            "component": "VList",
+                            "props": {"density": "compact", "nav": True},
+                            "content": items,
+                        }],
+                    }],
+                }],
+            }
+
         def _upload_action_cell(it):
-            """最近上传行：按记录字段渲染可用动作。"""
+            """最近上传行：按记录字段渲染可用动作菜单。"""
             local = it.get("local") or ""
             remote = it.get("remote") or ""
             status = it.get("status") or ""
-            btns = []
+            items = []
             # 重新上传：仅上传/跳过且有本地源文件路径
             if local and remote and status in ("uploaded", "skipped"):
-                btns.append(_action_btn(
+                items.append(_menu_item(
                     "重新上传", "mdi-upload-refresh",
                     {"action": "reupload", "local": local, "remote": remote}))
             # 删除云端：有云端路径即可
             if remote:
-                btns.append(_action_btn(
+                items.append(_menu_item(
                     "删除云端", "mdi-cloud-remove",
                     {"action": "delete_remote", "local": "", "remote": remote},
                     color="warning"))
             # 删除云端+本地：需要本地路径（后端再校验是否在上传映射内）
             if local and remote:
-                btns.append(_action_btn(
+                items.append(_menu_item(
                     "删云端和本地", "mdi-delete-forever",
                     {"action": "delete_remote_and_local", "local": local, "remote": remote},
                     color="error"))
-            if not btns:
-                return {"component": "td", "props": {"class": "text-grey"}, "text": "-"}
-            return {"component": "td", "content": btns}
+            return _action_menu_cell(items)
 
         def _strm_action_cell(it):
-            """最近 STRM 行：重新生成 STRM。"""
+            """最近 STRM 行：重新生成 STRM 菜单。"""
             strm = it.get("path") or ""
             remote = it.get("remote") or ""
             if strm and remote:
-                return {"component": "td", "content": [_action_btn(
+                return _action_menu_cell([_menu_item(
                     "重新生成 STRM", "mdi-file-refresh",
-                    {"action": "regenerate_strm", "local": "", "remote": remote, "strm": strm})]}
-            return {"component": "td", "props": {"class": "text-grey"}, "text": "-"}
+                    {"action": "regenerate_strm", "local": "", "remote": remote, "strm": strm})])
+            return _action_menu_cell([])
 
         # 最近上传表行
         upload_rows = [
@@ -834,10 +894,8 @@ class CloudStrmHelper(_PluginBase):
         except Exception as e:
             logger.error(f"【云端STRM】手动同步异常: {e}", exc_info=True)
 
-    def manual_action(self, request: Request = None,
-                      action: str = "", local: str = "",
-                      remote: str = "", strm: str = ""):
-        """单条手动处理端点（首页列表内操作调用）。
+    def manual_action(self, params: ManualActionParams):
+        """单条手动处理端点（首页列表内操作调用，POST body = ManualActionParams）。
 
         action:
           - reupload              : 先删云端再上传，并重新生成 STRM（需 local+remote）
@@ -845,30 +903,19 @@ class CloudStrmHelper(_PluginBase):
           - delete_remote_and_local: 删云端 + 删本地（需 local+remote，local 须在上传映射内）
           - regenerate_strm       : 重新生成 STRM（需 strm+remote）
 
-        复用 _manual_action_worker 的分派与校验；校验失败返回 400。
+        校验通过后启动后台线程执行真实任务（_manual_action_worker → AList/OpenList 操作）。
         """
         if not self._enabled:
             return JSONResponse({"state": False, "message": "插件未启用"}, status_code=400)
-        action = (action or "").strip().lower()
-        valid = {"reupload", "delete_remote", "delete_remote_and_local", "regenerate_strm"}
-        if action not in valid:
-            return JSONResponse({"state": False, "message": f"未知动作: {action}"}, status_code=400)
 
-        # 构造 action dict，复用 _manual_action_worker 的分派与校验
-        if action == "regenerate_strm":
-            if not (strm or "").strip() or not (remote or "").strip():
-                return JSONResponse({"state": False, "message": "缺少 strm 或 remote 参数"}, status_code=400)
-            payload = {"kind": "strm", "action": "regenerate_strm",
-                       "target": self._manual_entry_value(strm=strm, remote=remote)}
-        else:
-            if not (remote or "").strip():
-                return JSONResponse({"state": False, "message": "缺少 remote 参数"}, status_code=400)
-            if action in ("reupload", "delete_remote_and_local") and not (local or "").strip():
-                return JSONResponse({"state": False, "message": "缺少 local 参数"}, status_code=400)
-            payload = {"kind": "upload", "action": action,
-                       "target": self._manual_entry_value(local=local or "", remote=remote)}
+        # 1. 动作合法性 + 必填参数
+        err = params.validate_action()
+        if err:
+            return JSONResponse({"state": False, "message": err}, status_code=400)
 
-        # 校验在 worker 内同步执行前完成；先同步跑一次校验，失败立即返回 400
+        # 2. 路径范围校验（同步，失败立即 400，不启动线程）
+        payload = params.to_payload()
+        action = (params.action or "").strip().lower()
         try:
             if payload["kind"] == "strm":
                 self._decode_manual_strm_target(payload["target"])
@@ -878,13 +925,16 @@ class CloudStrmHelper(_PluginBase):
                 self._decode_manual_delete_target(
                     payload["target"], require_local=(action == "delete_remote_and_local"))
         except Exception as e:
+            logger.warning(f"【手动处理】单条操作校验失败: action={action}, err={e}")
             return JSONResponse({"state": False, "message": str(e)}, status_code=400)
 
+        # 3. 启动后台线程执行真实任务
         threading.Thread(
             target=self._manual_action_worker,
             args=(payload,), daemon=True,
             name="CloudStrmManualAction",
         ).start()
+        logger.info(f"【手动处理】已开始执行单条操作: action={action}, remote={params.remote}")
         return JSONResponse({"state": True, "message": f"已开始执行: {action}"})
 
     @staticmethod
@@ -1896,13 +1946,13 @@ class CloudStrmHelper(_PluginBase):
                         "props": {
                             "model": "_tabs",
                             "color": "primary",
-                            "class": "mb-3",
+                            "class": "mb-4",
                         },
                         "content": [
-                            {"component": "VTab", "props": {"value": "base"}, "text": "基础"},
-                            {"component": "VTab", "props": {"value": "play"}, "text": "播放 / 302"},
-                            {"component": "VTab", "props": {"value": "cloud"}, "text": "云存储 / 路径"},
-                            {"component": "VTab", "props": {"value": "sync"}, "text": "同步 / 刷新"},
+                            {"component": "VTab", "props": {"value": "base"}, "text": "基础设置"},
+                            {"component": "VTab", "props": {"value": "play"}, "text": "播放设置"},
+                            {"component": "VTab", "props": {"value": "cloud"}, "text": "路径设置"},
+                            {"component": "VTab", "props": {"value": "sync"}, "text": "同步设置"},
                         ],
                     },
                     {
@@ -1917,11 +1967,11 @@ class CloudStrmHelper(_PluginBase):
                                     # 1. 基础设置
                                     {
                 "component": "VCard",
-                "props": {"variant": "outlined", "class": "mb-3"},
+                "props": {"variant": "outlined", "class": "mb-4"},
                 "content": [
                     {
                         "component": "VCardTitle",
-                        "props": {"class": "d-flex align-center"},
+                        "props": {"class": "d-flex align-center py-3 px-4"},
                         "content": [
                             {"component": "VIcon", "props": {"icon": "mdi-cog", "color": "primary", "class": "mr-2"}},
                             {"component": "span", "text": "基础设置"},
@@ -1930,9 +1980,11 @@ class CloudStrmHelper(_PluginBase):
                     {"component": "VDivider"},
                     {
                         "component": "VCardText",
+                        "props": {"class": "pt-4 pb-2"},
                         "content": [
                             {
                                 "component": "VRow",
+                                "props": {"class": "mb-2"},
                                 "content": [
                                     {
                                         "component": "VCol", "props": {"cols": 12, "md": 3},
@@ -1967,6 +2019,7 @@ class CloudStrmHelper(_PluginBase):
                             },
                             {
                                 "component": "VRow",
+                                "props": {"class": "mb-2"},
                                 "content": [
                                     {
                                         "component": "VCol", "props": {"cols": 12, "md": 3},
@@ -1989,104 +2042,14 @@ class CloudStrmHelper(_PluginBase):
                                 "component": "VWindowItem",
                                 "props": {"value": "play"},
                                 "content": [
-            # 2. 播放入口设置
-            {
-                "component": "VCard",
-                "props": {"variant": "outlined", "class": "mb-3"},
-                "content": [
-                    {
-                        "component": "VCardTitle",
-                        "content": [
-                            {"component": "VIcon", "props": {"icon": "mdi-play-circle", "color": "primary", "class": "mr-2"}},
-                            {"component": "span", "text": "播放入口设置"},
-                        ],
-                    },
-                    {"component": "VDivider"},
-                    {
-                        "component": "VCardText",
-                        "content": [
-                            {
-                                "component": "VRow",
-                                "content": [
-                                    {
-                                        "component": "VCol", "props": {"cols": 12, "md": 6},
-                                        "content": [{"component": "VTextField", "props": {
-                                            "model": "moviepilot_address", "label": "MoviePilot 内网地址",
-                                            "placeholder": DEFAULT_MOVIEPILOT_ADDRESS,
-                                            "hint": "生成 STRM 内的 /redirect 播放入口 URL；留空用 MP_DOMAIN",
-                                            "persistent-hint": True,
-                                        }}],
-                                    },
-                                    {
-                                        "component": "VCol", "props": {"cols": 12, "md": 6},
-                                        "content": [{"component": "VSelect", "props": {
-                                            "model": "strm_url_mode", "label": "STRM URL 模式",
-                                            "items": [
-                                                {"title": "AList/OpenList /d 302 模式（推荐）", "value": "alist_direct"},
-                                                {"title": "云盘 raw_url 直链模式（实验）", "value": "cloud_raw_url"},
-                                            ],
-                                            "hint": "默认生成 /d/<媒体路径>，Emby 能识别媒体后缀；raw_url 模式直写云盘链接但可能过期",
-                                            "persistent-hint": True,
-                                        }}],
-                                    },
-                                ],
-                            },
-                            {
-                                "component": "VRow",
-                                "content": [
-                                    {
-                                        "component": "VCol", "props": {"cols": 12, "md": 3},
-                                        "content": [{"component": "VSwitch", "props": {
-                                            "model": "resolve_final_url", "label": "解析最终直链",
-                                            "hint": "HEAD 跟随上游重定向，把最终 URL 直接返回客户端", "persistent-hint": True,
-                                        }}],
-                                    },
-                                    {
-                                        "component": "VCol", "props": {"cols": 12, "md": 3},
-                                        "content": [{"component": "VSelect", "props": {
-                                            "model": "direct_link_mode", "label": "直链来源策略",
-                                            "items": [
-                                                {"title": "优先云盘 raw_url（推荐）", "value": "prefer_raw_url"},
-                                                {"title": "仅云盘 raw_url（严格零上行）", "value": "raw_url_only"},
-                                                {"title": "AList/OpenList /d 兼容", "value": "alist_download"},
-                                            ],
-                                            "hint": "严格模式没有 raw_url 时直接失败，避免回退到服务器下载端点",
-                                            "persistent-hint": True,
-                                        }}],
-                                    },
-                                    {
-                                        "component": "VCol", "props": {"cols": 12, "md": 3},
-                                        "content": [{"component": "VTextField", "props": {
-                                            "model": "redirect_cache_ttl", "label": "直链缓存时间（秒）",
-                                            "placeholder": "120", "type": "number",
-                                            "hint": "缓存 AList/OpenList 解析结果，降低 API 请求频率", "persistent-hint": True,
-                                        }}],
-                                    },
-                                    {
-                                        "component": "VCol", "props": {"cols": 12, "md": 3},
-                                        "content": [{"component": "VSelect", "props": {
-                                            "model": "head_probe_mode", "label": "HEAD 探测策略",
-                                            "items": [
-                                                {"title": "HEAD 返回 200（兼容模式）", "value": "ok"},
-                                                {"title": "HEAD 返回 302（严格模式）", "value": "redirect"},
-                                                {"title": "HEAD 解析但不跳转（诊断模式）", "value": "resolve"},
-                                            ],
-                                            "hint": "部分客户端先 HEAD 探测，默认返回 200 避免误判", "persistent-hint": True,
-                                        }}],
-                                    },
-                                ],
-                            },
-                        ],
-                    },
-                ],
-            },
             # 3. Emby 302 前置代理
             {
                 "component": "VCard",
-                "props": {"variant": "outlined", "class": "mb-3"},
+                "props": {"variant": "outlined", "class": "mb-4"},
                 "content": [
                     {
                         "component": "VCardTitle",
+                        "props": {"class": "py-3 px-4"},
                         "content": [
                             {"component": "VIcon", "props": {"icon": "mdi-swap-horizontal", "color": "primary", "class": "mr-2"}},
                             {"component": "span", "text": "Emby 302 前置代理"},
@@ -2095,9 +2058,11 @@ class CloudStrmHelper(_PluginBase):
                     {"component": "VDivider"},
                     {
                         "component": "VCardText",
+                        "props": {"class": "pt-4 pb-2"},
                         "content": [
                             {
                                 "component": "VRow",
+                                "props": {"class": "mb-2"},
                                 "content": [
                                     {
                                         "component": "VCol", "props": {"cols": 12, "md": 3},
@@ -2150,10 +2115,11 @@ class CloudStrmHelper(_PluginBase):
             # 5. 云端存储设置
             {
                 "component": "VCard",
-                "props": {"variant": "outlined", "class": "mb-3"},
+                "props": {"variant": "outlined", "class": "mb-4"},
                 "content": [
                     {
                         "component": "VCardTitle",
+                        "props": {"class": "py-3 px-4"},
                         "content": [
                             {"component": "VIcon", "props": {"icon": "mdi-cloud", "color": "primary", "class": "mr-2"}},
                             {"component": "span", "text": "云端存储设置"},
@@ -2162,9 +2128,11 @@ class CloudStrmHelper(_PluginBase):
                     {"component": "VDivider"},
                     {
                         "component": "VCardText",
+                        "props": {"class": "pt-4 pb-2"},
                         "content": [
                             {
                                 "component": "VRow",
+                                "props": {"class": "mb-2"},
                                 "content": [
                                     {
                                         "component": "VCol", "props": {"cols": 12, "md": 4},
@@ -2198,10 +2166,11 @@ class CloudStrmHelper(_PluginBase):
             # 6. 上传与 STRM 路径映射
             {
                 "component": "VCard",
-                "props": {"variant": "outlined", "class": "mb-3"},
+                "props": {"variant": "outlined", "class": "mb-4"},
                 "content": [
                     {
                         "component": "VCardTitle",
+                        "props": {"class": "py-3 px-4"},
                         "content": [
                             {"component": "VIcon", "props": {"icon": "mdi-folder-sync", "color": "primary", "class": "mr-2"}},
                             {"component": "span", "text": "上传与 STRM 路径映射"},
@@ -2210,9 +2179,11 @@ class CloudStrmHelper(_PluginBase):
                     {"component": "VDivider"},
                     {
                         "component": "VCardText",
+                        "props": {"class": "pt-4 pb-2"},
                         "content": [
                             {
                                 "component": "VRow",
+                                "props": {"class": "mb-2"},
                                 "content": [
                                     {
                                         "component": "VCol", "props": {"cols": 12},
@@ -2229,6 +2200,7 @@ class CloudStrmHelper(_PluginBase):
                             },
                             {
                                 "component": "VRow",
+                                "props": {"class": "mb-2"},
                                 "content": [
                                     {
                                         "component": "VCol", "props": {"cols": 12},
@@ -2257,10 +2229,11 @@ class CloudStrmHelper(_PluginBase):
             # 7. 同步与过滤
             {
                 "component": "VCard",
-                "props": {"variant": "outlined", "class": "mb-3"},
+                "props": {"variant": "outlined", "class": "mb-4"},
                 "content": [
                     {
                         "component": "VCardTitle",
+                        "props": {"class": "py-3 px-4"},
                         "content": [
                             {"component": "VIcon", "props": {"icon": "mdi-sync", "color": "primary", "class": "mr-2"}},
                             {"component": "span", "text": "同步与过滤"},
@@ -2269,9 +2242,11 @@ class CloudStrmHelper(_PluginBase):
                     {"component": "VDivider"},
                     {
                         "component": "VCardText",
+                        "props": {"class": "pt-4 pb-2"},
                         "content": [
                             {
                                 "component": "VRow",
+                                "props": {"class": "mb-2"},
                                 "content": [
                                     {
                                         "component": "VCol", "props": {"cols": 12, "md": 4},
@@ -2306,6 +2281,7 @@ class CloudStrmHelper(_PluginBase):
                             },
                             {
                                 "component": "VRow",
+                                "props": {"class": "mb-2"},
                                 "content": [{
                                     "component": "VCol", "props": {"cols": 12},
                                     "content": [{
@@ -2319,6 +2295,7 @@ class CloudStrmHelper(_PluginBase):
                             },
                             {
                                 "component": "VRow",
+                                "props": {"class": "mb-2"},
                                 "content": [{
                                     "component": "VCol", "props": {"cols": 12},
                                     "content": [{
@@ -2341,6 +2318,7 @@ class CloudStrmHelper(_PluginBase):
                 "content": [
                     {
                         "component": "VCardTitle",
+                        "props": {"class": "py-3 px-4"},
                         "content": [
                             {"component": "VIcon", "props": {"icon": "mdi-server-network", "color": "primary", "class": "mr-2"}},
                             {"component": "span", "text": "媒体服务器刷新"},
@@ -2349,9 +2327,11 @@ class CloudStrmHelper(_PluginBase):
                     {"component": "VDivider"},
                     {
                         "component": "VCardText",
+                        "props": {"class": "pt-4 pb-2"},
                         "content": [
                             {
                                 "component": "VRow",
+                                "props": {"class": "mb-2"},
                                 "content": [
                                     {
                                         "component": "VCol", "props": {"cols": 12, "md": 4},
@@ -2372,6 +2352,7 @@ class CloudStrmHelper(_PluginBase):
                             },
                             {
                                 "component": "VRow",
+                                "props": {"class": "mb-2"},
                                 "content": [{
                                     "component": "VCol", "props": {"cols": 12},
                                     "content": [{

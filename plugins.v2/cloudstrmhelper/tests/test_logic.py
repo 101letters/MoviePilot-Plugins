@@ -42,11 +42,23 @@ def _stub_app_modules():
         "Response": MagicMock,
         "StreamingResponse": MagicMock,
     })
-    # pydantic（fastapi 间接依赖，本机若有则不覆盖）
+    # pydantic（fastapi 间接依赖，本机若有则用真实的，否则用最小可用 stub）
     try:
         import pydantic  # noqa
     except Exception:
-        _stub("pydantic", {"BaseModel": MagicMock})
+        class _StubBaseModel:
+            def __init__(self, **kwargs):
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+
+            @classmethod
+            def model_validate(cls, data):
+                return cls(**data)
+
+        def _Field(default="", **kw):
+            return default
+
+        _stub("pydantic", {"BaseModel": _StubBaseModel, "Field": _Field})
 
     # cachetools（本机已装，跳过 stub 以用真实 TTLCache/cached）
 
@@ -463,7 +475,7 @@ class TestPluginMetadata(unittest.TestCase):
     def test_metadata_present(self):
         from cloudstrmhelper import CloudStrmHelper
         self.assertEqual(CloudStrmHelper.plugin_name, "云端STRM整理助手")
-        self.assertEqual(CloudStrmHelper.plugin_version, "1.5.3")
+        self.assertEqual(CloudStrmHelper.plugin_version, "1.5.4")
         self.assertEqual(CloudStrmHelper.plugin_config_prefix, "cloudstrmhelper_")
         self.assertEqual(CloudStrmHelper.plugin_author, "101letters")
         self.assertEqual(CloudStrmHelper.auth_level, 1)
@@ -787,7 +799,7 @@ class TestPathComputation(unittest.TestCase):
             )
 
     def _manual_action_plugin(self):
-        from cloudstrmhelper import CloudStrmHelper
+        from cloudstrmhelper import CloudStrmHelper, ManualActionParams
         plugin = CloudStrmHelper.__new__(CloudStrmHelper)
         plugin._enabled = True
         plugin._upload_mappings = [("/media/movies", "/cloud/movies")]
@@ -796,6 +808,11 @@ class TestPathComputation(unittest.TestCase):
         plugin._alist_target_path = "/cloud"
         plugin._strm_gen = None
         return plugin
+
+    @staticmethod
+    def _params(**kw):
+        from cloudstrmhelper import ManualActionParams
+        return ManualActionParams.model_validate(kw)
 
     def test_manual_action_rejects_unknown_action(self):
         plugin = self._manual_action_plugin()
@@ -806,7 +823,7 @@ class TestPathComputation(unittest.TestCase):
             return body
 
         with patch("cloudstrmhelper.JSONResponse", fake_json):
-            resp = plugin.manual_action(action="bogus", remote="/cloud/movies/x.mkv")
+            resp = plugin.manual_action(self._params(action="bogus", remote="/cloud/movies/x.mkv"))
         body, status = calls[-1]
         self.assertEqual(status, 400)
         self.assertFalse(body["state"])
@@ -815,7 +832,7 @@ class TestPathComputation(unittest.TestCase):
         plugin = self._manual_action_plugin()
         calls = []
         with patch("cloudstrmhelper.JSONResponse", lambda b, **kw: calls.append((b, kw.get("status_code", 200))) or b):
-            plugin.manual_action(action="delete_remote")
+            plugin.manual_action(self._params(action="delete_remote"))
         body, status = calls[-1]
         self.assertEqual(status, 400)
         self.assertFalse(body["state"])
@@ -825,7 +842,7 @@ class TestPathComputation(unittest.TestCase):
         calls = []
         with patch("cloudstrmhelper.JSONResponse", lambda b, **kw: calls.append((b, kw.get("status_code", 200))) or b):
             # remote 不在任何已配置云端根下 → 校验失败 400（不启动后台线程）
-            plugin.manual_action(action="delete_remote", remote="/other/x.mkv")
+            plugin.manual_action(self._params(action="delete_remote", remote="/other/x.mkv"))
         body, status = calls[-1]
         self.assertEqual(status, 400)
         self.assertFalse(body["state"])
@@ -847,11 +864,11 @@ class TestPathComputation(unittest.TestCase):
 
         with patch("cloudstrmhelper.JSONResponse", fake_json), \
              patch("cloudstrmhelper.threading.Thread", _FakeThread):
-            resp = plugin.manual_action(
+            resp = plugin.manual_action(self._params(
                 action="regenerate_strm",
                 strm="/strm/movies/Foo.strm",
                 remote="/cloud/movies/Foo.mkv",
-            )
+            ))
         body, status = calls[-1]
         self.assertEqual(status, 200)
         self.assertTrue(body["state"])
