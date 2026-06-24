@@ -43,6 +43,15 @@ HOP_BY_HOP_HEADERS = {
     "upgrade",
 }
 
+CONTAINER_ALIASES = {
+    "m4v": "mp4",
+    "mpg": "mpeg",
+    "mpeg": "mpeg",
+    "m2ts": "ts",
+    "mts": "ts",
+}
+IGNORED_CONTAINER_EXTS = {"", "strm", "srt", "ass", "ssa", "vtt", "sub", "idx"}
+
 
 def create_emby_proxy_app(plugin, emby_server_url: str) -> FastAPI:
     """创建独立 Emby 302 前置代理 app。"""
@@ -323,16 +332,35 @@ class Emby302Proxy:
             if not isinstance(source, dict):
                 continue
             media_path = str(source.get("Path") or "")
-            if not self.is_redirect_candidate(media_path):
+            playback_target = self.playback_target_from_media_path(media_path)
+            if not playback_target:
                 continue
+            if not (self.is_remote_url(playback_target) or self.remote_path_from_media_path(playback_target)):
+                continue
+            container = self.container_from_target(playback_target) or self.container_from_source(source)
             source_id = str(source.get("Id") or "")
-            direct_stream_url = self.direct_stream_url(item_id=item_id, source_id=source_id, api_key=api_key)
+            direct_stream_url = self.direct_stream_url(
+                item_id=item_id,
+                source_id=source_id,
+                api_key=api_key,
+                container=container,
+            )
             if direct_stream_url:
                 source["DirectStreamUrl"] = direct_stream_url
+            if container:
+                source["Container"] = container
+            source["Protocol"] = "Http"
+            source.setdefault("Type", "Default")
             source["SupportsDirectPlay"] = True
             source["SupportsDirectStream"] = True
             source["SupportsTranscoding"] = False
             source["IsRemote"] = True
+            source["SupportsExternalStream"] = True
+            source["RequiresOpening"] = False
+            source["RequiresClosing"] = False
+            source["RequiresLooping"] = False
+            source["SupportsProbing"] = False
+            self.patch_media_streams_for_direct(source)
             for key in (
                 "TranscodingUrl",
                 "TranscodingSubProtocol",
@@ -344,24 +372,22 @@ class Emby302Proxy:
         return result, patched_count
 
     @staticmethod
-    def direct_stream_url(item_id: str, source_id: str, api_key: str = "") -> str:
+    def direct_stream_url(item_id: str, source_id: str, api_key: str = "", container: str = "") -> str:
         if not item_id:
             return ""
         params = [("MediaSourceId", source_id), ("Static", "true")]
         if api_key:
             params.append(("api_key", api_key))
         query = "&".join(f"{quote(k)}={quote(str(v))}" for k, v in params if v is not None)
-        return f"/videos/{quote(item_id)}/stream?{query}"
+        ext = Emby302Proxy.safe_container_ext(container)
+        suffix = f".{ext}" if ext else ""
+        return f"/videos/{quote(item_id)}/stream{suffix}?{query}"
 
     def resolve_media_path(self, media_path: str, ua: str = "") -> Optional[DirectLink]:
         """解析 Emby MediaSource.Path 到可跳转直链。"""
-        candidate = self.normalize_media_path(media_path)
+        candidate = self.playback_target_from_media_path(media_path)
         if not candidate:
             return None
-
-        strm_target = self.read_strm_target(candidate)
-        if strm_target:
-            candidate = self.normalize_media_path(strm_target)
 
         if self.is_remote_url(candidate):
             return self.direct_link_from_remote_url(candidate, ua=ua)
@@ -372,13 +398,70 @@ class Emby302Proxy:
         return None
 
     def is_redirect_candidate(self, media_path: str) -> bool:
-        candidate = self.normalize_media_path(media_path)
+        candidate = self.playback_target_from_media_path(media_path)
         if not candidate:
             return False
+        return self.is_remote_url(candidate) or bool(self.remote_path_from_media_path(candidate))
+
+    def playback_target_from_media_path(self, media_path: str) -> str:
+        """返回 Emby 源实际应播放的目标，优先展开本地 .strm 第一行。"""
+        candidate = self.normalize_media_path(media_path)
+        if not candidate:
+            return ""
         strm_target = self.read_strm_target(candidate)
         if strm_target:
-            candidate = self.normalize_media_path(strm_target)
-        return self.is_remote_url(candidate) or bool(self.remote_path_from_media_path(candidate))
+            return self.normalize_media_path(strm_target)
+        return candidate
+
+    @staticmethod
+    def patch_media_streams_for_direct(source: Dict[str, Any]) -> None:
+        """让客户端把已有音视频流按外部直连源处理。"""
+        streams = source.get("MediaStreams") or []
+        if not isinstance(streams, list):
+            return
+        for stream in streams:
+            if not isinstance(stream, dict):
+                continue
+            stream["SupportsExternalStream"] = True
+
+    @staticmethod
+    def container_from_source(source: Dict[str, Any]) -> str:
+        return Emby302Proxy.safe_container_ext(str((source or {}).get("Container") or ""))
+
+    @staticmethod
+    def container_from_target(target: str) -> str:
+        text = Emby302Proxy.normalize_media_path(target)
+        if not text:
+            return ""
+        parsed = None
+        try:
+            parsed = urlsplit(text)
+            path = parsed.path if parsed.scheme else text
+        except Exception:
+            path = text
+        suffix = Path(unquote(path)).suffix.lower().lstrip(".")
+        container = Emby302Proxy.safe_container_ext(suffix)
+        if container:
+            return container
+        if parsed is None:
+            return ""
+        values = parse_qs(parsed.query or "")
+        for key in ("path", "file", "filename", "name"):
+            for value in values.get(key) or []:
+                container = Emby302Proxy.safe_container_ext(Path(unquote(value)).suffix)
+                if container:
+                    return container
+        return ""
+
+    @staticmethod
+    def safe_container_ext(value: str) -> str:
+        ext = str(value or "").strip().lower().lstrip(".")
+        if not ext or ext in IGNORED_CONTAINER_EXTS:
+            return ""
+        ext = CONTAINER_ALIASES.get(ext, ext)
+        if not re.fullmatch(r"[a-z0-9]{1,12}", ext):
+            return ""
+        return ext
 
     def direct_link_from_cloud_path(self, remote_path: str, ua: str = "") -> Optional[DirectLink]:
         plugin = self.plugin
