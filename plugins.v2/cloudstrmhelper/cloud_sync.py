@@ -620,3 +620,59 @@ class CloudSync:
         if not isinstance(remote_size, int):
             return True  # 是目录，同名冲突
         return False
+
+    def preload_remote_dirs(self, remote_roots: List[str]) -> Dict[str, Dict[str, Any]]:
+        """批量预加载云端目录列表（refresh=False，用 AList 缓存），供扫描期快速判定。
+
+        扫描成千上万文件时，逐文件 list_dir(refresh=True) 会非常慢
+        （每个文件一次网络往返 + 云盘刷新）。预加载每个云端根目录一次，
+        扫描期 need_upload_cached 只查内存，避免 N 次远端请求。
+        """
+        cache: Dict[str, Dict[str, Any]] = {}
+        if not self.alist:
+            return cache
+        for root in remote_roots:
+            root = (root or "").strip().rstrip("/")
+            if not root:
+                continue
+            # 递归预加载：root 及其一层子目录（媒体文件通常在 Season/剧集 子目录）
+            self._preload_one(cache, root)
+        return cache
+
+    def _preload_one(self, cache: Dict[str, Dict[str, Any]], path: str) -> None:
+        if path in cache:
+            return
+        try:
+            listing = self.alist.list_dir(path, refresh=False)
+            cache[path] = listing
+        except AlistError as e:
+            logger.debug(f"【云同步】预加载远端目录失败: {path} ({e})")
+            cache[path] = {}
+            return
+        # 递归一层子目录（影视库通常 根/类型/剧名/Season/文件）
+        for name, val in list(listing.items()):
+            if isinstance(val, dict) and name.endswith("/"):
+                child = f"{path}/{name.rstrip('/')}"
+                self._preload_one(cache, child)
+
+    def need_upload_cached(self, remote_path: str, cache: Dict[str, Dict[str, Any]]) -> bool:
+        """基于预加载缓存判定是否需要上传；缓存未命中时回退实时 list_dir。"""
+        remote_name = Path(remote_path).name
+        remote_parent = str(Path(remote_path).parent)
+        if remote_parent in ("", ".", "/"):
+            remote_parent = "/"
+        listing = cache.get(remote_parent)
+        if listing is None:
+            # 缓存未命中（子目录层级深），回退实时查询（不强制刷新）
+            try:
+                listing = self.alist.list_dir(remote_parent, refresh=False)
+                cache[remote_parent] = listing
+            except AlistError as e:
+                logger.debug(f"【云同步】缓存未命中实时 list 失败，按需上传: {remote_parent} ({e})")
+                return True
+        if remote_name not in listing:
+            return True
+        remote_size = listing[remote_name]
+        if not isinstance(remote_size, int):
+            return True
+        return False

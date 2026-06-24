@@ -1367,7 +1367,14 @@ class CloudStrmHelper(_PluginBase):
         logger.info(f"【云端STRM】上传映射: {self._upload_mappings}")
         self._cloud_sync.prepare_batch()
 
+        # 预加载云端目录列表，避免逐文件 list_dir 导致扫描阶段极慢
+        remote_roots = [cloud for _, cloud in self._upload_mappings if cloud]
+        logger.info(f"【云端STRM】预加载云端目录列表: {remote_roots}")
+        remote_cache = self._cloud_sync.preload_remote_dirs(remote_roots)
+        logger.info(f"【云端STRM】预加载完成：缓存 {len(remote_cache)} 个远端目录")
+
         for local_root in local_roots:
+            root_files = 0
             for root, dirs, files in os.walk(local_root):
                 for name in files:
                     local_path = os.path.join(root, name)
@@ -1383,7 +1390,7 @@ class CloudStrmHelper(_PluginBase):
                         skipped += 1
                         continue
                     try:
-                        if not self._cloud_sync.need_upload(local_path, remote_path):
+                        if not self._cloud_sync.need_upload_cached(remote_path, remote_cache):
                             # 远端已存在不加入上传列表，但仍需生成 STRM
                             ready_for_strm.append((local_path, remote_path, None, None))
                             skipped += 1
@@ -1392,6 +1399,8 @@ class CloudStrmHelper(_PluginBase):
                         logger.warning(f"【云端STRM】增量判定异常，按需上传: {e}")
                     self._cloud_sync.enqueue_file(local_path, remote_path, None, None)
                     queued += 1
+                    root_files += 1
+            logger.info(f"【云端STRM】已扫描根目录: {local_root}（待上传 {root_files}）")
 
         self._cloud_sync.mark_scan_finish()
         logger.info(f"【云端STRM】全量扫描完成: 入队 {queued}，跳过 {skipped}")
