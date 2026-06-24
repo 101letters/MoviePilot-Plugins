@@ -577,7 +577,7 @@ class CloudStrmHelper(_PluginBase):
                 {"component": "td", "props": {"class": "text-caption text-grey"}, "text": it.get("remote") or "-"},
                 _upload_action_cell(it),
             ]}
-            for it in recent_uploads[:10]
+            for it in recent_uploads[:5]
         ]
         if not upload_rows:
             upload_rows = [{"component": "tr", "content": [
@@ -594,7 +594,7 @@ class CloudStrmHelper(_PluginBase):
                 {"component": "td", "props": {"class": "text-caption text-grey"}, "text": it.get("remote") or "-"},
                 _strm_action_cell(it),
             ]}
-            for it in recent_strms[:10]
+            for it in recent_strms[:5]
         ]
         if not strm_rows:
             strm_rows = [{"component": "tr", "content": [
@@ -1382,15 +1382,25 @@ class CloudStrmHelper(_PluginBase):
         finished = self._cloud_sync.wait_for_batch()
         for item in finished:
             if item.status == TASK_SUCCEEDED:
+                logger.info(f"【云端STRM】上传完成: {item.local_path} -> {item.remote_path} ({(item.file_size or 0)/1024/1024:.1f} MB)")
                 self._record_upload_stat(item.local_path, item.remote_path, item.file_size or 0, status="uploaded")
                 ready_for_strm.append((item.local_path, item.remote_path, item.mediainfo, item.meta))
             elif item.status == TASK_SKIPPED:
-                # 远端已存在跳过上传，不记入上传列表，但仍需生成 STRM
+                logger.info(f"【云端STRM】远端已存在，跳过上传: {item.remote_path}")
+                # 不记入上传列表，但仍需生成 STRM
                 ready_for_strm.append((item.local_path, item.remote_path, item.mediainfo, item.meta))
         logger.info(f"【云端STRM】全量 Phase 2 完成：可生成 STRM {len(ready_for_strm)} 条")
+        strm_ok = 0
+        strm_fail = 0
         for local_path, remote_path, mediainfo, meta in ready_for_strm:
-            self._on_file_synced(local_path, remote_path, mediainfo, meta)
-        logger.info("【云端STRM】全量 Phase 3/4 完成")
+            ok = self._on_file_synced(local_path, remote_path, mediainfo, meta)
+            if ok:
+                strm_ok += 1
+                logger.info(f"【云端STRM】STRM 生成完成: {Path(remote_path).name}")
+            else:
+                strm_fail += 1
+                logger.warning(f"【云端STRM】STRM 生成失败: {remote_path}")
+        logger.info(f"【云端STRM】全量 Phase 3/4 完成：STRM 成功 {strm_ok}，失败 {strm_fail}")
 
     # ============================================================
     # 路径映射与统计
@@ -2103,52 +2113,46 @@ class CloudStrmHelper(_PluginBase):
                                 "component": "VWindowItem",
                                 "props": {"value": "base"},
                                 "content": [
-                                    {
-                                        "component": "VCard",
-                                        "props": {"variant": "outlined"},
-                                        "content": [{
-                                            "component": "VCardText",
-                                            "props": {"class": "py-4 px-4"},
-                                            "content": [
-                                                {
-                                                    "component": "VRow",
-                                                    "props": {"class": "mb-4"},
-                                                    "content": [
-                                                        {
-                                                            "component": "VCol", "props": {"cols": 12, "md": 3},
-                                                            "content": [{"component": "VSwitch", "props": {
-                                                                "model": "enabled", "label": "启用插件",
-                                                                "hint": "监听 MP 整理入库事件", "persistent-hint": False,
-                                                            }}],
-                                                        },
-                                                        {
-                                                            "component": "VCol", "props": {"cols": 12, "md": 3},
-                                                            "content": [{"component": "VSwitch", "props": {
-                                                                "model": "once_sync", "label": "立即全量上传并生成 STRM",
-                                                                "hint": "保存触发一次全量扫描→上传→生成 STRM",
-                                                                "persistent-hint": False,
-                                                            }}],
-                                                        },
-                                                        {
-                                                            "component": "VCol", "props": {"cols": 12, "md": 3},
-                                                            "content": [{"component": "VSwitch", "props": {
-                                                                "model": "notify_enabled", "label": "任务完成通知",
-                                                                "hint": "通过 MP 通知同步结果", "persistent-hint": False,
-                                                            }}],
-                                                        },
-                                                        {
-                                                            "component": "VCol", "props": {"cols": 12, "md": 3},
-                                                            "content": [{"component": "VTextField", "props": {
-                                                                "model": "upload_concurrency", "label": "上传并发数",
-                                                                "placeholder": "3", "type": "number",
-                                                                "hint": "并发上传文件数", "persistent-hint": False,
-                                                            }}],
-                                                        },
-                                                    ],
-                                                },
-                                            ],
-                                        }],
-                                    },
+                                    {"component": "div", "props": {"class": "pa-5"},
+                                     "content": [
+                                         {"component": "div", "props": {"class": "text-h6 mb-4"}, "text": "基础设置"},
+                                         {
+                                             "component": "VRow",
+                                             "props": {"class": "mb-4"},
+                                             "content": [
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 3},
+                                                     "content": [{"component": "VSwitch", "props": {
+                                                         "model": "enabled", "label": "启用插件",
+                                                         "hint": "监听 MP 整理入库事件", "persistent-hint": False,
+                                                     }}],
+                                                 },
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 3},
+                                                     "content": [{"component": "VSwitch", "props": {
+                                                         "model": "once_sync", "label": "立即全量上传并生成 STRM",
+                                                         "hint": "保存后触发一次全量扫描→上传→STRM",
+                                                         "persistent-hint": False,
+                                                     }}],
+                                                 },
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 3},
+                                                     "content": [{"component": "VSwitch", "props": {
+                                                         "model": "notify_enabled", "label": "任务完成通知",
+                                                         "hint": "通过 MP 通知同步结果", "persistent-hint": False,
+                                                     }}],
+                                                 },
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 3},
+                                                     "content": [{"component": "VTextField", "props": {
+                                                         "model": "upload_concurrency", "label": "上传并发数",
+                                                         "placeholder": "3", "type": "number",
+                                                         "hint": "并发上传文件数", "persistent-hint": False,
+                                                     }}],
+                                                 },
+                                             ],
+                                         },
+                                     ]},
                                 ],
                             },
                             # ---- Tab: 播放 / 302 ----
@@ -2156,55 +2160,49 @@ class CloudStrmHelper(_PluginBase):
                                 "component": "VWindowItem",
                                 "props": {"value": "play"},
                                 "content": [
-                                    {
-                                        "component": "VCard",
-                                        "props": {"variant": "outlined"},
-                                        "content": [{
-                                            "component": "VCardText",
-                                            "props": {"class": "py-4 px-4"},
-                                            "content": [
-                                                {
-                                                    "component": "VRow",
-                                                    "props": {"class": "mb-4"},
-                                                    "content": [
-                                                        {
-                                                            "component": "VCol", "props": {"cols": 12, "md": 3},
-                                                            "content": [{"component": "VSwitch", "props": {
-                                                                "model": "emby_proxy_enabled", "label": "启用 Emby 302 代理",
-                                                                "hint": "代理 Emby 播放请求并拦截回源",
-                                                                "persistent-hint": False,
-                                                            }}],
-                                                        },
-                                                        {
-                                                            "component": "VCol", "props": {"cols": 12, "md": 3},
-                                                            "content": [{"component": "VTextField", "props": {
-                                                                "model": "emby_server_url", "label": "Emby 原始地址",
-                                                                "placeholder": DEFAULT_EMBY_SERVER_URL,
-                                                                "hint": "客户端改连代理端口", "persistent-hint": False,
-                                                            }}],
-                                                        },
-                                                        {
-                                                            "component": "VCol", "props": {"cols": 12, "md": 3},
-                                                            "content": [{"component": "VTextField", "props": {
-                                                                "model": "emby_proxy_host", "label": "代理监听地址",
-                                                                "placeholder": DEFAULT_EMBY_PROXY_HOST,
-                                                                "hint": "通常保持 0.0.0.0",
-                                                                "persistent-hint": False,
-                                                            }}],
-                                                        },
-                                                        {
-                                                            "component": "VCol", "props": {"cols": 12, "md": 3},
-                                                            "content": [{"component": "VTextField", "props": {
-                                                                "model": "emby_proxy_port", "label": "代理监听端口",
-                                                                "placeholder": str(DEFAULT_EMBY_PROXY_PORT), "type": "number",
-                                                                "hint": "例如 8095", "persistent-hint": False,
-                                                            }}],
-                                                        },
-                                                    ],
-                                                },
-                                            ],
-                                        }],
-                                    },
+                                    {"component": "div", "props": {"class": "pa-5"},
+                                     "content": [
+                                         {"component": "div", "props": {"class": "text-h6 mb-4"}, "text": "播放设置"},
+                                         {
+                                             "component": "VRow",
+                                             "props": {"class": "mb-4"},
+                                             "content": [
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 3},
+                                                     "content": [{"component": "VSwitch", "props": {
+                                                         "model": "emby_proxy_enabled", "label": "启用 Emby 302 代理",
+                                                         "hint": "代理 Emby 播放请求并拦截回源",
+                                                         "persistent-hint": False,
+                                                     }}],
+                                                 },
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 3},
+                                                     "content": [{"component": "VTextField", "props": {
+                                                         "model": "emby_server_url", "label": "Emby 原始地址",
+                                                         "placeholder": DEFAULT_EMBY_SERVER_URL,
+                                                         "hint": "客户端改连代理端口", "persistent-hint": False,
+                                                     }}],
+                                                 },
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 3},
+                                                     "content": [{"component": "VTextField", "props": {
+                                                         "model": "emby_proxy_host", "label": "代理监听地址",
+                                                         "placeholder": DEFAULT_EMBY_PROXY_HOST,
+                                                         "hint": "通常保持 0.0.0.0",
+                                                         "persistent-hint": False,
+                                                     }}],
+                                                 },
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 3},
+                                                     "content": [{"component": "VTextField", "props": {
+                                                         "model": "emby_proxy_port", "label": "代理监听端口",
+                                                         "placeholder": str(DEFAULT_EMBY_PROXY_PORT), "type": "number",
+                                                         "hint": "例如 8095", "persistent-hint": False,
+                                                     }}],
+                                                 },
+                                             ],
+                                         },
+                                     ]},
                                 ],
                             },
                             # ---- Tab: 云存储 / 路径 ----
@@ -2212,83 +2210,74 @@ class CloudStrmHelper(_PluginBase):
                                 "component": "VWindowItem",
                                 "props": {"value": "cloud"},
                                 "content": [
-                                    {
-                                        "component": "VCard",
-                                        "props": {"variant": "outlined"},
-                                        "content": [{
-                                            "component": "VCardText",
-                                            "props": {"class": "py-4 px-4"},
-                                            "content": [
-                                                # ---- 云端存储 ----
-                                                {"component": "div", "props": {"class": "text-subtitle-2 font-weight-medium mb-3 mt-2"}, "text": "云端存储"},
-                                                {
-                                                    "component": "VRow",
-                                                    "props": {"class": "mb-4"},
-                                                    "content": [
-                                                        {
-                                                            "component": "VCol", "props": {"cols": 12, "md": 4},
-                                                            "content": [{"component": "VSelect", "props": {
-                                                                "model": "cloud_storage_type", "label": "云端存储类型",
-                                                                "items": [{"title": "AList / OpenList", "value": "alist"}],
-                                                                "disabled": True,
-                                                            }}],
-                                                        },
-                                                        {
-                                                            "component": "VCol", "props": {"cols": 12, "md": 4},
-                                                            "content": [{"component": "VTextField", "props": {
-                                                                "model": "alist_url", "label": "AList/OpenList 地址",
-                                                                "placeholder": DEFAULT_ALIST_URL,
-                                                                "hint": "服务地址", "persistent-hint": False,
-                                                            }}],
-                                                        },
-                                                        {
-                                                            "component": "VCol", "props": {"cols": 12, "md": 4},
-                                                            "content": [{"component": "VTextField", "props": {
-                                                                "model": "alist_token", "label": "AList/OpenList Token",
-                                                                "hint": "API Token", "persistent-hint": False,
-                                                            }}],
-                                                        },
-                                                    ],
-                                                },
-                                                # ---- 上传与 STRM 路径映射 ----
-                                                {"component": "div", "props": {"class": "text-subtitle-2 font-weight-medium mb-3 mt-5"}, "text": "上传与 STRM 路径映射"},
-                                                {
-                                                    "component": "VRow",
-                                                    "props": {"class": "mb-3"},
-                                                    "content": [
-                                                        {
-                                                            "component": "VCol", "props": {"cols": 12},
-                                                            "content": [{"component": "VTextarea", "props": {
-                                                                "model": "upload_path_mappings",
-                                                                "label": "上传映射（本地路径#云端路径）",
-                                                                "rows": 3,
-                                                                "placeholder": DEFAULT_UPLOAD_PATH_MAPPINGS,
-                                                                "hint": "只处理这些本地根目录",
-                                                                "persistent-hint": False,
-                                                            }}],
-                                                        },
-                                                    ],
-                                                },
-                                                {
-                                                    "component": "VRow",
-                                                    "props": {"class": "mb-3"},
-                                                    "content": [
-                                                        {
-                                                            "component": "VCol", "props": {"cols": 12},
-                                                            "content": [{"component": "VTextarea", "props": {
-                                                                "model": "strm_path_mappings",
-                                                                "label": "STRM 映射（云端路径#本地 STRM 目录）",
-                                                                "rows": 3,
-                                                                "placeholder": DEFAULT_STRM_PATH_MAPPINGS,
-                                                                "hint": "按云端路径匹配到 STRM 输出目录",
-                                                                "persistent-hint": False,
-                                                            }}],
-                                                        },
-                                                    ],
-                                                },
-                                            ],
-                                        }],
-                                    },
+                                    {"component": "div", "props": {"class": "pa-5"},
+                                     "content": [
+                                         {"component": "div", "props": {"class": "text-h6 mb-4"}, "text": "云端存储"},
+                                         {
+                                             "component": "VRow",
+                                             "props": {"class": "mb-4"},
+                                             "content": [
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 4},
+                                                     "content": [{"component": "VSelect", "props": {
+                                                         "model": "cloud_storage_type", "label": "云端存储类型",
+                                                         "items": [{"title": "AList / OpenList", "value": "alist"}],
+                                                         "disabled": True,
+                                                     }}],
+                                                 },
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 4},
+                                                     "content": [{"component": "VTextField", "props": {
+                                                         "model": "alist_url", "label": "AList/OpenList 地址",
+                                                         "placeholder": DEFAULT_ALIST_URL,
+                                                         "hint": "服务地址", "persistent-hint": False,
+                                                     }}],
+                                                 },
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 4},
+                                                     "content": [{"component": "VTextField", "props": {
+                                                         "model": "alist_token", "label": "AList/OpenList Token",
+                                                         "hint": "API Token", "persistent-hint": False,
+                                                     }}],
+                                                 },
+                                             ],
+                                         },
+                                         {"component": "div", "props": {"class": "text-h6 mb-4 mt-6"}, "text": "上传与 STRM 路径映射"},
+                                         {
+                                             "component": "VRow",
+                                             "props": {"class": "mb-3"},
+                                             "content": [
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12},
+                                                     "content": [{"component": "VTextarea", "props": {
+                                                         "model": "upload_path_mappings",
+                                                         "label": "上传映射（本地路径#云端路径）",
+                                                         "rows": 3,
+                                                         "placeholder": DEFAULT_UPLOAD_PATH_MAPPINGS,
+                                                         "hint": "只处理这些本地根目录",
+                                                         "persistent-hint": False,
+                                                     }}],
+                                                 },
+                                             ],
+                                         },
+                                         {
+                                             "component": "VRow",
+                                             "props": {"class": "mb-3"},
+                                             "content": [
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12},
+                                                     "content": [{"component": "VTextarea", "props": {
+                                                         "model": "strm_path_mappings",
+                                                         "label": "STRM 映射（云端路径#本地 STRM 目录）",
+                                                         "rows": 3,
+                                                         "placeholder": DEFAULT_STRM_PATH_MAPPINGS,
+                                                         "hint": "按云端路径匹配到 STRM 输出目录",
+                                                         "persistent-hint": False,
+                                                     }}],
+                                                 },
+                                             ],
+                                         },
+                                     ]},
                                 ],
                             },
                             # ---- Tab: 同步 / 刷新 ----
@@ -2296,119 +2285,110 @@ class CloudStrmHelper(_PluginBase):
                                 "component": "VWindowItem",
                                 "props": {"value": "sync"},
                                 "content": [
-                                    {
-                                        "component": "VCard",
-                                        "props": {"variant": "outlined"},
-                                        "content": [{
-                                            "component": "VCardText",
-                                            "props": {"class": "py-4 px-4"},
-                                            "content": [
-                                                # ---- 同步与过滤 ----
-                                                {"component": "div", "props": {"class": "text-subtitle-2 font-weight-medium mb-3 mt-2"}, "text": "同步与过滤"},
-                                                {
-                                                    "component": "VRow",
-                                                    "props": {"class": "mb-4"},
-                                                    "content": [
-                                                        {
-                                                            "component": "VCol", "props": {"cols": 12, "md": 4},
-                                                            "content": [{"component": "VSelect", "props": {
-                                                                "model": "sync_mode", "label": "同步模式",
-                                                                "items": [
-                                                                    {"title": "复制（上传后保留本地源文件）", "value": "copy"},
-                                                                    {"title": "移动（上传+STRM 成功后删本地）", "value": "move"},
-                                                                ],
-                                                                "hint": "不删云端文件", "persistent-hint": False,
-                                                            }}],
-                                                        },
-                                                        {
-                                                            "component": "VCol", "props": {"cols": 12, "md": 4},
-                                                            "content": [{"component": "VSelect", "props": {
-                                                                "model": "overwrite_mode", "label": "STRM 覆盖模式",
-                                                                "items": [
-                                                                    {"title": "从不（跳过已存在）", "value": "never"},
-                                                                    {"title": "总是（覆盖已有 STRM）", "value": "always"},
-                                                                ],
-                                                            }}],
-                                                        },
-                                                        {
-                                                            "component": "VCol", "props": {"cols": 12, "md": 4},
-                                                            "content": [{"component": "VTextField", "props": {
-                                                                "model": "rmt_mediaext", "label": "可处理媒体扩展名",
-                                                                "placeholder": "mp4,mkv,ts,iso,...",
-                                                                "hint": "逗号分隔", "persistent-hint": False,
-                                                            }}],
-                                                        },
-                                                    ],
-                                                },
-                                                {
-                                                    "component": "VRow",
-                                                    "props": {"class": "mb-3"},
-                                                    "content": [{
-                                                        "component": "VCol", "props": {"cols": 12},
-                                                        "content": [{
-                                                            "component": "VTextarea", "props": {
-                                                                "model": "exclude_patterns", "label": "排除规则（gitignore 语法，一行一条）",
-                                                                "rows": 3, "placeholder": DEFAULT_EXCLUDE_PATTERNS,
-                                                                "hint": "命中规则的文件不上传也不生成 STRM", "persistent-hint": False,
-                                                            },
-                                                        }],
-                                                    }],
-                                                },
-                                                {
-                                                    "component": "VRow",
-                                                    "props": {"class": "mb-3"},
-                                                    "content": [{
-                                                        "component": "VCol", "props": {"cols": 12},
-                                                        "content": [{
-                                                            "component": "VTextarea", "props": {
-                                                                "model": "event_filters", "label": "事件路径过滤（留空处理全部）",
-                                                                "rows": 2, "placeholder": DEFAULT_EVENT_FILTERS,
-                                                                "hint": "只处理这些本地路径前缀下的整理事件", "persistent-hint": False,
-                                                            },
-                                                        }],
-                                                    }],
-                                                },
-                                                # ---- 媒体服务器刷新 ----
-                                                {"component": "div", "props": {"class": "text-subtitle-2 font-weight-medium mb-3 mt-5"}, "text": "媒体服务器刷新"},
-                                                {
-                                                    "component": "VRow",
-                                                    "props": {"class": "mb-4"},
-                                                    "content": [
-                                                        {
-                                                            "component": "VCol", "props": {"cols": 12, "md": 4},
-                                                            "content": [{"component": "VSwitch", "props": {
-                                                                "model": "transfer_monitor_media_server_refresh_enabled",
-                                                                "label": "生成 STRM 后刷新媒体服务器",
-                                                            }}],
-                                                        },
-                                                        {
-                                                            "component": "VCol", "props": {"cols": 12, "md": 8},
-                                                            "content": [{"component": "VSelect", "props": {
-                                                                "model": "transfer_monitor_mediaservers", "label": "媒体服务器",
-                                                                "items": mediaserver_items,
-                                                                "multiple": True, "chips": True, "clearable": True,
-                                                            }}],
-                                                        },
-                                                    ],
-                                                },
-                                                {
-                                                    "component": "VRow",
-                                                    "props": {"class": "mb-3"},
-                                                    "content": [{
-                                                        "component": "VCol", "props": {"cols": 12},
-                                                        "content": [{
-                                                            "component": "VTextarea", "props": {
-                                                                "model": "transfer_mp_mediaserver_paths",
-                                                                "label": "路径映射（Emby 路径#MP 路径）",
-                                                                "rows": 2, "placeholder": DEFAULT_PATH_MAPPING,
-                                                                "hint": "用于刷新媒体库", "persistent-hint": False,
-                                                            },
-                                                        }],
-                                                    }],
-                                                },
-                                            ],
-                                        }],
-                                    },
+                                    {"component": "div", "props": {"class": "pa-5"},
+                                     "content": [
+                                         {"component": "div", "props": {"class": "text-h6 mb-4"}, "text": "同步与过滤"},
+                                         {
+                                             "component": "VRow",
+                                             "props": {"class": "mb-4"},
+                                             "content": [
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 4},
+                                                     "content": [{"component": "VSelect", "props": {
+                                                         "model": "sync_mode", "label": "同步模式",
+                                                         "items": [
+                                                             {"title": "复制（上传后保留本地源文件）", "value": "copy"},
+                                                             {"title": "移动（上传+STRM 成功后删本地）", "value": "move"},
+                                                         ],
+                                                         "hint": "不删云端文件", "persistent-hint": False,
+                                                     }}],
+                                                 },
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 4},
+                                                     "content": [{"component": "VSelect", "props": {
+                                                         "model": "overwrite_mode", "label": "STRM 覆盖模式",
+                                                         "items": [
+                                                             {"title": "从不（跳过已存在）", "value": "never"},
+                                                             {"title": "总是（覆盖已有 STRM）", "value": "always"},
+                                                         ],
+                                                     }}],
+                                                 },
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 4},
+                                                     "content": [{"component": "VTextField", "props": {
+                                                         "model": "rmt_mediaext", "label": "可处理媒体扩展名",
+                                                         "placeholder": "mp4,mkv,ts,iso,...",
+                                                         "hint": "逗号分隔", "persistent-hint": False,
+                                                     }}],
+                                                 },
+                                             ],
+                                         },
+                                         {
+                                             "component": "VRow",
+                                             "props": {"class": "mb-3"},
+                                             "content": [{
+                                                 "component": "VCol", "props": {"cols": 12},
+                                                 "content": [{
+                                                     "component": "VTextarea", "props": {
+                                                         "model": "exclude_patterns", "label": "排除规则（gitignore 语法，一行一条）",
+                                                         "rows": 3, "placeholder": DEFAULT_EXCLUDE_PATTERNS,
+                                                         "hint": "命中规则的文件不上传也不生成 STRM", "persistent-hint": False,
+                                                     },
+                                                 }],
+                                             }],
+                                         },
+                                         {
+                                             "component": "VRow",
+                                             "props": {"class": "mb-3"},
+                                             "content": [{
+                                                 "component": "VCol", "props": {"cols": 12},
+                                                 "content": [{
+                                                     "component": "VTextarea", "props": {
+                                                         "model": "event_filters", "label": "事件路径过滤（留空处理全部）",
+                                                         "rows": 2, "placeholder": DEFAULT_EVENT_FILTERS,
+                                                         "hint": "只处理这些本地路径前缀下的整理事件", "persistent-hint": False,
+                                                     },
+                                                 }],
+                                             }],
+                                         },
+                                         {"component": "div", "props": {"class": "text-h6 mb-4 mt-6"}, "text": "媒体服务器刷新"},
+                                         {
+                                             "component": "VRow",
+                                             "props": {"class": "mb-4"},
+                                             "content": [
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 4},
+                                                     "content": [{"component": "VSwitch", "props": {
+                                                         "model": "transfer_monitor_media_server_refresh_enabled",
+                                                         "label": "生成 STRM 后刷新媒体服务器",
+                                                     }}],
+                                                 },
+                                                 {
+                                                     "component": "VCol", "props": {"cols": 12, "md": 8},
+                                                     "content": [{"component": "VSelect", "props": {
+                                                         "model": "transfer_monitor_mediaservers", "label": "媒体服务器",
+                                                         "items": mediaserver_items,
+                                                         "multiple": True, "chips": True, "clearable": True,
+                                                     }}],
+                                                 },
+                                             ],
+                                         },
+                                         {
+                                             "component": "VRow",
+                                             "props": {"class": "mb-3"},
+                                             "content": [{
+                                                 "component": "VCol", "props": {"cols": 12},
+                                                 "content": [{
+                                                     "component": "VTextarea", "props": {
+                                                         "model": "transfer_mp_mediaserver_paths",
+                                                         "label": "路径映射（Emby 路径#MP 路径）",
+                                                         "rows": 2, "placeholder": DEFAULT_PATH_MAPPING,
+                                                         "hint": "用于刷新媒体库", "persistent-hint": False,
+                                                     },
+                                                 }],
+                                             }],
+                                         },
+                                     ]},
                                 ],
                             },
                         ],
