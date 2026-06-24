@@ -554,6 +554,84 @@ class TestPluginMetadata(unittest.TestCase):
         self.assertEqual(manual["auth"], "apikey")
         self.assertIn("POST", manual["methods"])
 
+    def test_clear_upload_history_endpoint_registered(self):
+        from cloudstrmhelper import CloudStrmHelper
+        apis = CloudStrmHelper.get_api(CloudStrmHelper)
+        ep = next((a for a in apis if a["path"] == "/clear_upload_history"), None)
+        self.assertIsNotNone(ep, "/clear_upload_history 端点未注册")
+        self.assertEqual(ep["auth"], "apikey")
+        self.assertIn("POST", ep["methods"])
+        self.assertIn("仅清除", ep["description"])
+
+    def test_clear_strm_history_endpoint_registered(self):
+        from cloudstrmhelper import CloudStrmHelper
+        apis = CloudStrmHelper.get_api(CloudStrmHelper)
+        ep = next((a for a in apis if a["path"] == "/clear_strm_history"), None)
+        self.assertIsNotNone(ep, "/clear_strm_history 端点未注册")
+        self.assertEqual(ep["auth"], "apikey")
+        self.assertIn("POST", ep["methods"])
+        self.assertIn("仅清除", ep["description"])
+
+    def test_clear_upload_history_resets_stats(self):
+        from cloudstrmhelper import CloudStrmHelper, JSONResponse
+        plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+        plugin._enabled = True
+        plugin._stats = {
+            "recent_uploads": [{"name": "a.mkv", "remote": "/cloud/a.mkv", "status": "uploaded"}],
+            "upload_count": 5,
+            "last_upload_time": "2025-01-01 12:00:00",
+            "recent_strms": [{"name": "a.strm", "path": "/strm/a.strm"}],
+            "strm_count": 3,
+            "last_strm_time": "2025-01-01 12:00:00",
+        }
+        calls = []
+
+        def fake_json(body, **kw):
+            calls.append((body, kw.get("status_code", 200)))
+            return body
+
+        with patch("cloudstrmhelper.JSONResponse", fake_json):
+            plugin.clear_upload_history()
+        body, status = calls[-1]
+        self.assertEqual(status, 200)
+        self.assertTrue(body["state"])
+        self.assertEqual(plugin._stats["recent_uploads"], [])
+        self.assertEqual(plugin._stats["upload_count"], 0)
+        self.assertEqual(plugin._stats["last_upload_time"], "")
+        # STRM 相关不应受影响
+        self.assertEqual(len(plugin._stats["recent_strms"]), 1)
+        self.assertEqual(plugin._stats["strm_count"], 3)
+
+    def test_clear_strm_history_resets_stats(self):
+        from cloudstrmhelper import CloudStrmHelper, JSONResponse
+        plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+        plugin._enabled = True
+        plugin._stats = {
+            "recent_uploads": [{"name": "a.mkv", "remote": "/cloud/a.mkv", "status": "uploaded"}],
+            "upload_count": 5,
+            "last_upload_time": "2025-01-01 12:00:00",
+            "recent_strms": [{"name": "a.strm", "path": "/strm/a.strm"}],
+            "strm_count": 3,
+            "last_strm_time": "2025-01-01 12:00:00",
+        }
+        calls = []
+
+        def fake_json(body, **kw):
+            calls.append((body, kw.get("status_code", 200)))
+            return body
+
+        with patch("cloudstrmhelper.JSONResponse", fake_json):
+            plugin.clear_strm_history()
+        body, status = calls[-1]
+        self.assertEqual(status, 200)
+        self.assertTrue(body["state"])
+        self.assertEqual(plugin._stats["recent_strms"], [])
+        self.assertEqual(plugin._stats["strm_count"], 0)
+        self.assertEqual(plugin._stats["last_strm_time"], "")
+        # 上传相关不应受影响
+        self.assertEqual(len(plugin._stats["recent_uploads"]), 1)
+        self.assertEqual(plugin._stats["upload_count"], 5)
+
     def test_api_has_auth(self):
         """规范：不要默认匿名开放 API，每个端点须声明 auth。"""
         from cloudstrmhelper import CloudStrmHelper

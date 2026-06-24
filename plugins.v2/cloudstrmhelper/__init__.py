@@ -487,6 +487,8 @@ class CloudStrmHelper(_PluginBase):
             return f"{v:.2f} PB"
 
         manual_api = f"plugin/{self.__class__.__name__}/manual_action?apikey={settings.API_TOKEN}"
+        clear_upload_api = f"plugin/{self.__class__.__name__}/clear_upload_history?apikey={settings.API_TOKEN}"
+        clear_strm_api = f"plugin/{self.__class__.__name__}/clear_strm_history?apikey={settings.API_TOKEN}"
 
         def _menu_item(text, icon, params, color="primary"):
             """操作菜单项：VListItem，点击 POST /manual_action。"""
@@ -626,7 +628,16 @@ class CloudStrmHelper(_PluginBase):
                 "component": "VCard",
                 "props": {"variant": "outlined", "class": "mt-3"},
                 "content": [
-                    {"component": "VCardTitle", "text": "最近上传列表"},
+                    {"component": "VCardTitle", "props": {"class": "d-flex align-center py-3 px-4"},
+                     "content": [
+                         {"component": "span", "text": "最近上传列表"},
+                         {"component": "VSpacer"},
+                         {"component": "VBtn", "props": {
+                             "prepend-icon": "mdi-delete-sweep", "variant": "tonal",
+                             "color": "info", "size": "small", "density": "compact",
+                         }, "text": "清除上传历史",
+                          "events": {"click": {"api": clear_upload_api, "method": "post"}}},
+                     ]},
                     {"component": "VDivider", "props": {"class": "mx-4"}},
                     {"component": "VTable", "content": [
                         {"component": "thead", "content": [{"component": "tr", "content": [
@@ -645,7 +656,16 @@ class CloudStrmHelper(_PluginBase):
                 "component": "VCard",
                 "props": {"variant": "outlined", "class": "mt-3"},
                 "content": [
-                    {"component": "VCardTitle", "text": "最近生成 STRM 列表"},
+                    {"component": "VCardTitle", "props": {"class": "d-flex align-center py-3 px-4"},
+                     "content": [
+                         {"component": "span", "text": "最近生成 STRM 列表"},
+                         {"component": "VSpacer"},
+                         {"component": "VBtn", "props": {
+                             "prepend-icon": "mdi-delete-sweep", "variant": "tonal",
+                             "color": "info", "size": "small", "density": "compact",
+                         }, "text": "清除 STRM 历史",
+                          "events": {"click": {"api": clear_strm_api, "method": "post"}}},
+                     ]},
                     {"component": "VDivider", "props": {"class": "mx-4"}},
                     {"component": "VTable", "content": [
                         {"component": "thead", "content": [{"component": "tr", "content": [
@@ -703,6 +723,22 @@ class CloudStrmHelper(_PluginBase):
                 "auth": "apikey",
                 "summary": "手动同步",
                 "description": "手动触发一次全量同步",
+            },
+            {
+                "path": "/clear_upload_history",
+                "endpoint": self.clear_upload_history,
+                "methods": ["POST"],
+                "auth": "apikey",
+                "summary": "清除上传历史",
+                "description": "仅清除最近上传列表记录，不删除云端/本地文件",
+            },
+            {
+                "path": "/clear_strm_history",
+                "endpoint": self.clear_strm_history,
+                "methods": ["POST"],
+                "auth": "apikey",
+                "summary": "清除 STRM 历史",
+                "description": "仅清除最近 STRM 生成记录，不删除 .strm 文件",
             },
             {
                 "path": "/manual_action",
@@ -893,6 +929,40 @@ class CloudStrmHelper(_PluginBase):
             return JSONResponse({"state": False, "message": "未配置本地媒体路径"}, status_code=400)
         threading.Thread(target=self._safe_run_once, daemon=True).start()
         return JSONResponse({"state": True, "message": "已触发全量同步"})
+
+    def clear_upload_history(self, request: Request = None):
+        """清除最近上传历史（仅记录，不删除云端/本地文件）。"""
+        if not self._enabled:
+            return JSONResponse({"state": False, "message": "插件未启用"}, status_code=400)
+        try:
+            stats = getattr(self, "_stats", None) or self._load_stats()
+            stats["recent_uploads"] = []
+            stats["upload_count"] = 0
+            stats["last_upload_time"] = ""
+            self._stats = stats
+            self._save_stats()
+            logger.info("【云端STRM】上传历史已清除（云端/本地文件未删除）")
+            return JSONResponse({"state": True, "message": "上传历史已清除（云端/本地文件未删除）"})
+        except Exception as e:
+            logger.error(f"【云端STRM】清除上传历史失败: {e}", exc_info=True)
+            return JSONResponse({"state": False, "message": f"清除失败: {e}"}, status_code=500)
+
+    def clear_strm_history(self, request: Request = None):
+        """清除最近 STRM 生成历史（仅记录，不删除 .strm 文件）。"""
+        if not self._enabled:
+            return JSONResponse({"state": False, "message": "插件未启用"}, status_code=400)
+        try:
+            stats = getattr(self, "_stats", None) or self._load_stats()
+            stats["recent_strms"] = []
+            stats["strm_count"] = 0
+            stats["last_strm_time"] = ""
+            self._stats = stats
+            self._save_stats()
+            logger.info("【云端STRM】STRM 生成历史已清除（.strm 文件未删除）")
+            return JSONResponse({"state": True, "message": "STRM 生成历史已清除（.strm 文件未删除）"})
+        except Exception as e:
+            logger.error(f"【云端STRM】清除 STRM 历史失败: {e}", exc_info=True)
+            return JSONResponse({"state": False, "message": f"清除失败: {e}"}, status_code=500)
 
     def _safe_run_once(self) -> None:
         try:
@@ -2063,8 +2133,9 @@ class CloudStrmHelper(_PluginBase):
                                     {
                                         "component": "VCol", "props": {"cols": 12, "md": 3},
                                         "content": [{"component": "VSwitch", "props": {
-                                            "model": "once_sync", "label": "立刻全量同步",
-                                            "hint": "保存即触发一次", "persistent-hint": False,
+                                            "model": "once_sync", "label": "立即全量上传并生成 STRM",
+                                            "hint": "保存后扫描所有本地媒体目录，上传到 OpenList/AList 并按路径映射生成 STRM；已存在且无需更新的文件按同步策略跳过",
+                                            "persistent-hint": False,
                                         }}],
                                     },
                                     {

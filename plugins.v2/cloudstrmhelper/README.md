@@ -242,6 +242,14 @@ STRM 覆盖模式：
 
 状态：上传 `已上传`/`远端已存在`/`已删云端`/`已删本地`；STRM `新生成`/`已存在/已跳过`。统计通过插件数据持久化，重启后保留，并兼容旧 `recent_files` 结构迁移到 `recent_strms`。
 
+每个列表标题右侧带有「清除上传历史」和「清除 STRM 历史」按钮，用于只清除插件记录的上传或 STRM 生成历史（**不删除任何真实文件**——不清除 OpenList/AList 云端文件、不清除本地媒体文件、不清除 .strm 文件）。清除操作不会影响当前正在执行的同步任务，仅移除统计数据中的最近记录列表。
+
+> **操作区分提醒：**
+> - 「清除上传历史」/「清除 STRM 历史」→ **只清除记录，不删任何文件**
+> - 「删除云端」→ 真实删除 AList/OpenList 云端文件
+> - 「删云端和本地」→ 真实删除云端文件 + 本地媒体文件
+> - 「删除 STRM 文件」→ 真实删除本地 .strm 文件
+
 ## 安装
 
 把 `plugins.v2/cloudstrmhelper/` 放入 MoviePilot 插件仓库，或复制到 MoviePilot 本地插件目录 `config/plugins/cloudstrmhelper/`，重启 MoviePilot 后安装启用。
@@ -283,6 +291,8 @@ uvicorn
 | `/diagnose?probe=true` | `GET` | 在诊断基础上只读探测 AList/OpenList Token/地址/fs_get（不输出 raw_url/sign 完整内容） |
 | `/sync_now` | `GET/POST` | 手动触发一次全量同步 |
 | `/manual_action` | `POST` | 首页列表内单条操作，请求 body 为 JSON：`action`（`reupload`/`delete_remote`/`delete_remote_and_local`/`regenerate_strm`/`delete_strm`）、`local`、`remote`、`strm`；后台线程执行真实任务并返回 `{state, message}` |
+| `/clear_upload_history` | `POST` | 清除最近上传历史记录（仅清除记录，不删除云端/本地文件） |
+| `/clear_strm_history` | `POST` | 清除最近 STRM 生成历史记录（仅清除记录，不删除 .strm 文件） |
 
 `/diagnose` 输出的 302 相关字段：`strm_url_mode`、`resolve_final_url`、`direct_link_mode`、`redirect_cache_ttl`、`head_probe_mode`、`redirect_cache_size`、`redirect_error_cache_size`、`emby_proxy_enabled`、`emby_proxy_running`、`emby_proxy_listen`。
 
