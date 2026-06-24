@@ -11,7 +11,7 @@ import pathspec
 from apscheduler.schedulers.background import BackgroundScheduler
 from cachetools import TTLCache
 from fastapi import Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from app.core.config import settings
 from app.core.event import Event, eventmanager
@@ -21,7 +21,7 @@ from app.plugins import _PluginBase
 from app.schemas.types import EventType
 
 from .cloud_sync import TASK_SKIPPED, TASK_SUCCEEDED, AlistClient, CloudSync
-from .proxy_handler import ProxyHandler
+from .proxy_handler import DirectLink, ProxyHandler
 from .sse_listener import MoviePilotSseListener
 from .strm_generator import StrmGenerator
 from .transfer_listener import TransferListener, TransferRecord
@@ -58,7 +58,7 @@ class CloudStrmHelper(_PluginBase):
     plugin_desc = "整理入库自动复制到AList并生成STRM，Emby 302直链播放"
     # 图标：引用仓库 icons 目录下的图标文件（URL 形式，与官方插件一致）
     plugin_icon = "https://raw.githubusercontent.com/101letters/MoviePilot-Plugins/main/icons/cloudstrmhelper.png"
-    plugin_version = "1.3.2"
+    plugin_version = "1.4.0"
     plugin_author = "101letters"
     author_url = "https://github.com/101letters"
     plugin_config_prefix = "cloudstrmhelper_"
@@ -98,6 +98,7 @@ class CloudStrmHelper(_PluginBase):
     # 播放入口 / 302 可靠性配置
     _strm_url_mode = "moviepilot_redirect"
     _resolve_final_url = True
+    _direct_link_mode = "prefer_raw_url"
     _redirect_cache_ttl = 120
     _head_probe_mode = "ok"
 
@@ -163,6 +164,8 @@ class CloudStrmHelper(_PluginBase):
             self._strm_url_mode = self._normalize_strm_url_mode(
                 config.get("strm_url_mode") or "moviepilot_redirect")
             self._resolve_final_url = bool(config.get("resolve_final_url", True))
+            self._direct_link_mode = self._normalize_direct_link_mode(
+                config.get("direct_link_mode") or "prefer_raw_url")
             try:
                 self._redirect_cache_ttl = max(0, int(config.get("redirect_cache_ttl") or 120))
             except (TypeError, ValueError):
@@ -220,6 +223,7 @@ class CloudStrmHelper(_PluginBase):
         self._proxy = ProxyHandler(
             self._alist_client,
             resolve_final_url=self._resolve_final_url,
+            direct_link_mode=self._direct_link_mode,
         ) if self._alist_client else None
         self._strm_gen = StrmGenerator(self)
         self._cloud_sync = CloudSync(
@@ -507,16 +511,15 @@ class CloudStrmHelper(_PluginBase):
 
         cache_key = self._redirect_cache_key(path, ua)
         try:
-            url = self._cached_resolve(cache_key, path, ua)
+            link = self._cached_resolve(cache_key, path, ua)
         except Exception as e:
             # 写负缓存并返回 502
             self._redirect_error_cache[path] = str(e)[:200]
             logger.error(f"【302跳转】解析失败: path={path}, err={e}", exc_info=True)
             return JSONResponse({"state": False, "message": f"解析直链失败: {e}"}, status_code=502)
 
-        resp = RedirectResponse(url=url, status_code=302)
-        resp.headers["Cache-Control"] = "no-store"
-        resp.headers["X-CloudStrm-Mode"] = self._strm_url_mode
+        resp = RedirectResponse(url=link.url, status_code=302)
+        self._set_redirect_headers(resp, link)
         return resp
 
     def _handle_head(self, ua: str, path: str):
@@ -531,33 +534,47 @@ class CloudStrmHelper(_PluginBase):
             if self._proxy is None:
                 return JSONResponse({"state": False, "message": "代理未初始化"}, status_code=503)
             try:
-                url = self._cached_resolve(self._redirect_cache_key(path, ua), path, ua)
+                link = self._cached_resolve(self._redirect_cache_key(path, ua), path, ua)
             except Exception as e:
                 self._redirect_error_cache[path] = str(e)[:200]
                 return JSONResponse({"state": False, "message": f"解析直链失败: {e}"}, status_code=502)
-            resp = RedirectResponse(url=url, status_code=302)
-            resp.headers["Cache-Control"] = "no-store"
-            resp.headers["X-CloudStrm-Mode"] = self._strm_url_mode
+            resp = RedirectResponse(url=link.url, status_code=302)
+            self._set_redirect_headers(resp, link)
             return resp
         if mode == "resolve" and self._proxy is not None:
             try:
-                url = self._proxy.resolve(path, ua)
+                link = self._cached_resolve(self._redirect_cache_key(path, ua), path, ua)
                 from .proxy_handler import _safe_url_for_log
                 resp = JSONResponse({"state": True}, status_code=200)
-                resp.headers["X-Resolved-Url"] = _safe_url_for_log(url)
+                resp.headers["X-Resolved-Url"] = _safe_url_for_log(link.url)
+                self._set_redirect_headers(resp, link)
                 return resp
             except Exception as e:
                 self._redirect_error_cache[path] = str(e)[:200]
                 return JSONResponse({"state": False, "message": f"解析直链失败: {e}"}, status_code=502)
         # ok 模式
-        return JSONResponse({"state": True}, status_code=200)
+        resp = Response(status_code=200)
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["X-CloudStrm-Mode"] = self._strm_url_mode
+        resp.headers["X-CloudStrm-Head-Mode"] = "ok"
+        return resp
 
-    def _redirect_cache_key(self, path: str, ua: str) -> Tuple[str, str, str]:
-        """cache key = (path, ua-hash[:16], 解析模式)，避免完整 UA 进缓存。"""
+    def _set_redirect_headers(self, resp, link: DirectLink) -> None:
+        """302/诊断响应头只放来源状态，不泄露真实 URL。"""
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["X-CloudStrm-Mode"] = self._strm_url_mode
+        resp.headers["X-CloudStrm-Link-Mode"] = self._direct_link_mode
+        resp.headers["X-CloudStrm-Link-Source"] = link.source
+        resp.headers["X-CloudStrm-Final-Resolved"] = "1" if link.resolved_final else "0"
+        direct = link.source == "raw_url" or bool(link.resolved_final)
+        resp.headers["X-CloudStrm-Direct-Link"] = "1" if direct else "0"
+
+    def _redirect_cache_key(self, path: str, ua: str) -> Tuple[str, str, str, str]:
+        """cache key = (path, ua-hash[:16], 解析模式, 直链策略)，避免完整 UA 进缓存。"""
         import hashlib
         ua_key = hashlib.sha256((ua or "").encode()).hexdigest()[:16]
         mode_key = "final" if self._resolve_final_url else "origin"
-        return (path, ua_key, mode_key)
+        return (path, ua_key, mode_key, self._direct_link_mode)
 
     def _get_resolve_lock(self, cache_key) -> threading.Lock:
         """获取 cache key 对应的 in-flight 锁（请求合并）。"""
@@ -569,7 +586,15 @@ class CloudStrmHelper(_PluginBase):
                 self._resolve_locks[key_str] = lock
             return lock
 
-    def _cached_resolve(self, cache_key, path: str, ua: str) -> str:
+    @staticmethod
+    def _coerce_direct_link(value) -> Optional[DirectLink]:
+        if isinstance(value, DirectLink):
+            return value
+        if isinstance(value, str) and value:
+            return DirectLink(url=value, source="legacy_cache")
+        return None
+
+    def _cached_resolve(self, cache_key, path: str, ua: str) -> DirectLink:
         """带 TTL 缓存 + in-flight 合并的解析。
 
         1. 查缓存命中直接返回；
@@ -577,18 +602,26 @@ class CloudStrmHelper(_PluginBase):
         3. 未命中才真正调用 AList/OpenList；
         4. 写缓存后释放锁。
         """
-        cached_url = self._redirect_cache.get(cache_key)
-        if cached_url:
-            return cached_url
+        cached_link = self._coerce_direct_link(self._redirect_cache.get(cache_key))
+        if cached_link and not cached_link.expires_soon():
+            return cached_link
+        if cached_link:
+            self._redirect_cache.pop(cache_key, None)
         lock = self._get_resolve_lock(cache_key)
         with lock:
             # double-check
-            cached_url = self._redirect_cache.get(cache_key)
-            if cached_url:
-                return cached_url
-            url = self._proxy.resolve(path, ua)
-            self._redirect_cache[cache_key] = url
-            return url
+            cached_link = self._coerce_direct_link(self._redirect_cache.get(cache_key))
+            if cached_link and not cached_link.expires_soon():
+                return cached_link
+            if cached_link:
+                self._redirect_cache.pop(cache_key, None)
+            if hasattr(self._proxy, "resolve_link"):
+                link = self._proxy.resolve_link(path, ua)
+            else:
+                link = DirectLink(url=self._proxy.resolve(path, ua), source="legacy_proxy")
+            if self._redirect_cache_ttl > 0 and not link.expires_soon():
+                self._redirect_cache[cache_key] = link
+            return link
 
     def status(self, request: Request = None):
         """返回云同步进度快照。"""
@@ -864,6 +897,16 @@ class CloudStrmHelper(_PluginBase):
         return "moviepilot_redirect"
 
     @staticmethod
+    def _normalize_direct_link_mode(value: str) -> str:
+        """302 直链来源策略：优先 raw_url / 严格 raw_url / AList 下载端点。"""
+        normalized = (value or "prefer_raw_url").strip().lower()
+        if normalized in ("raw_url_only", "raw_url", "raw", "strict", "strict_raw"):
+            return "raw_url_only"
+        if normalized in ("alist_download", "alist_direct", "alist", "download", "d"):
+            return "alist_download"
+        return "prefer_raw_url"
+
+    @staticmethod
     def _normalize_head_probe_mode(value: str) -> str:
         """HEAD 探测策略：ok（兼容200）/ redirect（严格302）/ resolve（诊断200+header）。"""
         normalized = (value or "ok").strip().lower()
@@ -1115,6 +1158,7 @@ class CloudStrmHelper(_PluginBase):
                 "path_mapping": self._transfer_mp_mediaserver_paths,
                 "strm_url_mode": self._strm_url_mode,
                 "resolve_final_url": self._resolve_final_url,
+                "direct_link_mode": self._direct_link_mode,
                 "redirect_cache_ttl": self._redirect_cache_ttl,
                 "head_probe_mode": self._head_probe_mode,
             },
@@ -1128,6 +1172,7 @@ class CloudStrmHelper(_PluginBase):
             "redirect": {
                 "strm_url_mode": self._strm_url_mode,
                 "resolve_final_url": self._resolve_final_url,
+                "direct_link_mode": self._direct_link_mode,
                 "redirect_cache_ttl": self._redirect_cache_ttl,
                 "head_probe_mode": self._head_probe_mode,
                 "redirect_cache_size": len(self._redirect_cache),
@@ -1351,6 +1396,7 @@ class CloudStrmHelper(_PluginBase):
             "once_sync": self._once_sync,
             "strm_url_mode": self._strm_url_mode,
             "resolve_final_url": self._resolve_final_url,
+            "direct_link_mode": self._direct_link_mode,
             "redirect_cache_ttl": self._redirect_cache_ttl,
             "head_probe_mode": self._head_probe_mode,
         })
@@ -1482,14 +1528,27 @@ class CloudStrmHelper(_PluginBase):
                                 "component": "VRow",
                                 "content": [
                                     {
-                                        "component": "VCol", "props": {"cols": 12, "md": 4},
+                                        "component": "VCol", "props": {"cols": 12, "md": 3},
                                         "content": [{"component": "VSwitch", "props": {
                                             "model": "resolve_final_url", "label": "解析最终直链",
                                             "hint": "HEAD 跟随上游重定向，把最终 URL 直接返回客户端", "persistent-hint": True,
                                         }}],
                                     },
                                     {
-                                        "component": "VCol", "props": {"cols": 12, "md": 4},
+                                        "component": "VCol", "props": {"cols": 12, "md": 3},
+                                        "content": [{"component": "VSelect", "props": {
+                                            "model": "direct_link_mode", "label": "直链来源策略",
+                                            "items": [
+                                                {"title": "优先云盘 raw_url（推荐）", "value": "prefer_raw_url"},
+                                                {"title": "仅云盘 raw_url（严格零上行）", "value": "raw_url_only"},
+                                                {"title": "AList/OpenList /d 兼容", "value": "alist_download"},
+                                            ],
+                                            "hint": "严格模式没有 raw_url 时直接失败，避免回退到服务器下载端点",
+                                            "persistent-hint": True,
+                                        }}],
+                                    },
+                                    {
+                                        "component": "VCol", "props": {"cols": 12, "md": 3},
                                         "content": [{"component": "VTextField", "props": {
                                             "model": "redirect_cache_ttl", "label": "直链缓存时间（秒）",
                                             "placeholder": "120", "type": "number",
@@ -1497,7 +1556,7 @@ class CloudStrmHelper(_PluginBase):
                                         }}],
                                     },
                                     {
-                                        "component": "VCol", "props": {"cols": 12, "md": 4},
+                                        "component": "VCol", "props": {"cols": 12, "md": 3},
                                         "content": [{"component": "VSelect", "props": {
                                             "model": "head_probe_mode", "label": "HEAD 探测策略",
                                             "items": [
@@ -1756,6 +1815,7 @@ class CloudStrmHelper(_PluginBase):
             "moviepilot_address": DEFAULT_MOVIEPILOT_ADDRESS,
             "strm_url_mode": "moviepilot_redirect",
             "resolve_final_url": True,
+            "direct_link_mode": "prefer_raw_url",
             "redirect_cache_ttl": 120,
             "head_probe_mode": "ok",
             "cloud_storage_type": "alist",

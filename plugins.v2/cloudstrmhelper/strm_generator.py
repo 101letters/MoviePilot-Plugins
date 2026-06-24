@@ -122,14 +122,19 @@ class StrmGenerator:
         这是真正绕过 MoviePilot/OpenList 数据流量的模式，但 raw_url 可能过期；适合只想要
         云盘厂商直链、且接受后续需要重新生成 STRM 的场景。
         """
+        strict_raw = getattr(self.plugin, "_direct_link_mode", "prefer_raw_url") == "raw_url_only"
         alist_client = getattr(self.plugin, "_alist_client", None)
         if not alist_client:
+            if strict_raw:
+                raise Exception("cloud_raw_url 严格模式需要 AList/OpenList 客户端")
             logger.warning(f"【STRM生成】cloud_raw_url 需要 AList/OpenList 客户端，回退 /d 地址: {remote_path}")
             return self._build_alist_download_url(remote_path)
 
         try:
             info = alist_client.fs_get(remote_path) or {}
         except Exception as e:
+            if strict_raw:
+                raise Exception(f"cloud_raw_url 严格模式取 raw_url 失败: {e}")
             logger.warning(f"【STRM生成】cloud_raw_url 取 raw_url 失败，回退 /d 地址: {remote_path} ({e})")
             return self._build_alist_download_url(remote_path)
 
@@ -146,6 +151,8 @@ class StrmGenerator:
             return raw_url
 
         sign = info.get("sign") or ""
+        if strict_raw:
+            raise Exception("cloud_raw_url 严格模式未拿到 raw_url")
         logger.warning(f"【STRM生成】cloud_raw_url 未拿到 raw_url，回退 AList/OpenList /d 地址: {remote_path}")
         url = self._build_alist_download_url(remote_path)
         return f"{url}?sign={sign}" if sign else url

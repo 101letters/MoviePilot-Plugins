@@ -39,6 +39,7 @@ def _stub_app_modules():
     _stub("fastapi.responses", {
         "RedirectResponse": MagicMock,
         "JSONResponse": MagicMock,
+        "Response": MagicMock,
     })
     # pydantic（fastapi 间接依赖，本机若有则不覆盖）
     try:
@@ -440,12 +441,28 @@ class TestAlistClientBuildUrl(unittest.TestCase):
         url = ph._build_url({}, "/foo.mkv")
         self.assertEqual(url, "http://192.168.31.5:5244/d/foo.mkv")
 
+    def test_raw_url_only_rejects_d_fallback(self):
+        from cloudstrmhelper.proxy_handler import ProxyHandler
+        alist = MagicMock()
+        alist.url = "http://192.168.31.5:5244"
+        ph = ProxyHandler(alist, follow_redirects=False, direct_link_mode="raw_url_only")
+        with self.assertRaises(Exception):
+            ph._build_url({"sign": "mysign"}, "/foo.mkv")
+
+    def test_alist_download_mode_ignores_raw_url(self):
+        from cloudstrmhelper.proxy_handler import ProxyHandler
+        alist = MagicMock()
+        alist.url = "http://192.168.31.5:5244"
+        ph = ProxyHandler(alist, follow_redirects=False, direct_link_mode="alist_download")
+        url = ph._build_url({"raw_url": "http://cdn/foo?sig=x", "sign": "mysign"}, "/foo.mkv")
+        self.assertEqual(url, "http://192.168.31.5:5244/d/foo.mkv?sign=mysign")
+
 
 class TestPluginMetadata(unittest.TestCase):
     def test_metadata_present(self):
         from cloudstrmhelper import CloudStrmHelper
         self.assertEqual(CloudStrmHelper.plugin_name, "云端STRM整理助手")
-        self.assertEqual(CloudStrmHelper.plugin_version, "1.3.2")
+        self.assertEqual(CloudStrmHelper.plugin_version, "1.4.0")
         self.assertEqual(CloudStrmHelper.plugin_config_prefix, "cloudstrmhelper_")
         self.assertEqual(CloudStrmHelper.plugin_author, "101letters")
         self.assertEqual(CloudStrmHelper.auth_level, 1)
@@ -474,6 +491,7 @@ class TestPluginMetadata(unittest.TestCase):
         self.assertIn("/media/tv#/strm/test/电视剧", defaults["local_strm_paths"])
         self.assertEqual(defaults["strm_output_path"], "/strm/test/华语电影")
         self.assertEqual(defaults["sync_mode"], "copy")
+        self.assertEqual(defaults["direct_link_mode"], "prefer_raw_url")
 
     def test_api_endpoints(self):
         from cloudstrmhelper import CloudStrmHelper
@@ -529,6 +547,11 @@ class TestPluginMetadata(unittest.TestCase):
         plugin._cloud_sync = None
         plugin._strm_gen = None
         plugin._proxy = None
+        plugin._strm_url_mode = "moviepilot_redirect"
+        plugin._resolve_final_url = True
+        plugin._direct_link_mode = "prefer_raw_url"
+        plugin._redirect_cache_ttl = 120
+        plugin._head_probe_mode = "ok"
         plugin._stats = {"strm_count": 2, "last_strm_time": "2026-01-01 00:00:00", "recent_files": []}
 
         data = plugin._diagnostic_snapshot(probe=False)
@@ -537,6 +560,7 @@ class TestPluginMetadata(unittest.TestCase):
         self.assertEqual(data["config"]["alist_token"], "secr...alue")
         self.assertEqual(data["mapping_sample"]["remote"], "/cloud/example.mkv")
         self.assertEqual(data["mapping_sample"]["strm"], "/strm/movies/example.strm")
+        self.assertEqual(data["redirect"]["direct_link_mode"], "prefer_raw_url")
         self.assertEqual(data["phase_order"], ["listen", "sync", "strm", "refresh"])
 
 
@@ -773,6 +797,7 @@ class TestStrmUrlMode(unittest.TestCase):
         plugin._alist_url = alist_url
         plugin._alist_client = alist_client
         plugin._resolve_final_url = False
+        plugin._direct_link_mode = "prefer_raw_url"
         return StrmGenerator(plugin), plugin
 
     def test_moviepilot_redirect_mode(self):
@@ -835,6 +860,14 @@ class TestStrmUrlMode(unittest.TestCase):
         url = gen._build_strm_url("/cloud/Foo.mkv")
         self.assertEqual(url, "http://192.168.31.6:5244/d/cloud/Foo.mkv?sign=abc")
 
+    def test_cloud_raw_url_strict_mode_requires_raw_url(self):
+        alist = MagicMock()
+        alist.fs_get.return_value = {"sign": "abc"}
+        gen, plugin = self._make_gen("cloud_raw_url", alist_client=alist)
+        plugin._direct_link_mode = "raw_url_only"
+        with self.assertRaises(Exception):
+            gen._build_strm_url("/cloud/Foo.mkv")
+
 
 class TestSafeUrlForLog(unittest.TestCase):
     """v1.3.0: 日志脱敏。"""
@@ -864,6 +897,17 @@ class TestProxyHandlerResolve(unittest.TestCase):
         ph.alist.fs_get.return_value = {"raw_url": "http://upstream/foo?token=abc", "name": "x.mkv"}
         url = ph.resolve("/x.mkv", resolve_final_url=False)
         self.assertEqual(url, "http://upstream/foo?token=abc")
+
+    def test_resolve_link_keeps_source_and_expiry(self):
+        ph = self._make_ph()
+        ph.alist.fs_get.return_value = {
+            "raw_url": "http://upstream/foo.mkv?Expires=4102444800&token=abc",
+            "name": "x.mkv",
+        }
+        link = ph.resolve_link("/x.mkv", resolve_final_url=False)
+        self.assertEqual(link.source, "raw_url")
+        self.assertEqual(link.url, "http://upstream/foo.mkv?Expires=4102444800&token=abc")
+        self.assertEqual(link.expires_at, 4102444800)
 
     def test_no_raw_url_uses_d_with_sign(self):
         ph = self._make_ph()
@@ -931,9 +975,11 @@ class TestRedirectEndpointCaching(unittest.TestCase):
 
     def _make_plugin(self):
         from cloudstrmhelper import CloudStrmHelper
+        from cloudstrmhelper.proxy_handler import DirectLink
         plugin = CloudStrmHelper.__new__(CloudStrmHelper)
         plugin._strm_url_mode = "moviepilot_redirect"
         plugin._resolve_final_url = False
+        plugin._direct_link_mode = "prefer_raw_url"
         plugin._redirect_cache_ttl = 120
         plugin._head_probe_mode = "ok"
         from cachetools import TTLCache
@@ -942,7 +988,7 @@ class TestRedirectEndpointCaching(unittest.TestCase):
         plugin._resolve_locks = {}
         plugin._resolve_locks_guard = __import__("threading").Lock()
         plugin._proxy = MagicMock()
-        plugin._proxy.resolve.return_value = "http://resolved/foo"
+        plugin._proxy.resolve_link.return_value = DirectLink(url="http://resolved/foo", source="raw_url")
         return plugin
 
     def test_cache_key_contains_ua_hash_and_mode(self):
@@ -950,38 +996,69 @@ class TestRedirectEndpointCaching(unittest.TestCase):
         k1 = plugin._redirect_cache_key("/p", "VLC/1")
         k2 = plugin._redirect_cache_key("/p", "VLC/2")
         k3 = plugin._redirect_cache_key("/p", "VLC/1")
-        self.assertEqual(len(k1), 3)
+        self.assertEqual(len(k1), 4)
         self.assertEqual(k1, k3)  # 同 UA 同 path 同 key
         self.assertNotEqual(k1, k2)  # 不同 UA 不同 key
         self.assertEqual(k1[0], "/p")
         self.assertEqual(k1[2], "origin")  # resolve_final_url=False
+        self.assertEqual(k1[3], "prefer_raw_url")
 
     def test_cached_resolve_hits_cache(self):
+        from cloudstrmhelper.proxy_handler import DirectLink
         plugin = self._make_plugin()
         key = plugin._redirect_cache_key("/p", "ua")
-        plugin._redirect_cache[key] = "http://cached/foo"
-        url = plugin._cached_resolve(key, "/p", "ua")
-        self.assertEqual(url, "http://cached/foo")
-        plugin._proxy.resolve.assert_not_called()
+        plugin._redirect_cache[key] = DirectLink(url="http://cached/foo", source="raw_url")
+        link = plugin._cached_resolve(key, "/p", "ua")
+        self.assertEqual(link.url, "http://cached/foo")
+        plugin._proxy.resolve_link.assert_not_called()
 
     def test_cached_resolve_miss_calls_proxy(self):
         plugin = self._make_plugin()
         key = plugin._redirect_cache_key("/p", "ua")
-        url = plugin._cached_resolve(key, "/p", "ua")
-        self.assertEqual(url, "http://resolved/foo")
-        plugin._proxy.resolve.assert_called_once()
+        link = plugin._cached_resolve(key, "/p", "ua")
+        self.assertEqual(link.url, "http://resolved/foo")
+        self.assertEqual(link.source, "raw_url")
+        plugin._proxy.resolve_link.assert_called_once()
         # 写入缓存
-        self.assertEqual(plugin._redirect_cache.get(key), "http://resolved/foo")
+        self.assertEqual(plugin._redirect_cache.get(key).url, "http://resolved/foo")
 
     def test_cached_resolve_double_check_under_lock(self):
         """in-flight 合并：锁内再次查缓存，避免并发重复调用。"""
+        from cloudstrmhelper.proxy_handler import DirectLink
         plugin = self._make_plugin()
         key = plugin._redirect_cache_key("/p", "ua")
         # 预置缓存，模拟另一个线程刚写
-        plugin._redirect_cache[key] = "http://just-cached"
-        url = plugin._cached_resolve(key, "/p", "ua")
-        self.assertEqual(url, "http://just-cached")
-        plugin._proxy.resolve.assert_not_called()
+        plugin._redirect_cache[key] = DirectLink(url="http://just-cached", source="raw_url")
+        link = plugin._cached_resolve(key, "/p", "ua")
+        self.assertEqual(link.url, "http://just-cached")
+        plugin._proxy.resolve_link.assert_not_called()
+
+    def test_cached_resolve_drops_expiring_direct_link(self):
+        from cloudstrmhelper.proxy_handler import DirectLink
+        plugin = self._make_plugin()
+        key = plugin._redirect_cache_key("/p", "ua")
+        plugin._redirect_cache[key] = DirectLink(
+            url="http://expired/foo?Expires=1",
+            source="raw_url",
+            expires_at=1,
+        )
+        link = plugin._cached_resolve(key, "/p", "ua")
+        self.assertEqual(link.url, "http://resolved/foo")
+        plugin._proxy.resolve_link.assert_called_once()
+
+    def test_redirect_headers_expose_source_without_url(self):
+        from cloudstrmhelper.proxy_handler import DirectLink
+        plugin = self._make_plugin()
+        resp = MagicMock()
+        resp.headers = {}
+        plugin._set_redirect_headers(
+            resp,
+            DirectLink(url="http://cdn/foo?token=secret", source="raw_url", resolved_final=False),
+        )
+        self.assertEqual(resp.headers["X-CloudStrm-Link-Source"], "raw_url")
+        self.assertEqual(resp.headers["X-CloudStrm-Direct-Link"], "1")
+        serialized = json.dumps(resp.headers)
+        self.assertNotIn("secret", serialized)
 
 
 class TestStatsMigration(unittest.TestCase):
@@ -1122,6 +1199,7 @@ class TestNewConfigPersistence(unittest.TestCase):
         plugin._once_sync = False
         plugin._strm_url_mode = "moviepilot_redirect"
         plugin._resolve_final_url = True
+        plugin._direct_link_mode = "prefer_raw_url"
         plugin._redirect_cache_ttl = 120
         plugin._head_probe_mode = "ok"
         captured = {}
@@ -1129,7 +1207,8 @@ class TestNewConfigPersistence(unittest.TestCase):
         plugin._update_config()
         for key in (
             "upload_path_mappings", "strm_path_mappings",
-            "strm_url_mode", "resolve_final_url", "redirect_cache_ttl", "head_probe_mode",
+            "strm_url_mode", "resolve_final_url", "direct_link_mode",
+            "redirect_cache_ttl", "head_probe_mode",
         ):
             self.assertIn(key, captured, f"{key} 未持久化")
 
@@ -1148,6 +1227,13 @@ class TestNewConfigPersistence(unittest.TestCase):
         self.assertEqual(CloudStrmHelper._normalize_head_probe_mode("redirect"), "redirect")
         self.assertEqual(CloudStrmHelper._normalize_head_probe_mode("resolve"), "resolve")
         self.assertEqual(CloudStrmHelper._normalize_head_probe_mode("garbage"), "ok")
+
+    def test_normalize_direct_link_mode(self):
+        from cloudstrmhelper import CloudStrmHelper
+        self.assertEqual(CloudStrmHelper._normalize_direct_link_mode("prefer_raw_url"), "prefer_raw_url")
+        self.assertEqual(CloudStrmHelper._normalize_direct_link_mode("raw_url"), "raw_url_only")
+        self.assertEqual(CloudStrmHelper._normalize_direct_link_mode("alist"), "alist_download")
+        self.assertEqual(CloudStrmHelper._normalize_direct_link_mode("garbage"), "prefer_raw_url")
 
     def test_diagnose_includes_redirect_fields(self):
         from cloudstrmhelper import CloudStrmHelper
@@ -1174,6 +1260,7 @@ class TestNewConfigPersistence(unittest.TestCase):
         plugin._transfer_mp_mediaserver_paths = ""
         plugin._strm_url_mode = "moviepilot_redirect"
         plugin._resolve_final_url = True
+        plugin._direct_link_mode = "prefer_raw_url"
         plugin._redirect_cache_ttl = 120
         plugin._head_probe_mode = "ok"
         from cachetools import TTLCache
@@ -1189,6 +1276,7 @@ class TestNewConfigPersistence(unittest.TestCase):
         data = plugin._diagnostic_snapshot(probe=False)
         self.assertEqual(data["redirect"]["strm_url_mode"], "moviepilot_redirect")
         self.assertEqual(data["redirect"]["resolve_final_url"], True)
+        self.assertEqual(data["redirect"]["direct_link_mode"], "prefer_raw_url")
         self.assertEqual(data["redirect"]["redirect_cache_ttl"], 120)
         self.assertEqual(data["redirect"]["head_probe_mode"], "ok")
         self.assertEqual(data["redirect"]["redirect_cache_size"], 0)

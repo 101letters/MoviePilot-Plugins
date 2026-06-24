@@ -2,13 +2,17 @@
 
 实现要点（参考 MediaWarp 的 AlistStrm 解析 + MediaRelay 的请求合并思想 + p123strmhelper 的自托管 302）：
 - 收到播放请求（.strm 内容 URL）→ 解析 path 参数 → AList/OpenList FsGet 取真实直链。
-- 优先 raw_url（AList 上游真实直链）；无则构建 {alist_url}/d{path}?sign={sign}。
+- direct_link_mode 控制来源：优先 raw_url、严格 raw_url、或 AList/OpenList /d 兼容。
 - resolve_final_url=True 时用 HEAD 跟随重定向取最终 URL（≤10 跳，循环检测），HEAD 失败回退 GET Range bytes=0-0，最终失败回退原始 URL 不中断播放。
+- URL query 中可识别过期时间时携带 expires_at，端点缓存会提前失效，避免返回过期直链。
 - head_probe_mode 由端点层使用（ok/redirect/resolve），本模块只负责解析。
 - 日志脱敏：_safe_url_for_log 只保留 scheme://host/path，去掉 query value。
 - 失败 raise，端点层捕获后写负缓存并返回 502 JSON。
 """
-from urllib.parse import quote, urljoin, urlsplit, urlunsplit
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from time import time
+from urllib.parse import parse_qsl, quote, urljoin, urlsplit, urlunsplit
 from typing import Optional
 
 import requests
@@ -20,6 +24,38 @@ MAX_REDIRECT_ATTEMPTS = 10
 
 # 最终 URL 解析的重试策略：(connect_timeout, read_timeout)
 _RESOLVE_TIMEOUTS = ((3.0, 10.0), (3.0, 15.0), (5.0, 20.0))
+_DIRECT_LINK_MODES = {"prefer_raw_url", "raw_url_only", "alist_download"}
+_ABSOLUTE_EXPIRY_QUERY_KEYS = {
+    "expires",
+    "expire",
+    "expires_at",
+    "expire_at",
+    "expiration",
+    "expiry",
+    "deadline",
+    "e",
+    "x-oss-expires",
+    "x-cos-expires",
+}
+
+
+@dataclass(frozen=True)
+class DirectLink:
+    """一次 302 解析结果。
+
+    source 用于诊断和响应头，不包含任何敏感 URL 值。
+    """
+
+    url: str
+    source: str
+    resolved_final: bool = False
+    expires_at: Optional[float] = None
+
+    def expires_soon(self, safety_seconds: int = 5, now: Optional[float] = None) -> bool:
+        if not self.expires_at:
+            return False
+        current = time() if now is None else now
+        return self.expires_at <= current + safety_seconds
 
 
 def _safe_url_for_log(url: str) -> str:
@@ -42,15 +78,106 @@ def _safe_url_for_log(url: str) -> str:
         return url.split("?", 1)[0] if "?" in url else url
 
 
+def _normalize_direct_link_mode(value: str) -> str:
+    """直链来源策略。
+
+    prefer_raw_url：优先 raw_url，无 raw_url 回退 /d；
+    raw_url_only：严格只允许 raw_url；
+    alist_download：始终返回 /d 下载端点。
+    """
+    normalized = (value or "prefer_raw_url").strip().lower()
+    aliases = {
+        "prefer": "prefer_raw_url",
+        "prefer_raw": "prefer_raw_url",
+        "raw": "raw_url_only",
+        "raw_url": "raw_url_only",
+        "strict_raw": "raw_url_only",
+        "strict": "raw_url_only",
+        "alist": "alist_download",
+        "alist_direct": "alist_download",
+        "download": "alist_download",
+        "d": "alist_download",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized in _DIRECT_LINK_MODES:
+        return normalized
+    return "prefer_raw_url"
+
+
+def _parse_epoch_seconds(value: str) -> Optional[float]:
+    """解析 URL query 中常见的 epoch 秒/毫秒。"""
+    try:
+        ts = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    # 小数字常是 TTL 而不是 epoch；没有配套 date 时不要误判。
+    if ts < 1_000_000_000:
+        return None
+    if ts > 10_000_000_000:
+        ts = ts / 1000
+    return ts
+
+
+def _parse_utc_compact_date(value: str) -> Optional[float]:
+    """解析 S3/GCS 风格的 20260624T120000Z。"""
+    text = str(value or "").strip()
+    for fmt in ("%Y%m%dT%H%M%SZ", "%Y%m%dT%H%M%S.%fZ"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _extract_url_expiry(url: str) -> Optional[float]:
+    """从常见云盘/CDN签名 URL 中提取过期时间。
+
+    只用于缓存提前失效；解析不到时返回 None，不影响播放。
+    """
+    try:
+        params = {
+            key.lower(): value
+            for key, value in parse_qsl(urlsplit(url).query, keep_blank_values=True)
+        }
+    except Exception:
+        return None
+
+    for key in _ABSOLUTE_EXPIRY_QUERY_KEYS:
+        if key in params:
+            ts = _parse_epoch_seconds(params[key])
+            if ts:
+                return ts
+
+    for date_key, duration_key in (
+        ("x-amz-date", "x-amz-expires"),
+        ("x-goog-date", "x-goog-expires"),
+    ):
+        if date_key not in params or duration_key not in params:
+            continue
+        started_at = _parse_utc_compact_date(params[date_key])
+        if not started_at:
+            continue
+        try:
+            ttl = float(params[duration_key])
+        except (TypeError, ValueError):
+            continue
+        if ttl > 0:
+            return started_at + ttl
+
+    return None
+
+
 class ProxyHandler:
     """302 解析器：把 AList/OpenList 云端路径解析为可直链访问的 URL。"""
 
     def __init__(self, alist_client, follow_redirects: bool = True,
-                 resolve_final_url: bool = True):
+                 resolve_final_url: bool = True,
+                 direct_link_mode: str = "prefer_raw_url"):
         # follow_redirects 保留兼容；实际由 resolve_final_url 控制
         self.alist = alist_client
         self.follow_redirects = follow_redirects
         self.resolve_final_url = resolve_final_url
+        self.direct_link_mode = _normalize_direct_link_mode(direct_link_mode)
 
     def resolve(self, remote_path: str, ua: str = "",
                 resolve_final_url: Optional[bool] = None) -> str:
@@ -62,6 +189,11 @@ class ProxyHandler:
         :return: 可 302 跳转的最终 URL
         :raises Exception: 解析失败（端点层捕获写负缓存）
         """
+        return self.resolve_link(remote_path, ua, resolve_final_url).url
+
+    def resolve_link(self, remote_path: str, ua: str = "",
+                     resolve_final_url: Optional[bool] = None) -> DirectLink:
+        """把 AList/OpenList 云端路径解析为带来源信息的直链结果。"""
         if not self.alist:
             raise Exception("AList/OpenList 客户端未初始化")
 
@@ -72,16 +204,24 @@ class ProxyHandler:
         if info.get("is_dir"):
             raise Exception(f"目标路径是目录而非文件: {remote_path}")
 
-        url = self._build_url(info, remote_path)
-        logger.info(f"【302跳转】解析直链: {remote_path} -> {_safe_url_for_log(url)}")
+        link = self._build_direct_link(info, remote_path)
+        logger.info(
+            f"【302跳转】解析直链: {remote_path} -> {_safe_url_for_log(link.url)} "
+            f"(source={link.source})"
+        )
 
         # 2. 可选：跟随重定向取最终 URL
         do_resolve = self.resolve_final_url if resolve_final_url is None else resolve_final_url
         if do_resolve:
-            final = self._resolve_final_url(url, ua)
+            final = self._resolve_final_url(link.url, ua)
             if final:
-                return final
-        return url
+                return DirectLink(
+                    url=final,
+                    source=link.source,
+                    resolved_final=final != link.url,
+                    expires_at=_extract_url_expiry(final) or link.expires_at,
+                )
+        return link
 
     def _build_url(self, info: dict, remote_path: str) -> str:
         """从 FsGet 响应构建直链 URL。
@@ -89,10 +229,28 @@ class ProxyHandler:
         优先 raw_url（AList 上游真实直链，已含 sign/expiry）；
         无 raw_url 则用 AList 自身的 /d/<path>?sign=<sign> 下载端点。
         """
-        raw_url = info.get("raw_url")
-        if raw_url:
-            return raw_url
+        return self._build_direct_link(info, remote_path).url
 
+    def _build_direct_link(self, info: dict, remote_path: str) -> DirectLink:
+        """从 FsGet 响应构建带来源信息的直链结果。"""
+        raw_url = info.get("raw_url")
+        if raw_url and self.direct_link_mode != "alist_download":
+            return DirectLink(
+                url=raw_url,
+                source="raw_url",
+                expires_at=_extract_url_expiry(raw_url),
+            )
+        if self.direct_link_mode == "raw_url_only":
+            raise Exception("AList/OpenList 未返回 raw_url，严格云盘直链模式拒绝回退 /d")
+
+        url = self._build_alist_download_url(info, remote_path)
+        return DirectLink(
+            url=url,
+            source="alist_download",
+            expires_at=_extract_url_expiry(url),
+        )
+
+    def _build_alist_download_url(self, info: dict, remote_path: str) -> str:
         sign = info.get("sign") or ""
         base = (self.alist.url or "").rstrip("/")
         # AList /d/*path 路由：直链下载，sign 校验
