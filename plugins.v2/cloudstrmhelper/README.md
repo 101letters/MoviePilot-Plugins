@@ -2,7 +2,7 @@
 
 MoviePilot V2 插件：监听 MoviePilot 整理完成/入库完成消息，按顺序上传到 AList/OpenList，基于云端路径生成 STRM，并刷新 Emby/Jellyfin 入库。
 
-> 版本：1.5.4
+> 版本：1.5.5
 
 ## 执行链路
 
@@ -196,7 +196,7 @@ Emby 原始地址: http://192.168.31.6:8096
 
 配置页按功能拆分为 4 个 Tab，每 Tab 一屏，避免长页面滚动查找：
 
-1. **基础设置**：启用、立刻全量同步、任务完成通知、上传并发数、SSE 监听
+1. **基础设置**：启用、立刻全量同步、任务完成通知、上传并发数
 2. **播放设置**：Emby 302 前置代理（启用开关、Emby 原始地址、代理监听地址、代理监听端口）
 3. **路径设置**：云端存储设置（云存储类型、AList/OpenList 地址、Token）+ 上传与 STRM 路径映射（上传映射、STRM 映射）
 4. **同步设置**：同步与过滤（同步模式、STRM 覆盖模式、媒体扩展名、排除规则、事件路径过滤）+ 媒体服务器刷新（刷新开关、媒体服务器选择、路径映射）
@@ -236,6 +236,7 @@ STRM 覆盖模式：
 最近生成 STRM 列表的菜单项：
 
 - `重新生成 STRM`：调用后端 STRM 生成逻辑，针对该条记录按当前 STRM URL 模式重新写入 STRM 文件内容。
+- `删除 STRM 文件`：删除本地 STRM 输出目录中的对应 .strm 文件，并从最近 STRM 列表中移除记录；删除失败提示错误并写入日志。
 
 所有菜单项点击后通过 `POST /manual_action` API 在后台线程执行真实任务（重新上传/删除云端/删除本地/重新生成 STRM 均调用对应后端逻辑，非纯 UI 按钮），执行成功或失败都会通过 MoviePilot 消息渠道通知并在日志记录，统计列表随之刷新。破坏性操作（删除）用醒目配色 + 后端路径范围校验防误触；不再通过配置页保存触发手动动作。
 
@@ -257,7 +258,7 @@ uvicorn
 ## 验证
 
 1. 配置 AList/OpenList 地址、Token、上传映射、STRM 映射、媒体服务器路径映射。
-2. 启用插件。默认不启动 SSE；如果明确开启 SSE，日志应出现 `【SSE监听】连接 MoviePilot 消息流`，若 MoviePilot 返回 401/403 会自动停止并继续使用内部事件兜底。
+2. 启用插件。SSE 监听默认关闭（UI 不再暴露此开关）；内部整理完成事件仍可兜底。如通过 API 手动开启 SSE，日志应出现 `【SSE监听】连接 MoviePilot 消息流`。若直接使用内部事件触发，确认日志出现 `Phase 1 完成`。
 3. 让 MoviePilot 完成一次整理入库，日志应按顺序出现：
    - `Phase 1 完成`
    - `Phase 2 开始`
@@ -281,7 +282,7 @@ uvicorn
 | `/diagnose` | `GET` | 查看脱敏配置、模块状态、302 状态、路径映射和统计 |
 | `/diagnose?probe=true` | `GET` | 在诊断基础上只读探测 AList/OpenList Token/地址/fs_get（不输出 raw_url/sign 完整内容） |
 | `/sync_now` | `GET/POST` | 手动触发一次全量同步 |
-| `/manual_action` | `POST` | 首页列表内单条操作，请求 body 为 JSON：`action`（`reupload`/`delete_remote`/`delete_remote_and_local`/`regenerate_strm`）、`local`、`remote`、`strm`；后台线程执行真实任务并返回 `{state, message}` |
+| `/manual_action` | `POST` | 首页列表内单条操作，请求 body 为 JSON：`action`（`reupload`/`delete_remote`/`delete_remote_and_local`/`regenerate_strm`/`delete_strm`）、`local`、`remote`、`strm`；后台线程执行真实任务并返回 `{state, message}` |
 
 `/diagnose` 输出的 302 相关字段：`strm_url_mode`、`resolve_final_url`、`direct_link_mode`、`redirect_cache_ttl`、`head_probe_mode`、`redirect_cache_size`、`redirect_error_cache_size`、`emby_proxy_enabled`、`emby_proxy_running`、`emby_proxy_listen`。
 

@@ -475,7 +475,7 @@ class TestPluginMetadata(unittest.TestCase):
     def test_metadata_present(self):
         from cloudstrmhelper import CloudStrmHelper
         self.assertEqual(CloudStrmHelper.plugin_name, "云端STRM整理助手")
-        self.assertEqual(CloudStrmHelper.plugin_version, "1.5.4")
+        self.assertEqual(CloudStrmHelper.plugin_version, "1.5.5")
         self.assertEqual(CloudStrmHelper.plugin_config_prefix, "cloudstrmhelper_")
         self.assertEqual(CloudStrmHelper.plugin_author, "101letters")
         self.assertEqual(CloudStrmHelper.auth_level, 1)
