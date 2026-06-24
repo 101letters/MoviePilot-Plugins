@@ -465,7 +465,6 @@ class CloudStrmHelper(_PluginBase):
         def _status_text(s):
             return {
                 "uploaded": "已上传",
-                "skipped": "远端已存在",
                 "remote_deleted": "已删云端",
                 "local_deleted": "已删本地",
             }.get(s, s or "-")
@@ -532,8 +531,8 @@ class CloudStrmHelper(_PluginBase):
             remote = it.get("remote") or ""
             status = it.get("status") or ""
             items = []
-            # 重新上传：仅上传/跳过且有本地源文件路径
-            if local and remote and status in ("uploaded", "skipped"):
+            # 重新上传：仅真实上传成功且有本地源文件路径
+            if local and remote and status == "uploaded":
                 items.append(_menu_item(
                     "重新上传", "mdi-upload-refresh",
                     {"action": "reupload", "local": local, "remote": remote}))
@@ -1261,6 +1260,7 @@ class CloudStrmHelper(_PluginBase):
             queued = 0
             skipped = 0
             ready_for_strm: List[Tuple[str, str, Any, Any]] = []
+            logger.info("【云端STRM】========== 开始同步（事件触发）==========")
             logger.info(f"【云端STRM】Phase 2 开始：AList 仅新增同步 {len(records)} 条")
             self._cloud_sync.prepare_batch()
             for record in records:
@@ -1308,6 +1308,7 @@ class CloudStrmHelper(_PluginBase):
                     strm_fail += 1
                     logger.warning(f"【云端STRM】STRM 生成失败: {remote_path}")
             logger.info(f"【云端STRM】Phase 3/4 完成：STRM 成功 {strm_ok}，失败 {strm_fail}")
+            logger.info("【云端STRM】========== 同步结束（事件触发）==========")
 
     # ============================================================
     # Phase 3/4
@@ -1358,7 +1359,9 @@ class CloudStrmHelper(_PluginBase):
         skipped = 0
         ready_for_strm: List[Tuple[str, str, Any, Any]] = []
 
-        logger.info(f"【云端STRM】开始全量同步: roots={local_roots}, upload_mappings={self._upload_mappings}")
+        logger.info("【云端STRM】========== 开始全量同步 ==========")
+        logger.info(f"【云端STRM】扫描根目录: {local_roots}")
+        logger.info(f"【云端STRM】上传映射: {self._upload_mappings}")
         self._cloud_sync.prepare_batch()
 
         for local_root in local_roots:
@@ -1411,6 +1414,7 @@ class CloudStrmHelper(_PluginBase):
                 strm_fail += 1
                 logger.warning(f"【云端STRM】STRM 生成失败: {remote_path}")
         logger.info(f"【云端STRM】全量 Phase 3/4 完成：STRM 成功 {strm_ok}，失败 {strm_fail}")
+        logger.info("【云端STRM】========== 全量同步结束 ==========")
 
     # ============================================================
     # 路径映射与统计
@@ -1893,6 +1897,12 @@ class CloudStrmHelper(_PluginBase):
                 data.setdefault("strm_count", 0)
                 data.setdefault("last_strm_time", "")
                 data.setdefault("recent_strms", recent_strms)
+                # v1.5.6: 清理历史遗留的 skipped 记录（远端已存在不再入列表）
+                uploads = data.get("recent_uploads") or []
+                cleaned = [it for it in uploads if isinstance(it, dict) and it.get("status") != "skipped"]
+                if len(cleaned) != len(uploads):
+                    data["recent_uploads"] = cleaned
+                    logger.info(f"【云端STRM】清理历史 skipped 记录: {len(uploads) - len(cleaned)} 条")
                 return data
         except Exception as e:
             logger.debug(f"【云端STRM】读取统计失败: {e}")
