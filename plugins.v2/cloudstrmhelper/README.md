@@ -2,7 +2,7 @@
 
 MoviePilot V2 插件：监听 MoviePilot 整理完成/入库完成消息，按顺序上传到 AList/OpenList，基于云端路径生成 STRM，并刷新 Emby/Jellyfin 入库。
 
-> 版本：1.5.6
+> 版本：1.5.7
 
 ## 执行链路
 
