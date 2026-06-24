@@ -463,7 +463,7 @@ class TestPluginMetadata(unittest.TestCase):
     def test_metadata_present(self):
         from cloudstrmhelper import CloudStrmHelper
         self.assertEqual(CloudStrmHelper.plugin_name, "云端STRM整理助手")
-        self.assertEqual(CloudStrmHelper.plugin_version, "1.5.1")
+        self.assertEqual(CloudStrmHelper.plugin_version, "1.5.2")
         self.assertEqual(CloudStrmHelper.plugin_config_prefix, "cloudstrmhelper_")
         self.assertEqual(CloudStrmHelper.plugin_author, "101letters")
         self.assertEqual(CloudStrmHelper.auth_level, 1)
@@ -492,11 +492,15 @@ class TestPluginMetadata(unittest.TestCase):
         self.assertIn("/media/tv#/strm/test/电视剧", defaults["local_strm_paths"])
         self.assertEqual(defaults["strm_output_path"], "/strm/test/华语电影")
         self.assertEqual(defaults["sync_mode"], "copy")
+        self.assertEqual(defaults["strm_url_mode"], "alist_direct")
         self.assertEqual(defaults["direct_link_mode"], "prefer_raw_url")
+        self.assertFalse(defaults["sse_enabled"])
         self.assertFalse(defaults["emby_proxy_enabled"])
         self.assertEqual(defaults["emby_server_url"], "http://192.168.31.6:8096")
         self.assertEqual(defaults["emby_proxy_host"], "0.0.0.0")
         self.assertEqual(defaults["emby_proxy_port"], 8095)
+        self.assertEqual(defaults["manual_upload_action"], "none")
+        self.assertFalse(defaults["manual_execute"])
 
     def test_api_endpoints(self):
         from cloudstrmhelper import CloudStrmHelper
@@ -506,8 +510,6 @@ class TestPluginMetadata(unittest.TestCase):
         self.assertIn("/status", paths)
         self.assertIn("/diagnose", paths)
         self.assertIn("/sync_now", paths)
-        self.assertIn("/reupload", paths)
-        self.assertIn("/regenerate_strm", paths)
 
     def test_api_has_auth(self):
         """规范：不要默认匿名开放 API，每个端点须声明 auth。"""
@@ -559,6 +561,7 @@ class TestPluginMetadata(unittest.TestCase):
         plugin._direct_link_mode = "prefer_raw_url"
         plugin._redirect_cache_ttl = 120
         plugin._head_probe_mode = "ok"
+        plugin._sse_enabled = False
         plugin._emby_proxy_enabled = True
         plugin._emby_server_url = "http://emby:8096"
         plugin._emby_proxy_host = "0.0.0.0"
@@ -726,6 +729,31 @@ class TestPathComputation(unittest.TestCase):
 
         self.assertEqual(local_path, str(media_file))
         self.assertEqual(remote_path, "/cloud/movies/Foo Bar.mkv")
+
+    def test_manual_delete_remote_does_not_require_existing_local_file(self):
+        from cloudstrmhelper import CloudStrmHelper
+        plugin = CloudStrmHelper.__new__(CloudStrmHelper)
+        plugin._upload_mappings = [("/missing/media", "/cloud/movies")]
+        plugin._strm_mappings = []
+        plugin._alist_target_path = "/cloud"
+
+        local_path, remote_path = plugin._decode_manual_delete_target(
+            json.dumps({
+                "local": "/missing/media/Foo.mkv",
+                "remote": "/cloud/movies/Foo.mkv",
+            })
+        )
+
+        self.assertEqual(local_path, "/missing/media/Foo.mkv")
+        self.assertEqual(remote_path, "/cloud/movies/Foo.mkv")
+        with self.assertRaises(Exception):
+            plugin._decode_manual_delete_target(
+                json.dumps({
+                    "local": "/missing/media/Foo.mkv",
+                    "remote": "/cloud/other/Foo.mkv",
+                }),
+                require_local=True,
+            )
 
 
 class TestEmby302Proxy(unittest.TestCase):
@@ -1370,13 +1398,24 @@ class TestNewConfigPersistence(unittest.TestCase):
         plugin._direct_link_mode = "prefer_raw_url"
         plugin._redirect_cache_ttl = 120
         plugin._head_probe_mode = "ok"
+        plugin._sse_enabled = False
+        plugin._emby_proxy_enabled = False
+        plugin._emby_server_url = ""
+        plugin._emby_proxy_host = "0.0.0.0"
+        plugin._emby_proxy_port = 8095
+        plugin._manual_upload_action = "none"
+        plugin._manual_upload_target = ""
+        plugin._manual_strm_target = ""
+        plugin._manual_confirm = False
+        plugin._manual_execute = False
         captured = {}
         plugin.update_config = lambda cfg: captured.update(cfg)
         plugin._update_config()
         for key in (
             "upload_path_mappings", "strm_path_mappings",
             "strm_url_mode", "resolve_final_url", "direct_link_mode",
-            "redirect_cache_ttl", "head_probe_mode",
+            "redirect_cache_ttl", "head_probe_mode", "sse_enabled",
+            "manual_upload_action", "manual_execute",
         ):
             self.assertIn(key, captured, f"{key} 未持久化")
 
@@ -1385,9 +1424,9 @@ class TestNewConfigPersistence(unittest.TestCase):
         self.assertEqual(CloudStrmHelper._normalize_strm_url_mode("cloud_raw_url"), "cloud_raw_url")
         self.assertEqual(CloudStrmHelper._normalize_strm_url_mode("raw_url"), "cloud_raw_url")
         self.assertEqual(CloudStrmHelper._normalize_strm_url_mode("alist_direct"), "alist_direct")
-        self.assertEqual(CloudStrmHelper._normalize_strm_url_mode("moviepilot_redirect"), "moviepilot_redirect")
-        self.assertEqual(CloudStrmHelper._normalize_strm_url_mode("garbage"), "moviepilot_redirect")
-        self.assertEqual(CloudStrmHelper._normalize_strm_url_mode(""), "moviepilot_redirect")
+        self.assertEqual(CloudStrmHelper._normalize_strm_url_mode("moviepilot_redirect"), "alist_direct")
+        self.assertEqual(CloudStrmHelper._normalize_strm_url_mode("garbage"), "alist_direct")
+        self.assertEqual(CloudStrmHelper._normalize_strm_url_mode(""), "alist_direct")
 
     def test_normalize_head_probe_mode(self):
         from cloudstrmhelper import CloudStrmHelper

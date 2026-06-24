@@ -60,7 +60,7 @@ class MoviePilotSseListener:
                 self._listen_once()
                 backoff = 3
             except MoviePilotSseAuthError as e:
-                logger.warning(
+                logger.info(
                     "【SSE监听】鉴权失败，已停止 SSE 监听，仅保留内部 TransferComplete 事件兜底: %s",
                     e,
                 )

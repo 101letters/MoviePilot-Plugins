@@ -3,7 +3,7 @@
     "name": "云端STRM整理助手",
     "description": "整理入库自动复制到AList并生成STRM，支持轻量/Emby前置302直链播放。",
     "labels": "STRM,AList,云盘,302",
-    "version": "1.5.1",
+    "version": "1.5.2",
     "icon": "cloudstrmhelper.png",
     "author": "101letters",
     "system_version": ">=2.0.0",

@@ -2,13 +2,13 @@
 
 MoviePilot V2 插件：监听 MoviePilot 整理完成/入库完成消息，按顺序上传到 AList/OpenList，基于云端路径生成 STRM，并刷新 Emby/Jellyfin 入库。
 
-> 版本：1.5.1
+> 版本：1.5.2
 
 ## 执行链路
 
 ```text
 Phase 1 监听事件
-  - SSE: GET /api/v1/system/message（只记录整理完成/入库完成事件）
+  - SSE（可选）: GET /api/v1/system/message（只记录整理完成/入库完成事件）
   - 进程内 EventType.TransferComplete 兜底
   - 只记录事件与路径，不做文件操作
         |
@@ -16,12 +16,12 @@ Phase 1 监听事件
 Phase 2 AList 同步
   - 按「本地路径#云端路径」上传映射计算 AList/OpenList 云端路径
   - SSE 如只记录到目录，在本阶段展开目录内媒体文件
-  - 仅新增，远端已存在即跳过，永不删除远端文件
+  - 常规同步仅新增，远端已存在即跳过，不删除远端文件
         |
         v
 Phase 3 STRM 生成
   - 按「云端路径#本地 STRM 输出目录」映射生成 STRM
-  - STRM 内容为 302 跳转 URL（默认 MoviePilot /redirect 模式）
+  - STRM 内容默认为 AList/OpenList `/d/<path>` 302 下载地址
   - STRM 覆盖模式可选「从不/总是」
         |
         v
@@ -33,8 +33,8 @@ Phase 4 媒体库刷新
 
 ## 三类路径/地址（务必区分）
 
-1. **MoviePilot 内网地址**：生成 STRM 内的 `/redirect` 播放入口 URL，如 `http://192.168.31.6:3000`。
-2. **AList/OpenList 地址**：上传文件、查询文件、`fs_get` 解析 `raw_url`/`sign`、构造 `/d` 下载地址，如 `http://192.168.31.6:5244/`。
+1. **MoviePilot 内网地址**：插件 API、诊断接口、兼容旧 STRM 的 `/redirect` 播放入口，如 `http://192.168.31.6:3000`。
+2. **AList/OpenList 地址**：上传文件、查询文件、`fs_get` 解析 `raw_url`/`sign`，也是默认 STRM `/d` 下载地址来源，如 `http://192.168.31.6:5244/`。
 3. **上传映射**：决定哪些本地媒体库路径会上传到哪个 AList/OpenList 云端路径，格式 `本地路径#云端路径`。
 4. **STRM 映射**：决定云端路径对应的本地 `.strm` 输出目录，格式 `云端路径#本地STRM输出目录`。
 
@@ -49,7 +49,8 @@ Phase 4 媒体库刷新
 | STRM 映射 | `/123云盘/影视/华语电影#/strm/test/华语电影`、`/123云盘/影视/电视剧#/strm/test/电视剧` |
 | 同步模式 | 复制 |
 | STRM 覆盖模式 | 从不 |
-| STRM URL 模式 | `moviepilot_redirect`（推荐） |
+| STRM URL 模式 | `alist_direct`（推荐） |
+| SSE 监听 | 关闭 |
 | 解析最终直链 | 开 |
 | 直链来源策略 | `prefer_raw_url` |
 | 直链缓存时间 | `120` 秒 |
@@ -111,27 +112,33 @@ AList/OpenList 云端路径#本地 STRM 输出目录
 
 ## STRM URL 模式
 
-### 推荐模式：MoviePilot 302（`moviepilot_redirect`，默认）
+### 推荐模式：AList/OpenList `/d` 302（`alist_direct`，默认）
 
-STRM 文件内容固定指向 MoviePilot 插件 `/redirect`：
+STRM 文件内容直接写入 AList/OpenList 下载地址：
+
+```text
+http://<AList/OpenList地址>/d/<AList/OpenList虚拟路径>?sign=<sign>
+```
+
+这个模式保留 `.mkv`、`.mp4` 等真实媒体后缀，Emby/Jellyfin 更容易识别可播放源；播放时由 AList/OpenList `/d` 再按存储驱动能力 302 到云盘直链。取 `sign` 失败时仅 warning，生成无 `sign` 的 `/d/` 地址，不中断 STRM 生成。
+
+是否完全绕过 AList/OpenList 服务器上行，取决于具体存储驱动的 `/d` 行为：如果 `/d` 返回 302 到云盘/CDN，则播放数据不走服务器；如果驱动只能中转下载，则仍可能占用 OpenList/NAS 上行。
+
+### 兼容模式：MoviePilot `/redirect`
+
+历史版本可能已经生成了 MoviePilot 插件 `/redirect` 格式的 STRM：
 
 ```text
 http://<MoviePilot内网地址>/api/v1/plugin/CloudStrmHelper/redirect?apikey=<API_TOKEN>&path=<AList/OpenList虚拟路径>
 ```
 
-播放时插件 `/redirect` 端点实时向 AList/OpenList 获取云盘直链并 302 跳转，避免把过期直链写死进 STRM。这个模式下 MoviePilot 只参与一次 URL 解析和 302 跳转，不代理视频数据；但外网客户端必须能访问 MoviePilot `/redirect`。
+插件仍保留 `/redirect` API 兼容旧 STRM，但配置页不再提供这个生成模式；保存配置时旧值 `moviepilot_redirect` 会迁移为 `alist_direct`。如果旧 STRM 在 Emby 里无法识别，使用配置页“手动处理”重新生成对应 STRM 即可改写为 `/d/` 地址。
 
-直链来源由 `direct_link_mode` 控制：
+MoviePilot `/redirect` 与 Emby 302 前置代理的直链来源由 `direct_link_mode` 控制：
 
 - `prefer_raw_url`（默认）：优先返回 AList/OpenList `fs_get.raw_url`；没有 `raw_url` 时回退 `/d/<path>?sign=...`，并在开启“解析最终直链”时尽量跟随到云盘/CDN 最终地址。
 - `raw_url_only`（严格零上行）：只允许返回云盘 `raw_url`。如果 AList/OpenList 没返回 `raw_url`，`/redirect` 直接 502，不回退 `/d`，避免实际播放流量走 OpenList/NAS 上行。
 - `alist_download`（兼容）：总是返回 AList/OpenList `/d` 下载端点，适合 raw_url 不稳定或客户端必须走 OpenList 鉴权的场景；是否绕过 OpenList 数据流量取决于 `/d` 是否继续 302 到云盘。
-
-### 实验模式：AList/OpenList 直链（`alist_direct`，不默认启用）
-
-STRM 内容直接写入 AList/OpenList `/d/<path>?sign=<sign>` 下载地址（不写 `raw_url`，因 `raw_url` 可能过期）。取 `sign` 失败时仅 warning，生成无 `sign` 的 `/d/` 地址，不中断 STRM 生成。
-
-这个模式绕过 MoviePilot，但不一定绕过 AList/OpenList 服务器：是否由 OpenList 再跳转到云盘厂商 CDN，取决于具体存储驱动和分享/签名能力。
 
 ### 实验模式：云盘 raw_url 直链（`cloud_raw_url`，不默认启用）
 
@@ -187,15 +194,16 @@ Emby 原始地址: http://192.168.31.6:8096
 
 ## UI
 
-配置页按以下顺序展示 7 个卡片：
+配置页按以下顺序展示 8 个卡片：
 
-1. 基础设置（启用、立刻全量同步、任务完成通知、上传并发数）
+1. 基础设置（启用、立刻全量同步、任务完成通知、上传并发数、SSE 监听）
 2. 播放入口设置（MoviePilot 内网地址、STRM URL 模式、解析最终直链、直链来源策略、直链缓存时间、HEAD 探测策略）
 3. Emby 302 前置代理（启用开关、Emby 原始地址、代理监听地址、代理监听端口）
-4. 云端存储设置（云存储类型、AList/OpenList 地址、Token）
-5. 上传与 STRM 路径映射（上传映射、STRM 映射）
-6. 同步与过滤（同步模式、STRM 覆盖模式、媒体扩展名、排除规则、事件路径过滤）
-7. 媒体服务器刷新（刷新开关、媒体服务器选择、路径映射）
+4. 手动处理（最近上传的重新上传、删除云端、删除云端和本地文件；最近 STRM 的重新生成）
+5. 云端存储设置（云存储类型、AList/OpenList 地址、Token）
+6. 上传与 STRM 路径映射（上传映射、STRM 映射）
+7. 同步与过滤（同步模式、STRM 覆盖模式、媒体扩展名、排除规则、事件路径过滤）
+8. 媒体服务器刷新（刷新开关、媒体服务器选择、路径映射）
 
 同步模式：
 
@@ -206,6 +214,15 @@ STRM 覆盖模式：
 
 - `从不`：已有 STRM 直接跳过。
 - `总是`：重新写入已有 STRM。
+
+手动处理：
+
+- `重新上传`：选择最近上传记录后，先删除指定云端文件，再用本地源文件上传，并重新生成对应 STRM。
+- `删除云端`：只删除选择的云端文件，不动本地文件。
+- `删除云端和本地文件`：删除选择的云端文件后，再删除上传映射本地根目录内的对应本地文件。
+- `重新生成 STRM`：选择最近 STRM 记录后，按当前 STRM URL 模式重新写入 STRM 文件。
+
+所有手动动作都必须在配置页选择目标、勾选确认、打开执行开关并保存配置后才会进入后台线程；不再通过首页按钮跳转到裸 API。
 
 ## 首页统计面板
 
@@ -218,15 +235,10 @@ STRM 覆盖模式：
 
 以及两个列表：
 
-- 最近上传列表（文件名 | 状态 | 大小 | 时间 | 云端路径 | 操作）
-- 最近生成 STRM 列表（文件名 | 状态 | 时间 | STRM 路径 | 云端路径 | 操作）
+- 最近上传列表（文件名 | 状态 | 大小 | 时间 | 云端路径）
+- 最近生成 STRM 列表（文件名 | 状态 | 时间 | STRM 路径 | 云端路径）
 
-状态：上传 `已上传`/`远端已存在`；STRM `新生成`/`已存在/已跳过`。统计通过插件数据持久化，重启后保留，并兼容旧 `recent_files` 结构迁移到 `recent_strms`。
-
-首页操作：
-
-- `重新上传`：删除对应云端文件后，从本地路径重新上传，并重新生成对应 STRM。
-- `重新生成`：按现有 STRM 路径和云端路径重新写入 STRM 文件内容，不重新上传媒体文件。
+状态：上传 `已上传`/`远端已存在`/`已删云端`/`已删本地`；STRM `新生成`/`已存在/已跳过`。统计通过插件数据持久化，重启后保留，并兼容旧 `recent_files` 结构迁移到 `recent_strms`。
 
 ## 安装
 
@@ -244,7 +256,7 @@ uvicorn
 ## 验证
 
 1. 配置 AList/OpenList 地址、Token、上传映射、STRM 映射、媒体服务器路径映射。
-2. 启用插件，观察日志出现 `【SSE监听】连接 MoviePilot 消息流`。
+2. 启用插件。默认不启动 SSE；如果明确开启 SSE，日志应出现 `【SSE监听】连接 MoviePilot 消息流`，若 MoviePilot 返回 401/403 会自动停止并继续使用内部事件兜底。
 3. 让 MoviePilot 完成一次整理入库，日志应按顺序出现：
    - `Phase 1 完成`
    - `Phase 2 开始`
@@ -252,9 +264,9 @@ uvicorn
    - `Phase 3 开始`
    - `Phase 3/4 完成`
 4. 检查上传映射对应的 AList/OpenList 云端目录新增媒体文件。
-5. 检查 STRM 输出目录新增 `.strm`，内容为 302 URL（推荐模式指向 `/redirect`）。
+5. 检查 STRM 输出目录新增 `.strm`，默认内容应以 AList/OpenList `/d/` 地址开头，并保留媒体文件后缀。
 6. 检查 Emby/Jellyfin 是否扫描到新条目并能通过 302 播放。
-7. Infuse/Fileball 的 HEAD 探测应按 `head_probe_mode` 返回（默认 200），GET 才 302。
+7. 旧 `/redirect` STRM 或 Infuse/Fileball 的 HEAD 探测应按 `head_probe_mode` 返回（默认 200），GET 才 302。
 8. 如启用 Emby 302 前置代理，把客户端服务器地址改为代理端口，访问 `/System/Info/Public` 应能正常回源，播放时代理日志应出现 `【Emby302代理】` 相关解析记录。
 
 也可以在配置中勾选「立刻全量同步」，或调用 `/api/v1/plugin/CloudStrmHelper/sync_now` 触发一次全量同步。
@@ -268,15 +280,14 @@ uvicorn
 | `/diagnose` | `GET` | 查看脱敏配置、模块状态、302 状态、路径映射和统计 |
 | `/diagnose?probe=true` | `GET` | 在诊断基础上只读探测 AList/OpenList Token/地址/fs_get（不输出 raw_url/sign 完整内容） |
 | `/sync_now` | `GET/POST` | 手动触发一次全量同步 |
-| `/reupload` | `GET/POST` | 删除云端文件后重新上传，并重新生成 STRM |
-| `/regenerate_strm` | `GET/POST` | 按指定 STRM 路径和云端路径重新写入 STRM |
 
 `/diagnose` 输出的 302 相关字段：`strm_url_mode`、`resolve_final_url`、`direct_link_mode`、`redirect_cache_ttl`、`head_probe_mode`、`redirect_cache_size`、`redirect_error_cache_size`、`emby_proxy_enabled`、`emby_proxy_running`、`emby_proxy_listen`。
 
 ## 安全约束
 
-- 不删除远端文件。
-- 不覆盖远端已有文件。
+- 常规同步不删除远端文件；手动处理必须勾选确认后才会删除指定云端文件。
+- 常规同步不覆盖远端已有文件；手动重新上传会先删除指定云端文件再上传。
+- 手动删除本地文件会校验目标位于上传映射本地根目录内。
 - STRM 是否覆盖由「STRM 覆盖模式」控制。
 - Phase 1 不做任何文件系统或 AList 操作。
 - 每个批次先完成 AList 同步，再生成 STRM 和刷新媒体库。

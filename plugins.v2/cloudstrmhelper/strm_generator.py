@@ -1,7 +1,7 @@
 """strm_generator.py — STRM 文件生成 + Emby/Jellyfin 媒体库刷新
 
 实现要点（参考 p123strmhelper）：
-- `.strm` 内容 = 指向插件自带 `/api/v1/plugin/<id>/redirect` 302 端点的 URL（自托管 302，链接不失效）。
+- `.strm` 内容默认写入 AList/OpenList `/d/...` 下载地址，保留插件 `/redirect` 端点兼容旧 STRM。
 - 文件名：原媒体文件 stem + `.strm`；`open(w, utf-8).write(url)` 不加换行。
 - 路径重定向：按插件的 `本地媒体库路径#STRM输出目录` 映射生成。
 - overwrite_mode：never=跳过已存在，always=覆盖。
@@ -73,11 +73,11 @@ class StrmGenerator:
     def _build_strm_url(self, remote_path: str) -> str:
         """构建 .strm 文件内容 URL，按插件 STRM URL 模式分流。
 
-        - moviepilot_redirect（默认/推荐）：指向插件自带 /redirect 端点，播放时实时解析直链，链接不失效。
-        - alist_direct（实验）：直接写入 AList/OpenList /d/... 下载地址，可能受 sign/权限/UA/跨域影响。
+        - alist_direct（默认/推荐）：直接写入 AList/OpenList /d/... 下载地址，保留媒体后缀便于 Emby 识别。
         - cloud_raw_url（实验）：直接写入 AList/OpenList fs_get.raw_url/最终 CDN URL，绕过 MP/OpenList 数据流量。
+        - moviepilot_redirect（兼容旧配置）：指向插件自带 /redirect 端点。
         """
-        mode = getattr(self.plugin, "_strm_url_mode", "moviepilot_redirect")
+        mode = getattr(self.plugin, "_strm_url_mode", "alist_direct")
         if mode == "cloud_raw_url":
             return self._build_cloud_raw_url(remote_path)
         if mode == "alist_direct":
@@ -85,7 +85,7 @@ class StrmGenerator:
         return self._build_moviepilot_redirect_url(remote_path)
 
     def _build_moviepilot_redirect_url(self, remote_path: str) -> str:
-        """推荐模式：STRM 内容 = 指向插件 /redirect 端点的 URL。
+        """兼容旧模式：STRM 内容 = 指向插件 /redirect 端点的 URL。
 
         http://<mp_address>/api/v1/plugin/<PluginID>/redirect?apikey=<token>&path=<urlenc 远端路径>
         """

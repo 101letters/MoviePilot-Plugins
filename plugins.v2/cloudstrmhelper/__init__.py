@@ -2,11 +2,12 @@
 
 链路：Phase 1 监听整理完成事件 → Phase 2 上传 AList → Phase 3 生成 STRM → Phase 4 刷新 Emby。
 """
+import json
 import os
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode, unquote_plus
+from urllib.parse import unquote_plus
 
 import pathspec
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -52,6 +53,7 @@ DEFAULT_PATH_MAPPING = "/media#/data"
 DEFAULT_EMBY_SERVER_URL = "http://192.168.31.6:8096"
 DEFAULT_EMBY_PROXY_HOST = "0.0.0.0"
 DEFAULT_EMBY_PROXY_PORT = 8095
+DEFAULT_STRM_URL_MODE = "alist_direct"
 
 
 class CloudStrmHelper(_PluginBase):
@@ -62,7 +64,7 @@ class CloudStrmHelper(_PluginBase):
     plugin_desc = "整理入库自动复制到AList并生成STRM，支持轻量/Emby前置302直链播放"
     # 图标：引用仓库 icons 目录下的图标文件（URL 形式，与官方插件一致）
     plugin_icon = "https://raw.githubusercontent.com/101letters/MoviePilot-Plugins/main/icons/cloudstrmhelper.png"
-    plugin_version = "1.5.1"
+    plugin_version = "1.5.2"
     plugin_author = "101letters"
     author_url = "https://github.com/101letters"
     plugin_config_prefix = "cloudstrmhelper_"
@@ -100,15 +102,22 @@ class CloudStrmHelper(_PluginBase):
     _upload_concurrency = 3
     _once_sync = False
     # 播放入口 / 302 可靠性配置
-    _strm_url_mode = "moviepilot_redirect"
+    _strm_url_mode = DEFAULT_STRM_URL_MODE
     _resolve_final_url = True
     _direct_link_mode = "prefer_raw_url"
     _redirect_cache_ttl = 120
     _head_probe_mode = "ok"
+    _sse_enabled = False
     _emby_proxy_enabled = False
     _emby_server_url = ""
     _emby_proxy_host = DEFAULT_EMBY_PROXY_HOST
     _emby_proxy_port = DEFAULT_EMBY_PROXY_PORT
+    _manual_upload_action = "none"
+    _manual_upload_target = ""
+    _manual_strm_target = ""
+    _manual_confirm = False
+    _manual_execute = False
+    _pending_manual_action: Optional[Dict[str, Any]] = None
 
     _scheduler: Optional[BackgroundScheduler] = None
     _alist_client = None
@@ -172,7 +181,7 @@ class CloudStrmHelper(_PluginBase):
             self._once_sync = bool(config.get("once_sync", False))
             # 播放入口 / 302 可靠性
             self._strm_url_mode = self._normalize_strm_url_mode(
-                config.get("strm_url_mode") or "moviepilot_redirect")
+                config.get("strm_url_mode") or DEFAULT_STRM_URL_MODE)
             self._resolve_final_url = bool(config.get("resolve_final_url", True))
             self._direct_link_mode = self._normalize_direct_link_mode(
                 config.get("direct_link_mode") or "prefer_raw_url")
@@ -182,6 +191,7 @@ class CloudStrmHelper(_PluginBase):
                 self._redirect_cache_ttl = 120
             self._head_probe_mode = self._normalize_head_probe_mode(
                 config.get("head_probe_mode") or "ok")
+            self._sse_enabled = bool(config.get("sse_enabled", False))
             self._emby_proxy_enabled = bool(config.get("emby_proxy_enabled", False))
             self._emby_server_url = (config.get("emby_server_url") or "").strip().rstrip("/")
             self._emby_proxy_host = (
@@ -191,6 +201,19 @@ class CloudStrmHelper(_PluginBase):
                 self._emby_proxy_port = max(1, int(config.get("emby_proxy_port") or DEFAULT_EMBY_PROXY_PORT))
             except (TypeError, ValueError):
                 self._emby_proxy_port = DEFAULT_EMBY_PROXY_PORT
+            self._manual_upload_action = self._normalize_manual_upload_action(
+                config.get("manual_upload_action") or "none")
+            self._manual_upload_target = config.get("manual_upload_target") or ""
+            self._manual_strm_target = config.get("manual_strm_target") or ""
+            self._manual_confirm = bool(config.get("manual_confirm", False))
+            self._manual_execute = bool(config.get("manual_execute", False))
+            self._pending_manual_action = self._build_pending_manual_action()
+            if self._pending_manual_action:
+                self._manual_upload_action = "none"
+                self._manual_upload_target = ""
+                self._manual_strm_target = ""
+                self._manual_confirm = False
+                self._manual_execute = False
             self._update_config()
 
         # 配置变更后重建 302 缓存（TTL 可配置）
@@ -252,13 +275,17 @@ class CloudStrmHelper(_PluginBase):
         )
         self._cloud_sync.start()
         self._listener = TransferListener(self)
-        self._sse_listener = MoviePilotSseListener(self)
-        self._sse_listener.start()
+        self._sse_listener = None
+        if self._sse_enabled:
+            self._sse_listener = MoviePilotSseListener(self)
+            self._sse_listener.start()
 
-        logger.info("【云端STRM】插件已启动：storage=%s, sync=%s, 并发=%d, SSE=on",
-                    self._cloud_storage_type, self._sync_mode, self._upload_concurrency)
+        logger.info("【云端STRM】插件已启动：storage=%s, sync=%s, 并发=%d, SSE=%s",
+                    self._cloud_storage_type, self._sync_mode, self._upload_concurrency,
+                    "on" if self._sse_enabled else "off")
 
         self._start_emby_proxy_service()
+        self._dispatch_pending_manual_action()
 
         # 一次性全量同步
         if self._once_sync:
@@ -390,30 +417,11 @@ class CloudStrmHelper(_PluginBase):
         """本插件无远程命令。"""
         return []
 
-    def _manual_action_url(self, action: str, **params) -> str:
-        """首页手动操作链接。"""
-        base = (self._moviepilot_address or "").strip()
-        if not base:
-            try:
-                base = settings.MP_DOMAIN("") if hasattr(settings, "MP_DOMAIN") else ""
-            except Exception:
-                base = ""
-        if not base:
-            base = "http://localhost:3000"
-        if not base.startswith(("http://", "https://")):
-            base = "http://" + base
-        query = {"apikey": settings.API_TOKEN or ""}
-        for key, value in params.items():
-            if value is not None and str(value) != "":
-                query[key] = str(value)
-        return (
-            f"{base.rstrip('/')}/api/v1/plugin/{type(self).__name__}/{action}"
-            f"?{urlencode(query)}"
-        )
-
     def get_page(self) -> List[dict]:
         """插件首页统计面板：4 统计卡片 + 最近上传表 + 最近 STRM 表。"""
-        stats = self._stats or self._load_stats()
+        stats = getattr(self, "_stats", None) or {}
+        if not stats and not isinstance(self, type):
+            stats = self._load_stats()
         recent_uploads = stats.get("recent_uploads") or []
         recent_strms = stats.get("recent_strms") or []
         upload_count = stats.get("upload_count") or 0
@@ -422,7 +430,12 @@ class CloudStrmHelper(_PluginBase):
         last_strm_time = stats.get("last_strm_time") or ""
 
         def _status_text(s):
-            return {"uploaded": "已上传", "skipped": "远端已存在"}.get(s, s or "-")
+            return {
+                "uploaded": "已上传",
+                "skipped": "远端已存在",
+                "remote_deleted": "已删云端",
+                "local_deleted": "已删本地",
+            }.get(s, s or "-")
 
         def _strm_status_text(created):
             return "新生成" if created else "已存在/已跳过"
@@ -440,68 +453,36 @@ class CloudStrmHelper(_PluginBase):
                 v /= 1024
             return f"{v:.2f} PB"
 
-        def _action_button(text, url, icon, color="primary"):
-            if not url:
-                return {"component": "span", "props": {"class": "text-grey"}, "text": "-"}
-            return {
-                "component": "VBtn",
-                "props": {
-                    "size": "small",
-                    "variant": "tonal",
-                    "color": color,
-                    "prepend-icon": icon,
-                    "href": url,
-                    "target": "_blank",
-                },
-                "text": text,
-            }
-
         # 最近上传表行
-        upload_rows = []
-        for it in recent_uploads[:10]:
-            local_path = it.get("local") or ""
-            remote_path = it.get("remote") or ""
-            upload_rows.append({"component": "tr", "content": [
+        upload_rows = [
+            {"component": "tr", "content": [
                 {"component": "td", "text": it.get("name") or "-"},
                 {"component": "td", "text": _status_text(it.get("status"))},
                 {"component": "td", "text": _fmt_size(it.get("size"))},
                 {"component": "td", "text": it.get("time") or "-"},
-                {"component": "td", "props": {"class": "text-caption text-grey"}, "text": remote_path or "-"},
-                {"component": "td", "content": [_action_button(
-                    "重新上传",
-                    self._manual_action_url("reupload", local=local_path, remote=remote_path)
-                    if local_path and remote_path else "",
-                    "mdi-cloud-upload",
-                    "warning",
-                )]},
-            ]})
+                {"component": "td", "props": {"class": "text-caption text-grey"}, "text": it.get("remote") or "-"},
+            ]}
+            for it in recent_uploads[:10]
+        ]
         if not upload_rows:
             upload_rows = [{"component": "tr", "content": [
-                {"component": "td", "props": {"colspan": 6, "class": "text-grey"}, "text": "暂无记录"},
+                {"component": "td", "props": {"colspan": 5, "class": "text-grey"}, "text": "暂无记录"},
             ]}]
 
         # 最近 STRM 表行
-        strm_rows = []
-        for it in recent_strms[:10]:
-            strm_path = it.get("path") or ""
-            remote_path = it.get("remote") or ""
-            strm_rows.append({"component": "tr", "content": [
+        strm_rows = [
+            {"component": "tr", "content": [
                 {"component": "td", "text": it.get("name") or "-"},
                 {"component": "td", "text": _strm_status_text(it.get("created"))},
                 {"component": "td", "text": it.get("time") or "-"},
-                {"component": "td", "props": {"class": "text-caption text-grey"}, "text": strm_path or "-"},
-                {"component": "td", "props": {"class": "text-caption text-grey"}, "text": remote_path or "-"},
-                {"component": "td", "content": [_action_button(
-                    "重新生成",
-                    self._manual_action_url("regenerate_strm", strm=strm_path, remote=remote_path)
-                    if strm_path and remote_path else "",
-                    "mdi-file-refresh",
-                    "primary",
-                )]},
-            ]})
+                {"component": "td", "props": {"class": "text-caption text-grey"}, "text": it.get("path") or "-"},
+                {"component": "td", "props": {"class": "text-caption text-grey"}, "text": it.get("remote") or "-"},
+            ]}
+            for it in recent_strms[:10]
+        ]
         if not strm_rows:
             strm_rows = [{"component": "tr", "content": [
-                {"component": "td", "props": {"colspan": 6, "class": "text-grey"}, "text": "暂无记录"},
+                {"component": "td", "props": {"colspan": 5, "class": "text-grey"}, "text": "暂无记录"},
             ]}]
 
         def _stat_card(caption, value):
@@ -540,7 +521,6 @@ class CloudStrmHelper(_PluginBase):
                             {"component": "th", "text": "大小"},
                             {"component": "th", "text": "时间"},
                             {"component": "th", "text": "云端路径"},
-                            {"component": "th", "text": "操作"},
                         ]}]},
                         {"component": "tbody", "content": upload_rows},
                     ]},
@@ -559,7 +539,6 @@ class CloudStrmHelper(_PluginBase):
                             {"component": "th", "text": "时间"},
                             {"component": "th", "text": "STRM 路径"},
                             {"component": "th", "text": "云端路径"},
-                            {"component": "th", "text": "操作"},
                         ]}]},
                         {"component": "tbody", "content": strm_rows},
                     ]},
@@ -608,22 +587,6 @@ class CloudStrmHelper(_PluginBase):
                 "auth": "apikey",
                 "summary": "手动同步",
                 "description": "手动触发一次全量同步",
-            },
-            {
-                "path": "/reupload",
-                "endpoint": self.reupload,
-                "methods": ["GET", "POST"],
-                "auth": "apikey",
-                "summary": "重新上传",
-                "description": "删除云端文件后重新上传，并重新生成对应 STRM",
-            },
-            {
-                "path": "/regenerate_strm",
-                "endpoint": self.regenerate_strm,
-                "methods": ["GET", "POST"],
-                "auth": "apikey",
-                "summary": "重新生成STRM",
-                "description": "按指定云端路径重新写入 STRM 文件内容",
             },
         ]
 
@@ -807,54 +770,73 @@ class CloudStrmHelper(_PluginBase):
         threading.Thread(target=self._safe_run_once, daemon=True).start()
         return JSONResponse({"state": True, "message": "已触发全量同步"})
 
-    def reupload(self, request: Request = None, apikey: str = "",
-                 local: str = "", remote: str = ""):
-        """手动重新上传：删除远端文件后上传本地文件，并重写 STRM。"""
-        if not apikey or apikey != (settings.API_TOKEN or ""):
-            return JSONResponse({"state": False, "message": "鉴权失败"}, status_code=401)
-        try:
-            local_path, remote_path = self._validate_reupload_paths(local, remote)
-        except Exception as e:
-            return JSONResponse({"state": False, "message": str(e)}, status_code=400)
-
-        threading.Thread(
-            target=self._manual_reupload_worker,
-            args=(local_path, remote_path),
-            daemon=True,
-            name="CloudStrmManualReupload",
-        ).start()
-        return JSONResponse({
-            "state": True,
-            "message": "已开始重新上传，完成后会重新生成 STRM",
-            "data": {"local": local_path, "remote": remote_path},
-        })
-
-    def regenerate_strm(self, request: Request = None, apikey: str = "",
-                        local: str = "", remote: str = "", strm: str = ""):
-        """手动重新生成 STRM。"""
-        if not apikey or apikey != (settings.API_TOKEN or ""):
-            return JSONResponse({"state": False, "message": "鉴权失败"}, status_code=401)
-        try:
-            remote_path = self._validate_remote_path(remote)
-            strm_path = self._validate_strm_path(strm) if strm else ""
-            if strm_path:
-                ok, path = self._regenerate_strm_file(strm_path, remote_path)
-            else:
-                local_path, remote_path = self._validate_reupload_paths(local, remote_path)
-                ok, path = self._regenerate_strm_for_pair(local_path, remote_path)
-        except Exception as e:
-            return JSONResponse({"state": False, "message": str(e)}, status_code=400)
-        return JSONResponse({
-            "state": bool(ok),
-            "message": "STRM 已重新生成" if ok else "STRM 重新生成失败",
-            "data": {"strm": str(path or ""), "remote": remote_path},
-        }, status_code=200 if ok else 500)
-
     def _safe_run_once(self) -> None:
         try:
             self.run_once()
         except Exception as e:
             logger.error(f"【云端STRM】手动同步异常: {e}", exc_info=True)
+
+    @staticmethod
+    def _normalize_manual_upload_action(value: str) -> str:
+        normalized = (value or "none").strip().lower()
+        if normalized in {"reupload", "delete_remote", "delete_remote_and_local"}:
+            return normalized
+        return "none"
+
+    def _build_pending_manual_action(self) -> Optional[Dict[str, Any]]:
+        if not self._manual_execute or not self._manual_confirm:
+            return None
+        if self._manual_upload_action != "none":
+            if not self._manual_upload_target:
+                logger.warning("【手动处理】已勾选执行，但未选择上传记录")
+                return None
+            return {"kind": "upload", "action": self._manual_upload_action, "target": self._manual_upload_target}
+        if self._manual_strm_target:
+            return {"kind": "strm", "action": "regenerate_strm", "target": self._manual_strm_target}
+        return None
+
+    def _dispatch_pending_manual_action(self) -> None:
+        action = self._pending_manual_action
+        self._pending_manual_action = None
+        if not action:
+            return
+        threading.Thread(
+            target=self._manual_action_worker,
+            args=(action,),
+            daemon=True,
+            name="CloudStrmManualAction",
+        ).start()
+
+    def _manual_action_worker(self, action: Dict[str, Any]) -> None:
+        try:
+            if action.get("kind") == "upload":
+                upload_action = action.get("action")
+                if upload_action == "reupload":
+                    local_path, remote_path = self._decode_manual_upload_target(action.get("target") or "")
+                    self._manual_reupload_worker(local_path, remote_path)
+                elif upload_action == "delete_remote":
+                    _, remote_path = self._decode_manual_delete_target(action.get("target") or "")
+                    self._manual_delete_remote_worker(remote_path)
+                elif upload_action == "delete_remote_and_local":
+                    local_path, remote_path = self._decode_manual_delete_target(
+                        action.get("target") or "",
+                        require_local=True,
+                    )
+                    self._manual_delete_remote_worker(remote_path)
+                    self._manual_delete_local_file(local_path)
+                else:
+                    raise Exception(f"未知上传手动动作: {upload_action}")
+                return
+            if action.get("kind") == "strm":
+                strm_path, remote_path = self._decode_manual_strm_target(action.get("target") or "")
+                ok, _ = self._regenerate_strm_file(strm_path, remote_path)
+                if not ok:
+                    raise Exception("STRM 重新生成失败")
+                return
+            raise Exception(f"未知手动动作: {action}")
+        except Exception as e:
+            logger.error(f"【手动处理】执行失败: {e}", exc_info=True)
+            self._notify("云端STRM手动处理失败", str(e))
 
     def _manual_reupload_worker(self, local_path: str, remote_path: str) -> None:
         try:
@@ -870,10 +852,37 @@ class CloudStrmHelper(_PluginBase):
             self._alist_client.put_stream(local_path, remote_path, as_task=False)
             size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
             self._record_upload_stat(local_path, remote_path, size, status="uploaded")
-            self._regenerate_strm_for_pair(local_path, remote_path)
+            ok, _ = self._regenerate_strm_for_pair(local_path, remote_path)
+            if not ok:
+                raise Exception("上传完成，但 STRM 重新生成失败")
             logger.info(f"【手动处理】重新上传完成: {local_path} -> {remote_path}")
+            self._notify("云端STRM手动处理完成", f"重新上传完成：{Path(local_path).name}")
         except Exception as e:
             logger.error(f"【手动处理】重新上传失败: {local_path} -> {remote_path}: {e}", exc_info=True)
+            raise
+
+    def _manual_delete_remote_worker(self, remote_path: str) -> None:
+        if not self._alist_client:
+            raise Exception("AList/OpenList 客户端未初始化")
+        remote_path = self._validate_remote_path(remote_path)
+        self._alist_client.remove_file(remote_path)
+        self._record_upload_stat("", remote_path, 0, status="remote_deleted")
+        logger.info(f"【手动处理】云端文件已删除: {remote_path}")
+        self._notify("云端STRM手动处理完成", f"云端文件已删除：{Path(remote_path).name}")
+
+    def _manual_delete_local_file(self, local_path: str) -> None:
+        local_path = unquote_plus(str(local_path or "").strip())
+        if not local_path:
+            raise Exception("缺少 local 参数")
+        if self._match_upload_mapping(local_path) is None:
+            raise Exception("local 不在上传映射范围内")
+        if not os.path.isfile(local_path):
+            logger.info(f"【手动处理】本地文件不存在，视为已删除: {local_path}")
+            return
+        os.remove(local_path)
+        self._record_upload_stat(local_path, self._build_remote_path(local_path) or "", 0, status="local_deleted")
+        logger.info(f"【手动处理】本地文件已删除: {local_path}")
+        self._notify("云端STRM手动处理完成", f"本地文件已删除：{Path(local_path).name}")
 
     def _validate_reupload_paths(self, local_path: str, remote_path: str = "") -> Tuple[str, str]:
         local_path = unquote_plus(str(local_path or "").strip())
@@ -906,6 +915,42 @@ class CloudStrmHelper(_PluginBase):
         if self._is_known_strm_path(value):
             return value
         raise Exception("strm 不在已配置的 STRM 输出路径范围内")
+
+    @staticmethod
+    def _manual_entry_value(**kwargs) -> str:
+        return json.dumps(kwargs, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _manual_entry_data(value: str) -> Dict[str, str]:
+        try:
+            data = json.loads(value or "{}")
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _decode_manual_upload_target(self, value: str) -> Tuple[str, str]:
+        data = self._manual_entry_data(value)
+        return self._validate_reupload_paths(data.get("local") or "", data.get("remote") or "")
+
+    def _decode_manual_delete_target(self, value: str, require_local: bool = False) -> Tuple[str, str]:
+        data = self._manual_entry_data(value)
+        remote_path = self._validate_remote_path(data.get("remote") or "")
+        local_path = unquote_plus(str(data.get("local") or "").strip())
+        if require_local and not local_path:
+            raise Exception("缺少 local 参数")
+        if local_path:
+            expected_remote = self._build_remote_path(local_path)
+            if require_local and not expected_remote:
+                raise Exception("local 不在上传映射范围内")
+            if expected_remote and remote_path != expected_remote:
+                raise Exception("remote 与上传映射计算结果不一致，已拒绝")
+        return local_path, remote_path
+
+    def _decode_manual_strm_target(self, value: str) -> Tuple[str, str]:
+        data = self._manual_entry_data(value)
+        strm_path = self._validate_strm_path(data.get("strm") or data.get("path") or "")
+        remote_path = self._validate_remote_path(data.get("remote") or "")
+        return strm_path, remote_path
 
     def _is_known_remote_path(self, remote_path: str) -> bool:
         roots = [cloud for _, cloud in self._upload_mappings or []]
@@ -1187,13 +1232,14 @@ class CloudStrmHelper(_PluginBase):
 
     @staticmethod
     def _normalize_strm_url_mode(value: str) -> str:
-        """STRM URL 模式：moviepilot_redirect（默认/推荐）/ alist_direct / cloud_raw_url（实验）。"""
-        normalized = (value or "moviepilot_redirect").strip().lower()
+        """STRM URL 模式：alist_direct（默认）/ cloud_raw_url（实验）。
+
+        moviepilot_redirect 作为历史配置保留兼容，但会迁移为 alist_direct。
+        """
+        normalized = (value or DEFAULT_STRM_URL_MODE).strip().lower()
         if normalized in ("cloud_raw_url", "cloud_raw", "raw_url", "raw", "cloud_direct"):
             return "cloud_raw_url"
-        if normalized in ("alist_direct", "alist", "direct"):
-            return "alist_direct"
-        return "moviepilot_redirect"
+        return DEFAULT_STRM_URL_MODE
 
     @staticmethod
     def _normalize_direct_link_mode(value: str) -> str:
@@ -1417,7 +1463,9 @@ class CloudStrmHelper(_PluginBase):
     def _diagnostic_snapshot(self, probe: bool = False) -> Dict[str, Any]:
         """构建脱敏运行诊断快照。"""
         local_roots = self._local_media_roots or self._parse_path_lines(self._local_media_path)
-        stats = self._stats or self._load_stats()
+        stats = getattr(self, "_stats", None) or {}
+        if not stats and not isinstance(self, type):
+            stats = self._load_stats()
         sample_local = self._sample_local_path(local_roots)
         sample_remote = self._build_remote_path(sample_local) if sample_local else ""
         sample_strm = str(self._strm_output_path_from_remote(sample_remote)) if sample_remote else ""
@@ -1460,6 +1508,7 @@ class CloudStrmHelper(_PluginBase):
                 "direct_link_mode": self._direct_link_mode,
                 "redirect_cache_ttl": self._redirect_cache_ttl,
                 "head_probe_mode": self._head_probe_mode,
+                "sse_enabled": self._sse_enabled,
                 "emby_proxy_enabled": self._emby_proxy_enabled,
                 "emby_server_url": self._emby_server_url,
                 "emby_proxy_host": self._emby_proxy_host,
@@ -1617,10 +1666,14 @@ class CloudStrmHelper(_PluginBase):
             self._stats["upload_count"] = int(self._stats.get("upload_count") or 0) + 1
         self._stats["last_upload_time"] = now
         recent = list(self._stats.get("recent_uploads") or [])
+        display_name = Path(local_path).name if local_path else Path(remote_path).name
         # 单批次去重：同 remote 路径不重复记录
-        if not any(item.get("remote") == remote_path for item in recent):
+        should_insert = status not in ("uploaded", "skipped") or not any(
+            item.get("remote") == remote_path for item in recent
+        )
+        if should_insert:
             recent.insert(0, {
-                "name": Path(local_path).name,
+                "name": display_name,
                 "local": local_path,
                 "remote": remote_path,
                 "size": size,
@@ -1710,10 +1763,16 @@ class CloudStrmHelper(_PluginBase):
             "direct_link_mode": self._direct_link_mode,
             "redirect_cache_ttl": self._redirect_cache_ttl,
             "head_probe_mode": self._head_probe_mode,
+            "sse_enabled": self._sse_enabled,
             "emby_proxy_enabled": self._emby_proxy_enabled,
             "emby_server_url": self._emby_server_url,
             "emby_proxy_host": self._emby_proxy_host,
             "emby_proxy_port": self._emby_proxy_port,
+            "manual_upload_action": self._manual_upload_action,
+            "manual_upload_target": self._manual_upload_target,
+            "manual_strm_target": self._manual_strm_target,
+            "manual_confirm": self._manual_confirm,
+            "manual_execute": self._manual_execute,
         })
 
     @staticmethod
@@ -1739,6 +1798,32 @@ class CloudStrmHelper(_PluginBase):
             ]
         except Exception:
             mediaserver_items = []
+
+        stats = getattr(self, "_stats", None) or {}
+        if not stats and not isinstance(self, type):
+            stats = self._load_stats()
+        upload_items = [
+            {
+                "title": f"{item.get('name') or '-'} | {item.get('remote') or '-'}",
+                "value": self._manual_entry_value(
+                    local=item.get("local") or "",
+                    remote=item.get("remote") or "",
+                ),
+            }
+            for item in (stats.get("recent_uploads") or [])
+            if item.get("local") and item.get("remote")
+        ][:20]
+        strm_items = [
+            {
+                "title": f"{item.get('name') or '-'} | {item.get('remote') or '-'}",
+                "value": self._manual_entry_value(
+                    strm=item.get("path") or "",
+                    remote=item.get("remote") or "",
+                ),
+            }
+            for item in (stats.get("recent_strms") or [])
+            if item.get("path") and item.get("remote")
+        ][:20]
 
         return [
             # 1. 基础设置
@@ -1792,6 +1877,19 @@ class CloudStrmHelper(_PluginBase):
                                     },
                                 ],
                             },
+                            {
+                                "component": "VRow",
+                                "content": [
+                                    {
+                                        "component": "VCol", "props": {"cols": 12, "md": 3},
+                                        "content": [{"component": "VSwitch", "props": {
+                                            "model": "sse_enabled", "label": "启用 SSE 监听",
+                                            "hint": "关闭时不再请求 /api/v1/system/message，避免 403 日志；内部整理完成事件仍可兜底",
+                                            "persistent-hint": True,
+                                        }}],
+                                    },
+                                ],
+                            },
                         ],
                     },
                 ],
@@ -1829,11 +1927,10 @@ class CloudStrmHelper(_PluginBase):
                                         "content": [{"component": "VSelect", "props": {
                                             "model": "strm_url_mode", "label": "STRM URL 模式",
                                             "items": [
-                                                {"title": "MoviePilot 302 模式（推荐）", "value": "moviepilot_redirect"},
-                                                {"title": "AList/OpenList 直链模式（实验）", "value": "alist_direct"},
+                                                {"title": "AList/OpenList /d 302 模式（推荐）", "value": "alist_direct"},
                                                 {"title": "云盘 raw_url 直链模式（实验）", "value": "cloud_raw_url"},
                                             ],
-                                            "hint": "推荐模式只做302解析；/d 模式仍经过 AList/OpenList；raw_url 模式直写云盘链接但可能过期",
+                                            "hint": "默认生成 /d/<媒体路径>，Emby 能识别媒体后缀；raw_url 模式直写云盘链接但可能过期",
                                             "persistent-hint": True,
                                         }}],
                                     },
@@ -1948,7 +2045,92 @@ class CloudStrmHelper(_PluginBase):
                     },
                 ],
             },
-            # 4. 云端存储设置
+            # 4. 手动处理
+            {
+                "component": "VCard",
+                "props": {"variant": "outlined", "class": "mb-3"},
+                "content": [
+                    {
+                        "component": "VCardTitle",
+                        "content": [
+                            {"component": "VIcon", "props": {"icon": "mdi-wrench", "color": "primary", "class": "mr-2"}},
+                            {"component": "span", "text": "手动处理"},
+                        ],
+                    },
+                    {"component": "VDivider"},
+                    {
+                        "component": "VCardText",
+                        "content": [
+                            {
+                                "component": "VRow",
+                                "content": [
+                                    {
+                                        "component": "VCol", "props": {"cols": 12, "md": 4},
+                                        "content": [{"component": "VSelect", "props": {
+                                            "model": "manual_upload_action", "label": "最近上传操作",
+                                            "items": [
+                                                {"title": "不处理", "value": "none"},
+                                                {"title": "重新上传（先删云端再上传）", "value": "reupload"},
+                                                {"title": "删除云端文件", "value": "delete_remote"},
+                                                {"title": "删除云端和本地文件", "value": "delete_remote_and_local"},
+                                            ],
+                                            "hint": "选择动作后，再选择下面的最近上传记录",
+                                            "persistent-hint": True,
+                                        }}],
+                                    },
+                                    {
+                                        "component": "VCol", "props": {"cols": 12, "md": 8},
+                                        "content": [{"component": "VSelect", "props": {
+                                            "model": "manual_upload_target", "label": "最近上传记录",
+                                            "items": upload_items,
+                                            "clearable": True,
+                                            "hint": "仅展示有本地路径和云端路径的最近记录",
+                                            "persistent-hint": True,
+                                        }}],
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VRow",
+                                "content": [
+                                    {
+                                        "component": "VCol", "props": {"cols": 12},
+                                        "content": [{"component": "VSelect", "props": {
+                                            "model": "manual_strm_target", "label": "重新生成 STRM",
+                                            "items": strm_items,
+                                            "clearable": True,
+                                            "hint": "选择最近 STRM 记录后，勾选确认和执行并保存配置",
+                                            "persistent-hint": True,
+                                        }}],
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VRow",
+                                "content": [
+                                    {
+                                        "component": "VCol", "props": {"cols": 12, "md": 6},
+                                        "content": [{"component": "VSwitch", "props": {
+                                            "model": "manual_confirm", "label": "确认执行所选手动处理",
+                                            "hint": "删除云端/本地文件属于破坏性操作，必须勾选确认",
+                                            "persistent-hint": True,
+                                        }}],
+                                    },
+                                    {
+                                        "component": "VCol", "props": {"cols": 12, "md": 6},
+                                        "content": [{"component": "VSwitch", "props": {
+                                            "model": "manual_execute", "label": "保存配置后立即执行",
+                                            "hint": "执行触发后会自动关闭本开关，避免重复执行",
+                                            "persistent-hint": True,
+                                        }}],
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+            # 5. 云端存储设置
             {
                 "component": "VCard",
                 "props": {"variant": "outlined", "class": "mb-3"},
@@ -1996,7 +2178,7 @@ class CloudStrmHelper(_PluginBase):
                     },
                 ],
             },
-            # 5. 上传与 STRM 路径映射
+            # 6. 上传与 STRM 路径映射
             {
                 "component": "VCard",
                 "props": {"variant": "outlined", "class": "mb-3"},
@@ -2048,7 +2230,7 @@ class CloudStrmHelper(_PluginBase):
                     },
                 ],
             },
-            # 6. 同步与过滤
+            # 7. 同步与过滤
             {
                 "component": "VCard",
                 "props": {"variant": "outlined", "class": "mb-3"},
@@ -2128,7 +2310,7 @@ class CloudStrmHelper(_PluginBase):
                     },
                 ],
             },
-            # 7. 媒体服务器刷新
+            # 8. 媒体服务器刷新
             {
                 "component": "VCard",
                 "props": {"variant": "outlined"},
@@ -2188,15 +2370,21 @@ class CloudStrmHelper(_PluginBase):
             "notify_enabled": True,
             "upload_concurrency": 3,
             "moviepilot_address": DEFAULT_MOVIEPILOT_ADDRESS,
-            "strm_url_mode": "moviepilot_redirect",
+            "strm_url_mode": DEFAULT_STRM_URL_MODE,
             "resolve_final_url": True,
             "direct_link_mode": "prefer_raw_url",
             "redirect_cache_ttl": 120,
             "head_probe_mode": "ok",
+            "sse_enabled": False,
             "emby_proxy_enabled": False,
             "emby_server_url": DEFAULT_EMBY_SERVER_URL,
             "emby_proxy_host": DEFAULT_EMBY_PROXY_HOST,
             "emby_proxy_port": DEFAULT_EMBY_PROXY_PORT,
+            "manual_upload_action": "none",
+            "manual_upload_target": "",
+            "manual_strm_target": "",
+            "manual_confirm": False,
+            "manual_execute": False,
             "cloud_storage_type": "alist",
             "alist_url": DEFAULT_ALIST_URL,
             "alist_token": "",
